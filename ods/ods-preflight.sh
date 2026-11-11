@@ -21,6 +21,8 @@ LOG_FILE="$ODS_DIR/preflight-$(date +%Y%m%d-%H%M%S).log"
 # Safe .env loading (no eval; use lib/safe-env.sh)
 [[ -f "$ODS_DIR/lib/safe-env.sh" ]] && . "$ODS_DIR/lib/safe-env.sh"
 load_env_file "$ODS_DIR/.env"
+# shellcheck source=lib/preflight-llm-route.sh
+. "$ODS_DIR/lib/preflight-llm-route.sh"
 
 SERVICE_HOST="${SERVICE_HOST:-localhost}"
 
@@ -32,6 +34,14 @@ CURL_HEALTH_FLAGS=(--connect-timeout 3 --max-time 10)
 # Priority: .env setting → nvidia-smi → AMD sysfs (any card).
 # On dual-GPU systems (AMD iGPU + NVIDIA dGPU) we must prefer
 # NVIDIA when present, since it is always the inference target.
+
+# WSL2 keeps the Microsoft kernel release string; ODS_PROC_VERSION_FILE is a
+# test hook, matching scripts/detect-hardware.sh.
+is_wsl() {
+    local version_file="${ODS_PROC_VERSION_FILE:-/proc/version}"
+    [[ -f "$version_file" ]] && grep -qi microsoft "$version_file" 2>/dev/null
+}
+
 detect_backend() {
     # 1. Trust .env if the installer already wrote it.
     if [[ "${GPU_BACKEND:-}" == "amd" ]]; then
@@ -50,6 +60,26 @@ detect_backend() {
     for _v in /sys/class/drm/card*/device/vendor; do
         [[ "$(cat "$_v" 2>/dev/null)" == "0x10de" ]] && _nvidia_hw=true && break
     done
+    # Headless servers without nvidia-drm.ko expose no DRM card, but the PCI
+    # device remains: accept vendor 0x10de with display class 0x03xxxx.
+    # Keep identical to installers/lib/detection.sh detect_gpu().
+    if ! $_nvidia_hw; then
+        for _v in "${ODS_PCI_SYS:-/sys/bus/pci/devices}"/*/vendor; do
+            [[ "$(cat "$_v" 2>/dev/null)" == "0x10de" ]] || continue
+            [[ "$(cat "${_v%/vendor}/class" 2>/dev/null)" == 0x03* ]] && _nvidia_hw=true && break
+        done
+    fi
+    # WSL2 passes the host GPU through its paravirtualized nvidia-smi bridge and
+    # normally exposes no matching /sys/class/drm vendor node, so a successful,
+    # non-empty query is the hardware witness there. This is the same rule
+    # installers/lib/detection.sh, scripts/detect-hardware.sh and the bootstrap
+    # preliminary check already apply.
+    if ! $_nvidia_hw && is_wsl && command -v nvidia-smi &> /dev/null; then
+        local _wsl_gpu_name=""
+        _wsl_gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) \
+            || _wsl_gpu_name=""
+        [[ -n "$_wsl_gpu_name" ]] && _nvidia_hw=true
+    fi
     if $_nvidia_hw && command -v nvidia-smi &> /dev/null; then
         if nvidia-smi --query-gpu=name --format=csv,noheader &> /dev/null; then
             echo "nvidia"
@@ -71,13 +101,6 @@ detect_backend() {
 }
 
 BACKEND=$(detect_backend)
-
-is_external_lemonade() {
-    local external="${LEMONADE_EXTERNAL:-false}"
-    local managed="${AMD_INFERENCE_MANAGED:-}"
-    local mode="${ODS_MODE:-local}"
-    [[ "${external,,}" == "true" ]] || [[ "${mode,,}" == "lemonade" && "${managed,,}" == "false" ]]
-}
 
 # Colors
 RED='\033[0;31m'
@@ -107,9 +130,9 @@ log ""
 
 # 1. Docker check
 log "[1/8] Checking Docker..."
-if command -v docker &> /dev/null; then
-    DOCKER_VERSION=$(docker --version | awk '{print $3}' | tr -d ',')
-    pass "Docker installed: $DOCKER_VERSION"
+if command -v docker &> /dev/null && docker --version &> /dev/null; then
+    DOCKER_VERSION=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || true)
+    pass "Docker installed: ${DOCKER_VERSION:-present}"
 
     if docker info &> /dev/null; then
         pass "Docker daemon running"
@@ -124,8 +147,8 @@ log ""
 # 2. Docker Compose check
 log "[2/8] Checking Docker Compose..."
 if docker compose version &> /dev/null 2>&1 || docker-compose version &> /dev/null 2>&1; then
-    COMPOSE_VERSION=$(docker compose version 2>/dev/null | awk '{print $4}' || docker-compose version 2>/dev/null | head -1 | awk '{print $3}')
-    pass "Docker Compose available: $COMPOSE_VERSION"
+    COMPOSE_VERSION=$(docker compose version 2>/dev/null | awk '{print $4}' || docker-compose version 2>/dev/null | head -1 | awk '{print $3}' || true)
+    pass "Docker Compose available: ${COMPOSE_VERSION:-present}"
 else
     fail "Docker Compose not found"
 fi
@@ -196,12 +219,12 @@ log ""
 # OLLAMA_PORT=11434 to .env automatically — it will be picked up via the
 # ${OLLAMA_PORT:-...} expansion below, so the fallback should be 8080.
 log "[4/8] Checking LLM endpoint..."
-if is_external_lemonade; then
+if ods_preflight_uses_litellm; then
     LLM_PORT="${LITELLM_PORT:-4000}"
     LLM_ENDPOINTS=("http://${SERVICE_HOST}:${LLM_PORT}/health/readiness" "http://127.0.0.1:${LLM_PORT}/health/readiness" "http://127.0.0.1:${LLM_PORT}/v1/models")
-    LLM_SERVICE_NAME="LiteLLM external Lemonade gateway"
+    LLM_SERVICE_NAME="LiteLLM gateway"
     LLM_CONTAINER_MATCH="ods-litellm"
-    LLM_START_CMD="docker compose up -d litellm"
+    LLM_START_CMD="cd \"$ODS_DIR\" && ./ods-cli start litellm"
 else
     LLM_PORT="${OLLAMA_PORT:-${LLAMA_SERVER_PORT:-8080}}"
     # Also probe the actual mapped port in case docker remapped it
@@ -210,7 +233,7 @@ else
     LLM_ENDPOINTS=("http://${SERVICE_HOST}:${EXTERNAL_PORT}/health" "http://${SERVICE_HOST}:${EXTERNAL_PORT}/v1/models" "http://127.0.0.1:${EXTERNAL_PORT}/health" "http://127.0.0.1:${EXTERNAL_PORT}/v1/models" "http://127.0.0.1:${LLM_PORT}/health" "http://127.0.0.1:${LLM_PORT}/v1/models")
     LLM_SERVICE_NAME="llama-server"
     LLM_CONTAINER_MATCH="ods-llama-server"
-    LLM_START_CMD="docker compose up -d llama-server"
+    LLM_START_CMD="cd \"$ODS_DIR\" && ./ods-cli start llama-server"
 fi
 
 LLM_FOUND=false

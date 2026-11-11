@@ -21,6 +21,7 @@ import {
   MessageSquare, Workflow, Boxes, Loader2, AlertCircle, Copy,
   QrCode, Share2,
 } from 'lucide-react'
+import odsMark from '../assets/ods-mark.png'
 
 const PROGRESS_KEY = 'ods-firstboot-progress'
 
@@ -84,6 +85,7 @@ export default function FirstBoot({ onComplete }) {
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState(null)
   const [invite, setInvite] = useState(null)
+  const [pendingInvite, setPendingInvite] = useState(null)
   const [ownerCardStatus, setOwnerCardStatus] = useState(null)
 
   // Persist progress whenever the user moves forward.
@@ -139,7 +141,7 @@ export default function FirstBoot({ onComplete }) {
         throw new Error('The selected stack is no longer available. Go back and choose another option.')
       }
 
-      if (selectedStack.templateId) {
+      if (!pendingInvite && selectedStack.templateId) {
         const applyResp = await fetch(`/api/templates/${selectedStack.templateId}/apply`, {
           method: 'POST',
         })
@@ -175,15 +177,15 @@ export default function FirstBoot({ onComplete }) {
         }
       }
 
-      let inviteData = null
-      if (!ownerCardUnavailable) {
+      let inviteData = pendingInvite
+      if (!inviteData && !ownerCardUnavailable) {
         // Generate the owner magic-link for the named user. Reuses the same
         // backend the Setup / Owner page consumes.
         const genResp = await fetch('/api/auth/magic-link/generate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            target_username: username,
+            target_username: username.trim(),
             token_type: 'owner',
             scope: 'hermes',
             url_mode: ownerCardStatus?.url_mode || 'lan',
@@ -195,6 +197,9 @@ export default function FirstBoot({ onComplete }) {
           throw new Error(body.detail || `generate failed: ${genResp.status}`)
         }
         inviteData = await genResp.json()
+        // The credential has already been issued. Retain it before the next
+        // request can fail, and never mint another card on completion retry.
+        setPendingInvite(inviteData)
       }
 
       // Flip the server-side sentinel so this device is "configured".
@@ -257,9 +262,9 @@ export default function FirstBoot({ onComplete }) {
   }
 
   return (
-    <div className="min-h-screen bg-theme-bg flex flex-col">
+    <div className="pixel-app pixel-setup min-h-screen bg-theme-bg flex flex-col">
       <header className="px-6 pt-8 pb-4 flex items-center justify-between">
-        <div className="font-mono text-sm font-bold text-theme-accent tracking-widest">ODS</div>
+        <img src={odsMark} alt="ODS" className="h-12 w-20 object-contain grayscale mix-blend-screen" />
         {!invite && <StepDots step={step} total={TOTAL_STEPS} />}
       </header>
 
@@ -295,6 +300,7 @@ export default function FirstBoot({ onComplete }) {
               {step === 4 && (
                 <ConfirmStep
                   deviceName={deviceName}
+                  pendingInvite={pendingInvite}
                   username={username}
                   stack={stack}
                   onBack={prev}
@@ -425,6 +431,7 @@ function UserStep({ username, setUsername, onNext, onBack }) {
       <div className="flex gap-3">
         <button
           onClick={onBack}
+          aria-label="Back"
           className="flex items-center justify-center gap-2 bg-theme-card border border-theme-border text-theme-text py-4 px-5 rounded-xl"
         >
           <ChevronLeft size={18} />
@@ -465,14 +472,15 @@ function StackStep({ stack, setStack, onNext, onBack }) {
             <button
               key={opt.id}
               onClick={() => setStack(opt.id)}
-              className={`w-full text-left p-4 rounded-xl border-2 transition-colors flex gap-4 ${
+              aria-pressed={selected}
+              className={`w-full text-left p-4 rounded-xl border transition-colors flex gap-4 ${
                 selected
                   ? 'border-theme-accent bg-theme-accent/10'
                   : 'border-theme-border bg-theme-card hover:border-theme-text-muted'
               }`}
             >
               <div className={`w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0 ${
-                selected ? 'bg-theme-accent text-white' : 'bg-theme-border text-theme-text-muted'
+                selected ? 'bg-theme-border text-theme-text' : 'bg-theme-border text-theme-text-muted'
               }`}>
                 <Icon size={24} />
               </div>
@@ -491,6 +499,7 @@ function StackStep({ stack, setStack, onNext, onBack }) {
       <div className="flex gap-3">
         <button
           onClick={onBack}
+          aria-label="Back"
           className="flex items-center justify-center gap-2 bg-theme-card border border-theme-border text-theme-text py-4 px-5 rounded-xl"
         >
           <ChevronLeft size={18} />
@@ -513,6 +522,7 @@ function StackStep({ stack, setStack, onNext, onBack }) {
 
 function ConfirmStep({
   deviceName,
+  pendingInvite,
   username,
   stack,
   onBack,
@@ -545,7 +555,7 @@ function ConfirmStep({
       )}
 
       {ownerCardUnavailable && (
-        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-100 text-sm flex items-start gap-2">
+        <div className="mb-6 p-4 bg-theme-text-secondary/10 border border-theme-border rounded-xl text-theme-text-secondary text-sm flex items-start gap-2">
           <AlertCircle size={18} className="flex-shrink-0 mt-0.5" />
           <span>
             {ownerCardStatus.reason || 'Enable ODS proxy before generating owner cards.'}
@@ -553,6 +563,15 @@ function ConfirmStep({
           </span>
         </div>
       )}
+
+      {pendingInvite && <div className="mb-6 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
+        <p>Your owner card was generated. Save this link before leaving the page. Finish retries setup completion using this same card.</p>
+        <label className="mt-3 block">Generated owner link
+          <input readOnly value={typeof pendingInvite.url === 'string' ? pendingInvite.url : ''}
+            onFocus={event => event.currentTarget.select()}
+            className="mt-1 w-full rounded border border-theme-border bg-theme-bg p-2 text-theme-text" />
+        </label>
+      </div>}
 
       {error && (
         <div className="mb-6 p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm flex items-start gap-2">
@@ -564,7 +583,8 @@ function ConfirmStep({
       <div className="flex gap-3">
         <button
           onClick={onBack}
-          disabled={finishing}
+          aria-label="Back"
+          disabled={finishing || Boolean(pendingInvite)}
           className="flex items-center justify-center gap-2 bg-theme-card border border-theme-border text-theme-text py-4 px-5 rounded-xl disabled:opacity-50"
         >
           <ChevronLeft size={18} />

@@ -69,6 +69,15 @@ case "${DOCKER_STUB_MODE:-success}" in
         echo "network busy (try again later)"
         exit 1
         ;;
+    fail-missing-service)
+        echo "no such service: missing-service"
+        exit 1
+        ;;
+    fail-mixed-missing-service)
+        echo "Error response from daemon: permission denied"
+        echo "no such service: missing-service"
+        exit 1
+        ;;
     fail-port-once)
         state_file="$TMPDIR_TEST/port-retry-count"
         count=0
@@ -107,6 +116,23 @@ case "${DOCKER_STUB_MODE:-success}" in
         fi
         echo "Container ods-llama-server started"
         exit 0
+        ;;
+    fail-wsl-runtime-once)
+        state_file="$TMPDIR_TEST/wsl-runtime-retry-count"
+        count=0
+        [[ -f "$state_file" ]] && count=$(cat "$state_file")
+        count=$((count + 1))
+        echo "$count" > "$state_file"
+        if [[ "$count" -eq 1 ]]; then
+            echo "failed to create task for container: OCI runtime create failed: unable to start container process: unable to start unit docker-deadbeef.scope: Message recipient disconnected from message bus without replying: unknown"
+            exit 1
+        fi
+        echo "Container ods-llama-server started"
+        exit 0
+        ;;
+    fail-wsl-runtime-always)
+        echo "failed to create task for container: OCI runtime create failed: unable to start container process: unable to start unit docker-deadbeef.scope: Message recipient disconnected from message bus without replying: unknown"
+        exit 1
         ;;
     fail-startup-twice-then-name-conflict)
         state_file="$TMPDIR_TEST/startup-retry-count"
@@ -186,6 +212,8 @@ teardown() {
     # At least one error-keyword line should be surfaced (indented two spaces).
     assert_output --partial "Error response from daemon"
     assert_output --partial "Full compose output:"
+    # A failed start/restart/update points at help (round G).
+    assert_output --partial "https://discord.gg/4ntNp9MAwC"
 }
 
 @test "wrapper: failure propagates the compose exit code (1)" {
@@ -209,6 +237,25 @@ teardown() {
 }
 
 # ── failure path, zero keyword matches (nounset/pipefail-hardening) ─────────
+
+@test "wrapper: missing service is included in the failure summary" {
+    export DOCKER_STUB_MODE=fail-missing-service
+    run _compose_run_with_summary "Starting service" up -d missing-service
+    [ "$status" -eq 1 ]
+    assert_output --partial "no such service: missing-service"
+    assert_output --partial "Full compose output:"
+    refute_output --partial "(no error keywords matched in compose log)"
+}
+
+@test "wrapper: missing service is retained alongside another error" {
+    export DOCKER_STUB_MODE=fail-mixed-missing-service
+    run _compose_run_with_summary "Starting service" up -d missing-service
+    [ "$status" -eq 1 ]
+    assert_output --partial "permission denied"
+    assert_output --partial "no such service: missing-service"
+    assert_output --partial "Full compose output:"
+    refute_output --partial "(no error keywords matched in compose log)"
+}
 
 # These two tests must execute the wrapper under `set -euo pipefail` because
 # the `|| warn "(no error keywords matched...)"` branch only fires when
@@ -307,6 +354,27 @@ teardown() {
     assert_output --partial "retrying (2/2)"
     assert_output --partial "Restarting all services"
     assert_output --partial "done"
+    run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
+    assert_output "3"
+}
+
+@test "wrapper: compose up retries a transient WSL systemd runtime startup failure" {
+    export DOCKER_STUB_MODE=fail-wsl-runtime-once
+    run _compose_run_with_summary "Restarting all services" up -d
+    assert_success
+    assert_output --partial "Docker reported a transient service startup failure"
+    run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
+    assert_output "2"
+}
+
+@test "wrapper: persistent WSL systemd runtime startup failure exhausts retries" {
+    export DOCKER_STUB_MODE=fail-wsl-runtime-always
+    export ODS_COMPOSE_STARTUP_RETRY_ATTEMPTS=3
+    run _compose_run_with_summary "Restarting all services" up -d
+    assert_failure
+    assert_output --partial "retrying (1/2)"
+    assert_output --partial "retrying (2/2)"
+    assert_output --partial "Restarting all services failed"
     run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
     assert_output "3"
 }

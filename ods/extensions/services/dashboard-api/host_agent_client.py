@@ -28,6 +28,18 @@ class AgentHTTPError(AgentClientError):
         self.response_text = response_text
 
 
+def agent_reports_busy(error: AgentHTTPError) -> bool:
+    """True for the host's 409 refusal made before acting: another model or
+    Portal change holds the lifecycle, so nothing was changed."""
+    if error.status_code != 409:
+        return False
+    try:
+        body = json.loads(error.response_text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(body, dict) and "model-lifecycle-busy" in (body.get("error"), body.get("code"))
+
+
 class AgentUnavailable(AgentClientError):
     """The host agent could not be reached."""
 
@@ -40,15 +52,21 @@ class AgentProtocolError(AgentClientError):
     """The host agent returned a response that violated its JSON contract."""
 
 
+# The host agent closes idle keep-alive sockets after 30 s
+# (ThreadedHTTPServer.request_socket_timeout). Expire pooled connections well
+# before that: with equal timeouts the pool can reuse a socket the agent is
+# closing, and behind Docker Desktop's proxy that close may never reach the
+# container, so the request hangs until its read timeout.
+_KEEPALIVE_EXPIRY_SECONDS = 10.0
 _SYNC_LIMITS = httpx.Limits(
     max_connections=8,
     max_keepalive_connections=4,
-    keepalive_expiry=30.0,
+    keepalive_expiry=_KEEPALIVE_EXPIRY_SECONDS,
 )
 _ASYNC_LIMITS = httpx.Limits(
     max_connections=2,
     max_keepalive_connections=2,
-    keepalive_expiry=30.0,
+    keepalive_expiry=_KEEPALIVE_EXPIRY_SECONDS,
 )
 _sync_client: httpx.Client | None = None
 _async_client: httpx.AsyncClient | None = None
@@ -129,12 +147,27 @@ def _get_sync_client() -> httpx.Client:
 async def _get_async_client() -> httpx.AsyncClient:
     global _async_client
 
+    loop = asyncio.get_running_loop()
     client = _async_client
-    if client is not None and not client.is_closed:
+    owner_loop = getattr(client, "_ods_owner_loop", None) if client is not None else None
+    if (
+        client is not None
+        and not client.is_closed
+        and (owner_loop is None or owner_loop is loop)
+    ):
+        # Tests and explicit adapters may inject a client. Adopt it into the
+        # current loop the first time rather than treating it as stale.
+        if owner_loop is None:
+            setattr(client, "_ods_owner_loop", loop)
         return client
     with _async_client_lock:
         client = _async_client
-        if client is None or client.is_closed:
+        owner_loop = getattr(client, "_ods_owner_loop", None) if client is not None else None
+        if (
+            client is None
+            or client.is_closed
+            or owner_loop is not None and owner_loop is not loop
+        ):
             _async_client = httpx.AsyncClient(
                 base_url=AGENT_URL,
                 headers=_headers(),
@@ -142,6 +175,7 @@ async def _get_async_client() -> httpx.AsyncClient:
                 timeout=_timeout(5.0),
                 trust_env=False,
             )
+            setattr(_async_client, "_ods_owner_loop", loop)
         return _async_client
 
 

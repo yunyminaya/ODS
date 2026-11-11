@@ -44,8 +44,9 @@ _pkg_retry() {
     while (( attempt <= max )); do
         if _pkg_run "$@"; then
             return 0
+        else
+            status=$?
         fi
-        status=$?
         if (( attempt >= max )); then
             return "$status"
         fi
@@ -176,16 +177,17 @@ detect_pkg_manager() {
 # Update the package index
 pkg_update() {
     case "$PKG_MANAGER" in
-        apt)    _pkg_run apt-get update -qq 2>>"$LOG_FILE" ;;
+        # sudo-rs 0.2.13/use_pty can stop apt when it inherits a terminal.
+        # Package commands are unattended; close input before entering sudo.
+        apt)    _pkg_run apt-get update -qq </dev/null 2>>"$LOG_FILE" ;;
         dnf)    _pkg_run dnf check-update -q 2>>"$LOG_FILE" || true ;;  # returns 100 if updates available
         pacman) _pkg_prepare_pacman_keyrings; _pkg_retry pacman -Syyu --noconfirm 2>>"$LOG_FILE" ;;  # full sync+upgrade (partial -Sy is unsafe)
         zypper)
             _pkg_configure_zypper_ci_network
-            if [[ -n "${GITHUB_ACTIONS:-}" || -n "${CI:-}" ]]; then
-                log "Skipping zypper refresh in CI; package installs use container image metadata"
-            else
-                _pkg_retry zypper --non-interactive --gpg-auto-import-keys refresh 2>>"$LOG_FILE"
-            fi
+            # Minimal container images may contain repository definitions but
+            # no usable metadata/key cache. Refresh them just like an installed
+            # host; --no-refresh on that initial state silently skips packages.
+            _pkg_retry zypper --non-interactive --gpg-auto-import-keys refresh 2>>"$LOG_FILE"
             ;;
         xbps)   _pkg_run xbps-install -S 2>>"$LOG_FILE" ;;
         apk)    _pkg_run apk update 2>>"$LOG_FILE" ;;
@@ -209,16 +211,12 @@ pkg_install() {
 
     log "Installing packages (${PKG_MANAGER}): ${pkgs[*]}"
     case "$PKG_MANAGER" in
-        apt)    _pkg_run apt-get install -y -qq "${pkgs[@]}" 2>>"$LOG_FILE" ;;
+        apt)    _pkg_run apt-get install -y -qq "${pkgs[@]}" </dev/null 2>>"$LOG_FILE" ;;
         dnf)    _pkg_run dnf install -y -q "${pkgs[@]}" 2>>"$LOG_FILE" ;;
         pacman) _pkg_prepare_pacman_keyrings; _pkg_retry pacman -S --noconfirm --needed "${pkgs[@]}" 2>>"$LOG_FILE" ;;
         zypper)
             _pkg_configure_zypper_ci_network
-            if [[ -n "${GITHUB_ACTIONS:-}" || -n "${CI:-}" ]]; then
-                _pkg_retry zypper --non-interactive --no-refresh install -y "${pkgs[@]}" 2>>"$LOG_FILE"
-            else
-                _pkg_retry zypper --non-interactive install -y "${pkgs[@]}" 2>>"$LOG_FILE"
-            fi
+            _pkg_retry zypper --non-interactive --gpg-auto-import-keys install -y "${pkgs[@]}" 2>>"$LOG_FILE"
             ;;
         xbps)   _pkg_run xbps-install -y "${pkgs[@]}" 2>>"$LOG_FILE" ;;
         apk)    _pkg_run apk add --no-progress "${pkgs[@]}" 2>>"$LOG_FILE" ;;
@@ -249,6 +247,7 @@ pkg_resolve() {
         apt)
             case "$canonical" in
                 docker-compose-plugin) echo "docker-compose-plugin" ;;
+                podman-compose)        echo "podman-compose" ;;
                 python3-pyyaml)        echo "python3-yaml" ;;
                 python3-pip)           echo "python3-pip" ;;
                 *) echo "$canonical" ;;
@@ -264,6 +263,7 @@ pkg_resolve() {
                     fi
                     ;;
                 docker-compose-plugin) echo "docker-compose-plugin" ;;
+                podman-compose)        echo "podman-compose" ;;
                 python3-pyyaml)        echo "python3-pyyaml" ;;
                 python3-pip)           echo "python3-pip" ;;
                 build-essential)       echo "gcc gcc-c++ make" ;;
@@ -273,6 +273,7 @@ pkg_resolve() {
         pacman)
             case "$canonical" in
                 docker-compose-plugin) echo "docker-compose" ;;
+                podman-compose)        echo "podman-compose" ;;
                 python3-pyyaml)        echo "python-yaml" ;;
                 python3-pip)           echo "python-pip" ;;
                 build-essential)       echo "base-devel" ;;
@@ -282,6 +283,7 @@ pkg_resolve() {
         zypper)
             case "$canonical" in
                 docker-compose-plugin) echo "docker-compose" ;;
+                podman-compose)        echo "docker-compose" ;;
                 python3-pyyaml)        echo "python3-PyYAML" ;;
                 python3-pip)           echo "python3-pip" ;;
                 build-essential)       echo "devel_basis" ;;
@@ -291,6 +293,7 @@ pkg_resolve() {
         xbps)
             case "$canonical" in
                 docker-compose-plugin) echo "docker-compose" ;;
+                podman-compose)        echo "podman-compose" ;;
                 python3-pyyaml)        echo "python3-yaml" ;;
                 python3-pip)           echo "python3-pip" ;;
                 build-essential)       echo "base-devel" ;;
@@ -300,6 +303,7 @@ pkg_resolve() {
         apk)
             case "$canonical" in
                 docker-compose-plugin) echo "docker-cli-compose" ;;
+                podman-compose)        echo "podman-compose" ;;
                 python3-pyyaml)        echo "py3-yaml" ;;
                 python3-pip)           echo "py3-pip" ;;
                 build-essential)       echo "build-base" ;;

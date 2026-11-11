@@ -1,6 +1,7 @@
 """Shared helper functions for service health checking, metrics, and system info."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -17,9 +18,16 @@ from typing import Optional
 import aiohttp
 import httpx
 
-from config import SERVICES, INSTALL_DIR, DATA_DIR, LLM_BACKEND, read_live_env_value
-from host_agent_client import AgentClientError, async_request_json as request_agent_json
+from config import (
+    SERVICES, INSTALL_DIR, DATA_DIR, LLM_BACKEND, EXTENSIONS_DIR, GPU_BACKEND,
+    LIBRARY_MANAGEABLE_BUILTINS, get_env_file_read_error, load_extension_manifests, read_live_env_value,
+)
+from env_values import parse_env_value
+from host_metrics import apple_host_metrics, linux_scope, windows_host_metrics
+from host_agent_client import AgentClientError, AgentHTTPError, async_request_json as request_agent_json
+from host_agent_client import request_json as request_agent_json_sync
 from models import ServiceStatus, DiskUsage, ModelInfo, BootstrapStatus
+from service_health_dns import ServiceHealthResolver
 
 
 class _DirSizeCache:
@@ -60,8 +68,8 @@ class _DirSizeCache:
 
 _dir_size_cache = _DirSizeCache()
 
-# Lemonade serves at /api/v1 instead of llama.cpp's /v1
-_LLM_API_PREFIX = "/api/v1" if LLM_BACKEND == "lemonade" else "/v1"
+# Every managed runtime is upstream llama-server (OpenAI routes under /v1).
+_LLM_API_PREFIX = "/v1"
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 _aio_session: Optional[aiohttp.ClientSession] = None
 _aio_session_lock: Optional[asyncio.Lock] = None
+_health_resolver: Optional[ServiceHealthResolver] = None
 _HEALTH_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Short timeout for the catalog fan-out: one slow probe must not stall the
 # whole Extensions page (frontend aborts after 8 s).
@@ -86,16 +95,31 @@ def _get_aio_session_lock() -> asyncio.Lock:
 
 async def _get_aio_session() -> aiohttp.ClientSession:
     """Return (and lazily create) a module-level aiohttp session."""
-    global _aio_session
+    global _aio_session, _health_resolver
     if _aio_session is not None and not _aio_session.closed:
         return _aio_session
     async with _get_aio_session_lock():
         if _aio_session is None or _aio_session.closed:
+            if _health_resolver is not None:
+                await _health_resolver.close()
+            _health_resolver = ServiceHealthResolver()
             _aio_session = aiohttp.ClientSession(
                 timeout=_HEALTH_TIMEOUT,
-                connector=aiohttp.TCPConnector(family=socket.AF_INET),
+                connector=aiohttp.TCPConnector(family=socket.AF_INET, resolver=_health_resolver),
             )
     return _aio_session
+
+
+async def shutdown_service_health_client() -> None:
+    """Close health sockets and cancel queued resolver work at app shutdown."""
+    global _aio_session, _health_resolver, _aio_session_lock
+    if _aio_session is not None:
+        await _aio_session.close()
+        _aio_session = None
+    if _health_resolver is not None:
+        await _health_resolver.close()
+        _health_resolver = None
+    _aio_session_lock = None
 
 
 # Shared httpx client for llama-server requests (connection pooling)
@@ -119,6 +143,15 @@ async def _get_httpx_client() -> httpx.AsyncClient:
         if _httpx_client is None or _httpx_client.is_closed:
             _httpx_client = httpx.AsyncClient(timeout=5.0)
     return _httpx_client
+
+
+async def shutdown_llm_client() -> None:
+    """Close the pooled LLM client after application users have stopped."""
+    global _httpx_client, _httpx_client_lock
+    if _httpx_client is not None:
+        await _httpx_client.aclose()
+        _httpx_client = None
+    _httpx_client_lock = None
 
 
 def _service_status_from_config(service_id: str, config: dict, status: str) -> ServiceStatus:
@@ -148,7 +181,86 @@ async def _check_tailscale_health(service_id: str, config: dict) -> ServiceStatu
     return _service_status_from_config(service_id, config, "unhealthy")
 
 
+# Last OpenCode lifecycle reported by the host agent. The dashboard uses it to
+# tell "never set up" from "installed but stopped"; a bare port probe cannot.
+_opencode_lifecycle: Optional[dict] = None
+
+_OPENCODE_STATE_STATUS = {
+    "running": "healthy",
+    "starting": "degraded",
+    "installing": "degraded",
+    "stopped": "down",
+    "not_installed": "not_deployed",
+}
+
+
+def get_opencode_lifecycle() -> Optional[dict]:
+    """Return the most recent OpenCode lifecycle snapshot, if any."""
+    return _opencode_lifecycle
+
+
+async def _check_opencode_health(service_id: str, config: dict) -> ServiceStatus:
+    """Map the host agent's OpenCode lifecycle onto the service vocabulary.
+
+    ``running`` -> healthy, ``starting``/``installing`` -> degraded,
+    ``stopped`` -> down (installed but not running), ``not_installed`` ->
+    not_deployed. Older host agents without the lifecycle route fall back to
+    the loopback port proof.
+    """
+    global _opencode_lifecycle
+    try:
+        payload = await request_agent_json("GET", "/v1/opencode/status", timeout=10)
+    except AgentHTTPError as exc:
+        _opencode_lifecycle = None
+        if exc.status_code == 404:
+            return await _check_host_port_health(service_id, config)
+        return _service_status_from_config(service_id, config, "down")
+    except AgentClientError:
+        _opencode_lifecycle = None
+        return _service_status_from_config(service_id, config, "down")
+
+    status = _OPENCODE_STATE_STATUS.get(payload.get("state"))
+    if status is None:
+        _opencode_lifecycle = None
+        return _service_status_from_config(service_id, config, "down")
+    _opencode_lifecycle = payload
+    response_time = payload.get("responseTimeMs")
+    return ServiceStatus(
+        id=service_id,
+        name=config["name"],
+        port=config["port"],
+        external_port=config.get("external_port", config["port"]),
+        status=status,
+        response_time_ms=response_time if isinstance(response_time, (int, float)) else None,
+    )
+
+
+async def _check_pixel_ingress_health(service_id: str, config: dict) -> ServiceStatus:
+    """Prove the socket-only Pixel host ingress through Pixel Edge.
+
+    The ingress listens only on a Unix socket, so no port can be probed and it
+    read "Not Deployed" while Portal worked (Workstation06, 2026-10-26). Pixel
+    Edge's /health answers ok only when that socket's /health does; an edge
+    that is down proves nothing about the socket.
+    """
+    edge = SERVICES.get("pixel-edge")
+    if edge is None:
+        return _service_status_from_config(service_id, config, "not_deployed")
+    edge_status = (await check_service_health("pixel-edge", edge)).status
+    status = edge_status if edge_status in ("healthy", "not_deployed") else "unknown"
+    return _service_status_from_config(service_id, config, status)
+
+
 async def _check_host_systemd_health(service_id: str, config: dict) -> ServiceStatus:
+    """Check a host-managed service through the authenticated host-agent."""
+    if service_id == "opencode":
+        return await _check_opencode_health(service_id, config)
+    if service_id == "pixel-agent" and config.get("socket_only"):
+        return await _check_pixel_ingress_health(service_id, config)
+    return await _check_host_port_health(service_id, config)
+
+
+async def _check_host_port_health(service_id: str, config: dict) -> ServiceStatus:
     """Check a host-managed service through the authenticated host-agent.
 
     Host-systemd services such as OpenCode usually bind to host loopback. From
@@ -187,12 +299,17 @@ async def _check_host_systemd_health(service_id: str, config: dict) -> ServiceSt
 _TOKEN_FILE = Path(DATA_DIR) / "token_counter.json"
 _PERF_FILE = Path(DATA_DIR) / "model_performance.json"
 MAX_SINGLE_REQUEST_TOKENS_PER_SECOND = 10_000.0
-_prev_tokens = {"count": 0, "time": 0.0, "tps": 0.0}
+_prev_tokens = {}
+_llama_metrics_lock = None
+_llama_metrics_sample = {}
+_METRICS_SAMPLE_SECONDS = 1.0
+_metrics_clock = time.monotonic
+_metrics_wall_clock = time.time
 _token_counter_lock = threading.Lock()
 
 
-def _update_lifetime_tokens(server_counter: float) -> int:
-    """Accumulate tokens across server restarts using a persistent file."""
+def _update_lifetime_tokens(server_counter: float, counter_id: Optional[str] = None) -> int:
+    """Accumulate independent runtime/model counters without crossing baselines."""
     with _token_counter_lock:
         data = _read_json_file(_TOKEN_FILE, {})
         if not isinstance(data, dict):
@@ -200,6 +317,14 @@ def _update_lifetime_tokens(server_counter: float) -> int:
 
         current = _non_negative_number(server_counter)
         prev = _non_negative_number(data.get("last_server_counter"))
+        if counter_id is not None:
+            counters = data.get("server_counters")
+            if not isinstance(counters, dict):
+                # Bind a legacy single baseline once, without recounting it.
+                counters = {counter_id: prev}
+            prev = _non_negative_number(counters.get(counter_id))
+            counters[counter_id] = current
+            data["server_counters"] = counters
         lifetime = _non_negative_number(data.get("lifetime"))
         delta = current if current < prev else current - prev
 
@@ -384,101 +509,253 @@ def get_model_performance_samples() -> list[dict]:
 
 # --- LLM Metrics ---
 
+def _measurement_number(value):
+    """Keep missing/invalid observations distinct from a measured zero."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _saved_lifetime_tokens():
+    data = _read_json_file(_TOKEN_FILE, {})
+    value = _measurement_number(data.get("lifetime")) if isinstance(data, dict) else None
+    return int(value) if value is not None else None
+
+
+def _host_native_llm() -> bool:
+    """The model runs in an ODS-owned llama-server on the Windows host.
+
+    That server requires its API key for /props and /metrics, which this
+    container never holds; the host agent reads them for the dashboard
+    (``/v1/llm/status``), through the WSL bridge when the stack runs in WSL.
+    """
+    return (LLM_BACKEND != "external"
+            and read_live_env_value("AMD_INFERENCE_LOCATION").strip().lower() == "host")
+
+
+async def _host_llm_status() -> dict:
+    status = await request_agent_json("GET", "/v1/llm/status", timeout=6)
+    if not isinstance(status, dict) or not isinstance(status.get("health"), dict):
+        raise ValueError("host llama-server status is invalid")
+    return status
+
+
+def get_cached_llama_metrics() -> dict:
+    """Last known measurement for status fallback; never claim fresh telemetry."""
+    result = dict(_llama_metrics_sample.get("result", {}))
+    result.update(throughput_state="unavailable", inference_active=None)
+    return result
+
+
 async def get_llama_metrics(model_hint: Optional[str] = None) -> dict:
+    """Share one measured sample across status/model consumers for one second.
+
+    Counter deltas describe generation intervals, not instantaneous token output.
+    Retain the last measured positive rate until another generation is observed,
+    with its original timestamp and explicit retained/unavailable provenance.
+    Counter updates may occur only on completion; request activity is separate.
+    Never compute a new interval across an outage/model change.
+    """
+    global _llama_metrics_lock
+    if _llama_metrics_lock is None:
+        _llama_metrics_lock = asyncio.Lock()
+    model_name = model_hint
+    if model_name is None:
+        model_name = await get_loaded_model() or ""
+    service = SERVICES.get("llama-server", {})
+    identity = (LLM_BACKEND, service.get("host"), service.get("port"),
+                str(os.environ.get("LLAMA_METRICS_PORT", service.get("port", ""))), model_name,
+                "host-native" if _host_native_llm() else "")
+    async with _llama_metrics_lock:
+        now = _metrics_clock()
+        previous_identity = _llama_metrics_sample.get("identity")
+        if not model_name:
+            # Discovery failure is not proof of a different model. Hold only a
+            # same-endpoint historical sample, with its actual model identity.
+            same_endpoint = (previous_identity is not None
+                             and previous_identity[:4] + previous_identity[5:] == identity[:4] + identity[5:])
+            previous = _llama_metrics_sample.get("measurement") if same_endpoint else None
+            _prev_tokens.clear()
+            if not same_endpoint:
+                _llama_metrics_sample.clear()
+            return {
+                "tokens_per_second": previous["rate"] if previous else None,
+                "lifetime_tokens": _saved_lifetime_tokens(),
+                "token_count_mode": "cumulative",
+                "throughput_mode": (previous.get("mode") if previous else None) or "generation_interval",
+                "throughput_state": "unavailable",
+                "throughput_sampled_at": previous["at"] if previous else None,
+                "throughput_model": previous_identity[4] if previous else None,
+                "inference_active": None,
+            }
+        if previous_identity != identity:
+            _prev_tokens.clear()
+            _llama_metrics_sample.clear()
+        elif now - _llama_metrics_sample["time"] < _METRICS_SAMPLE_SECONDS:
+            return dict(_llama_metrics_sample["result"])
+        counter_id = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        try:
+            result = await _fetch_llama_metrics(model_hint=model_name, counter_id=counter_id)
+        except asyncio.CancelledError:
+            # A bounded background observer may time out while owning the
+            # sampler. Release the lock without measuring across that gap;
+            # cancellation while waiting for the lock never touches its owner.
+            _prev_tokens.clear()
+            if "result" in _llama_metrics_sample:
+                _llama_metrics_sample["result"].update(
+                    throughput_state="unavailable", inference_active=None)
+            raise
+        mode = result.pop("_throughput_mode", "generation_interval")
+
+        available = result.pop("_available", False)
+        reset = result.pop("_counter_reset", False)
+        counters = result.pop("_counters", None)
+        previous_counters = _llama_metrics_sample.get("counters")
+        if counters is not None:
+            if previous_counters is not None:
+                reset = reset or any(old is not None and new is not None and new < old
+                                     for old, new in zip(previous_counters, counters))
+            _llama_metrics_sample["counters"] = counters
+        if reset:
+            _llama_metrics_sample.pop("measurement", None)
+        previous = _llama_metrics_sample.get("measurement")
+        completion_identity = result.pop("_completion_identity", None)
+        rate = result.get("tokens_per_second")
+        newly_measured = (available and rate is not None and rate > 0
+                          and (completion_identity is None or previous is None
+                               or completion_identity != previous.get("completion_identity")))
+        if newly_measured:
+            previous = {"rate": rate, "at": _metrics_wall_clock(), "mode": mode,
+                        "completion_identity": completion_identity}
+            _llama_metrics_sample["measurement"] = previous
+        result["tokens_per_second"] = previous["rate"] if previous else None
+        result["throughput_sampled_at"] = previous["at"] if previous else None
+        result["throughput_state"] = ("unavailable" if not available or not previous
+                                       else "measured" if newly_measured else "retained")
+        result["throughput_mode"] = previous.get("mode", mode) if previous else mode
+        result.setdefault("inference_active", None)
+        result["throughput_model"] = model_name or None
+        _llama_metrics_sample.update(identity=identity, time=_metrics_clock(), result=dict(result))
+        return result
+
+
+def _observe_live_output_slots(payload, sampled_at: float):
+    """Rate of accepted output tokens for an unchanged set of active tasks.
+
+    llama.cpp b9014 server-context.cpp exports n_decoded as predicted_n and
+    increments it by accepted tokens, including accepted speculative tokens.
+    This is distinct from Prometheus n_decode_total (decode invocations).
+    Read only numeric identifiers/counters; never retain prompt/params/text.
+    The caller owns the shared sampler lock and clears this baseline on failure.
+    """
+    if not isinstance(payload, list):
+        raise ValueError("slot metrics must be a list")
+    counts = {}
+    seen_slots = set()
+    for slot in payload:
+        if not isinstance(slot, dict) or not isinstance(slot.get("is_processing"), bool):
+            raise ValueError("invalid slot activity")
+        if not slot["is_processing"]:
+            continue
+        slot_id, task_id = slot.get("id"), slot.get("id_task")
+        next_token = slot.get("next_token")
+        # b9014 returns a one-element array; older servers return an object.
+        if isinstance(next_token, list) and len(next_token) == 1:
+            next_token = next_token[0]
+        if not isinstance(next_token, dict):
+            raise ValueError("slot output counter unavailable")
+        count = next_token.get("n_decoded")
+        if any(type(value) is not int or not 0 <= value < 2**63
+               for value in (slot_id, task_id, count)) or slot_id in seen_slots:
+            raise ValueError("invalid slot output counter or identity")
+        seen_slots.add(slot_id)
+        counts[(slot_id, task_id)] = count
+    previous = _prev_tokens.get("live_slots")
+    _prev_tokens["live_slots"] = {"at": sampled_at, "counts": counts}
+    if not counts or previous is None or previous["counts"].keys() != counts.keys():
+        return None
+    elapsed = sampled_at - previous["at"]
+    if elapsed <= 0 or any(count < previous["counts"][key] for key, count in counts.items()):
+        return None  # task/reset/clock discontinuity starts a new interval
+    return round(sum(count - previous["counts"][key] for key, count in counts.items()) / elapsed, 1)
+
+
+# vLLM's counters (LLM_BACKEND=vllm) under the names the sampler reads. vLLM
+# exports no generation-seconds counter, so its throughput reads unavailable
+# while its token count still accumulates.
+_VLLM_COUNTERS = {
+    "vllm:generation_tokens_total": "tokens_predicted_total",
+    "vllm:num_requests_running": "requests_processing",
+}
+
+
+def _parse_llama_prometheus(body: str) -> dict:
+    """Read the llama.cpp (or vLLM) counters the dashboard samples from a /metrics body."""
+    metrics: dict = {}
+    for line in body.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        metric_name = parts[0].split("{", 1)[0]
+        if metric_name in _VLLM_COUNTERS:
+            try:
+                metrics[_VLLM_COUNTERS[metric_name]] = float(parts[1])
+            except ValueError:
+                pass
+            continue
+        for counter in ("requests_processing", "tokens_predicted_total", "tokens_predicted_seconds_total"):
+            if metric_name.endswith(counter):
+                try:
+                    metrics[counter] = float(parts[1])
+                except ValueError:
+                    pass
+    return metrics
+
+
+async def _fetch_llama_metrics(model_hint: Optional[str] = None, counter_id: Optional[str] = None) -> dict:
     """Get inference metrics from llama-server Prometheus /metrics endpoint.
 
     Accepts an optional *model_hint* so callers that already resolved the
     loaded model name can avoid a redundant HTTP round-trip.
     """
     try:
-        if LLM_BACKEND == "lemonade":
-            if read_live_env_value("AMD_INFERENCE_LOCATION").lower() == "host":
-                host_status = await request_agent_json("GET", "/v1/llm/status", timeout=6)
-                stats = host_status.get("stats")
-            else:
-                if "llama-server" not in SERVICES:
-                    return {
-                        "tokens_per_second": 0,
-                        "lifetime_tokens": 0,
-                        "token_count_mode": "unavailable",
-                    }
-                host = SERVICES["llama-server"]["host"]
-                port = SERVICES["llama-server"]["port"]
-                client = await _get_httpx_client()
-                stats = None
-                last_error: Exception | None = None
-                api_key = read_live_env_value("LEMONADE_API_KEY")
-                headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-                for prefix in ("/api/v1", "/v1"):
-                    try:
-                        resp = await client.get(
-                            f"http://{host}:{port}{prefix}/stats", headers=headers,
-                        )
-                        resp.raise_for_status()
-                        stats = resp.json()
-                        break
-                    except (httpx.HTTPError, ValueError) as exc:
-                        last_error = exc
-                if stats is None:
-                    raise ValueError(f"Lemonade stats endpoint is unavailable: {last_error}")
-            if not isinstance(stats, dict):
-                raise ValueError("Lemonade stats response is unavailable")
-            try:
-                tokens_per_second = float(stats.get("tokens_per_second") or 0)
-            except (TypeError, ValueError):
-                tokens_per_second = 0.0
-            if tokens_per_second and not is_plausible_single_request_tps(tokens_per_second):
-                logger.warning(
-                    "Ignoring implausible Lemonade single-request throughput: %s tok/s",
-                    tokens_per_second,
-                )
-                tokens_per_second = 0.0
-            output_tokens = int(_non_negative_number(stats.get("output_tokens")))
-            return {
-                "tokens_per_second": round(max(0.0, tokens_per_second), 1),
-                # Lemonade /v1/stats documents only the most recent request.
-                # It has no cumulative counter or stable event sequence, so
-                # polling cannot truthfully construct a lifetime total.
-                "lifetime_tokens": output_tokens,
-                "token_count_mode": "latest_completion",
-            }
-
-        if "llama-server" not in SERVICES:
-            return {
-                "tokens_per_second": 0,
-                "lifetime_tokens": _get_lifetime_tokens(),
-                "token_count_mode": "cumulative",
-            }
-
-        host = SERVICES["llama-server"]["host"]
-        port = SERVICES["llama-server"]["port"]
-        metrics_port = int(os.environ.get("LLAMA_METRICS_PORT", port))
-        model_name = model_hint if model_hint is not None else (await get_loaded_model() or "")
-        url = f"http://{host}:{metrics_port}/metrics"
-        params = {"model": model_name} if model_name else {}
-        client = await _get_httpx_client()
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-
-        metrics = {}
-        for line in resp.text.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            metric_name = parts[0].split("{", 1)[0]
-            if metric_name.endswith("tokens_predicted_total"):
-                try:
-                    metrics["tokens_predicted_total"] = float(parts[-1])
-                except ValueError:
-                    pass
-            if metric_name.endswith("tokens_predicted_seconds_total"):
-                try:
-                    metrics["tokens_predicted_seconds_total"] = float(parts[-1])
-                except ValueError:
-                    pass
+        slots_url = None
+        params: dict = {}
+        if _host_native_llm():
+            # The host agent already parsed llama.cpp's Prometheus counters.
+            reported = (await _host_llm_status()).get("metrics")
+            if not isinstance(reported, dict):
+                raise ValueError("host llama-server metrics are unavailable")
+            metrics = {key: reported[key] for key in (
+                "requests_processing", "tokens_predicted_total", "tokens_predicted_seconds_total",
+            ) if key in reported}
+            client = None
+        else:
+            if "llama-server" not in SERVICES:
+                return {
+                    "tokens_per_second": None,
+                    "lifetime_tokens": _saved_lifetime_tokens(),
+                    "token_count_mode": "cumulative",
+                }
+            host = SERVICES["llama-server"]["host"]
+            port = SERVICES["llama-server"]["port"]
+            metrics_port = int(os.environ.get("LLAMA_METRICS_PORT", port))
+            model_name = model_hint if model_hint is not None else (await get_loaded_model() or "")
+            url = f"http://{host}:{metrics_port}/metrics"
+            params = {"model": model_name} if model_name else {}
+            # /slots is llama.cpp's; vLLM has no per-slot output timing.
+            slots_url = None if LLM_BACKEND == "vllm" else f"http://{host}:{metrics_port}/slots"
+            client = await _get_httpx_client()
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            metrics = _parse_llama_prometheus(resp.text)
 
         # A successful HTTP response is not sufficient proof that this is the
         # llama.cpp Prometheus endpoint. Treat HTML, proxy error pages, and
@@ -487,60 +764,86 @@ async def get_llama_metrics(model_hint: Optional[str] = None) -> dict:
         if "tokens_predicted_total" not in metrics:
             raise ValueError("llama-server metrics response has no token counter")
 
-        now = time.time()
-        curr = _non_negative_number(metrics["tokens_predicted_total"])
-        gen_secs = _non_negative_number(metrics.get("tokens_predicted_seconds_total"))
-        if _prev_tokens["time"] > 0 and curr > _prev_tokens["count"]:
-            delta_secs = gen_secs - _prev_tokens.get("gen_secs", 0)
-            if delta_secs > 0:
-                _prev_tokens["tps"] = round((curr - _prev_tokens["count"]) / delta_secs, 1)
-            else:
-                _prev_tokens["tps"] = 0.0
-        else:
-            # The server is idle, has restarted, or reset its counters. A
-            # previous request's throughput is not live throughput.
-            _prev_tokens["tps"] = 0.0
-        _prev_tokens["count"] = curr
-        _prev_tokens["time"] = now
-        _prev_tokens["gen_secs"] = gen_secs
+        curr = _measurement_number(metrics["tokens_predicted_total"])
+        if curr is None:
+            raise ValueError("llama-server token counter is invalid")
+        gen_secs = _measurement_number(metrics.get("tokens_predicted_seconds_total"))
+        tps = None
+        reset = bool(_prev_tokens and (curr < _prev_tokens["count"] or
+                     (gen_secs is not None and _prev_tokens.get("gen_secs") is not None
+                      and gen_secs < _prev_tokens["gen_secs"])))
+        if _prev_tokens and gen_secs is not None:
+            delta_tokens = curr - _prev_tokens["count"]
+            previous_secs = _prev_tokens.get("gen_secs")
+            if previous_secs is not None:
+                delta_secs = gen_secs - previous_secs
+                if delta_tokens == 0 and delta_secs == 0:
+                    tps = 0.0  # two successful unchanged observations
+                elif delta_tokens > 0 and delta_secs > 0:
+                    tps = round(delta_tokens / delta_secs, 1)
+                # First samples, resets, or incomplete timing are unknown rates.
+        _prev_tokens.update(count=curr, gen_secs=gen_secs)
 
-        lifetime = _update_lifetime_tokens(curr)
+        lifetime = _update_lifetime_tokens(curr, counter_id=counter_id)
+        active = (metrics["requests_processing"] > 0
+                  if _measurement_number(metrics.get("requests_processing")) is not None else None)
+        available = gen_secs is not None
+        mode = "generation_interval"
+        if reset or active is not True:
+            _prev_tokens.pop("live_slots", None)
+        if active is True and slots_url:
+            try:
+                slots = await client.get(slots_url, params=params, timeout=2.0)
+                slots.raise_for_status()
+                live_rate = _observe_live_output_slots(slots.json(), _metrics_clock())
+                if live_rate is not None and live_rate > 0:
+                    tps, available, mode = live_rate, True, "live_output_interval"
+            except (httpx.HTTPError, OSError, ValueError, KeyError):
+                _prev_tokens.pop("live_slots", None)
+                # A fresh completed interval remains valid if slots are disabled.
+                # Otherwise a held rate must expose the live telemetry outage.
+                available = bool(available and tps is not None and tps > 0)
         return {
-            "tokens_per_second": _prev_tokens["tps"],
+            "tokens_per_second": tps,
             "lifetime_tokens": lifetime,
             "token_count_mode": "cumulative",
+            "_available": available,
+            "_throughput_mode": mode,
+            "_counter_reset": reset,
+            "_counters": (curr, gen_secs),
+            "inference_active": active,
         }
     except (AgentClientError, httpx.HTTPError, httpx.TimeoutException, OSError, ValueError, KeyError) as e:
+        _prev_tokens.clear()  # never measure a rate across an unavailable gap
         logger.warning("get_llama_metrics failed: %s: %s", type(e).__name__, e)
-        if LLM_BACKEND == "lemonade":
-            return {
-                "tokens_per_second": 0,
-                "lifetime_tokens": 0,
-                "token_count_mode": "unavailable",
-            }
         return {
-            "tokens_per_second": 0,
-            "lifetime_tokens": _get_lifetime_tokens(),
+            "tokens_per_second": None,
+            "lifetime_tokens": _saved_lifetime_tokens(),
             "token_count_mode": "cumulative",
         }
 
 
 async def get_loaded_model() -> Optional[str]:
     """Query llama-server for actually loaded model name."""
+    if _host_native_llm():
+        try:
+            health = (await _host_llm_status())["health"]
+        except (AgentClientError, OSError, ValueError):
+            return None
+        loaded = health.get("model_loaded")
+        return loaded.strip() if health.get("status") == "ok" and isinstance(loaded, str) and loaded.strip() else None
     if "llama-server" not in SERVICES:
         return None
     try:
         host = SERVICES["llama-server"]["host"]
         port = SERVICES["llama-server"]["port"]
         client = await _get_httpx_client()
-
-        # Lemonade lists ALL available models at /v1/models without a status
-        # field, so the first entry is arbitrary.  The health endpoint is the
-        # authoritative source for which model is actually loaded.
-        if LLM_BACKEND == "lemonade":
-            resp = await client.get(f"http://{host}:{port}{_LLM_API_PREFIX}/health")
-            loaded = resp.json().get("model_loaded")
-            return loaded if loaded else None
+        # A generic OpenAI-compatible server lists every available model with
+        # no loaded status; its first entry is not the active model.
+        external_compatible = (
+            LLM_BACKEND == "external"
+            and os.environ.get("EXTERNAL_LLM_PROVIDER", "").strip().lower() == "openai-compatible"
+        )
 
         # llama.cpp: /v1/models returns the loaded model with status info.
         resp = await client.get(f"http://{host}:{port}{_LLM_API_PREFIX}/models")
@@ -549,7 +852,7 @@ async def get_loaded_model() -> Optional[str]:
             status = m.get("status", {})
             if isinstance(status, dict) and status.get("value") == "loaded":
                 return m.get("id")
-        if models:
+        if models and not external_compatible:
             return models[0].get("id")
     except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
         logger.debug("get_loaded_model failed: %s", e)
@@ -562,8 +865,16 @@ async def get_llama_context_size(model_hint: Optional[str] = None) -> Optional[i
     Accepts an optional *model_hint* to skip the redundant
     ``get_loaded_model()`` call when the caller already has it.
     """
+    if _host_native_llm():
+        try:
+            context = (await _host_llm_status())["health"].get("context_length")
+        except (AgentClientError, OSError, ValueError):
+            return None
+        return context if type(context) is int and context > 0 else None
     if "llama-server" not in SERVICES:
         return None
+    if LLM_BACKEND == "vllm":
+        return await _vllm_context_size(model_hint)
     try:
         host = SERVICES["llama-server"]["host"]
         port = SERVICES["llama-server"]["port"]
@@ -580,12 +891,75 @@ async def get_llama_context_size(model_hint: Optional[str] = None) -> Optional[i
         return None
 
 
+async def _vllm_context_size(model_hint: Optional[str]) -> Optional[int]:
+    """The context vLLM serves: ``max_model_len`` of its /v1/models row.
+
+    vLLM has no /props; its --max-model-len fixes the context, and the row of
+    the served model reports it.
+    """
+    try:
+        host = SERVICES["llama-server"]["host"]
+        port = SERVICES["llama-server"]["port"]
+        client = await _get_httpx_client()
+        resp = await client.get(f"http://{host}:{port}{_LLM_API_PREFIX}/models")
+        payload = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+        logger.debug("vLLM context size unavailable: %s", e)
+        return None
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    for row in rows if isinstance(rows, list) else ():
+        if isinstance(row, dict) and (model_hint is None or row.get("id") == model_hint):
+            context = row.get("max_model_len")
+            return context if type(context) is int and context > 0 else None
+    return None
+
+
+async def get_llama_vision_support() -> Optional[bool]:
+    """Whether the active llama-server loaded a vision projector.
+
+    llama-server reports it as ``/props`` ``modalities.vision``. None when that
+    cannot be read: the owner's own server, an unreachable runtime, a build
+    without the field, or the vLLM engine, which reports no modalities.
+    """
+    if _host_native_llm():
+        try:
+            vision = (await _host_llm_status())["health"].get("vision")
+        except (AgentClientError, OSError, ValueError):
+            return None
+        return vision if type(vision) is bool else None
+    if LLM_BACKEND in {"external", "vllm"} or "llama-server" not in SERVICES:
+        return None
+    try:
+        host = SERVICES["llama-server"]["host"]
+        port = SERVICES["llama-server"]["port"]
+        client = await _get_httpx_client()
+        props = (await client.get(f"http://{host}:{port}/props")).json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.debug("get_llama_vision_support failed: %s", e)
+        return None
+    modalities = props.get("modalities") if isinstance(props, dict) else None
+    vision = modalities.get("vision") if isinstance(modalities, dict) else None
+    return vision if type(vision) is bool else None
+
+
 # --- Service Health Cache ---
 # Written by background poll loop in main.py, read by API endpoints.
 # Keeps health checking decoupled from request handling so slow DNS
 # lookups (Docker Desktop) never block API responses.
 
 _services_cache: Optional[list] = None  # list[ServiceStatus], set by poll loop
+_services_cache_revision = 0
+
+
+def _host_service_affirmed_stopped(service_id: str) -> bool:
+    """True when the host agent confirmed an installed service is stopped.
+
+    Agent failures still surface as ``down``; those remain hidden for optional
+    host tools. A confirmed stopped OpenCode must stay visible so the owner can
+    start it instead of seeing it vanish or a permanent "Offline" entry.
+    """
+    lifecycle = _opencode_lifecycle if service_id == "opencode" else None
+    return bool(lifecycle and lifecycle.get("state") == "stopped")
 
 
 def _normalize_cached_service_status(status: ServiceStatus) -> ServiceStatus:
@@ -595,6 +969,7 @@ def _normalize_cached_service_status(status: ServiceStatus) -> ServiceStatus:
         status.status == "down"
         and config.get("type") == "host-systemd"
         and not config.get("required", False)
+        and not _host_service_affirmed_stopped(status.id)
     ):
         return ServiceStatus(
             id=status.id,
@@ -607,15 +982,56 @@ def _normalize_cached_service_status(status: ServiceStatus) -> ServiceStatus:
     return status
 
 
-def set_services_cache(statuses: list) -> None:
-    """Store latest health check results (called by background poll)."""
-    global _services_cache
+def get_services_cache_revision() -> int:
+    """Revision captured before a background health poll starts."""
+    return _services_cache_revision
+
+
+def set_services_cache(statuses: list, *, expected_revision: Optional[int] = None) -> bool:
+    """Store a poll result only if no owner refresh superseded its snapshot."""
+    global _services_cache, _services_cache_revision
+    if expected_revision is not None and expected_revision != _services_cache_revision:
+        return False
     _services_cache = [_normalize_cached_service_status(status) for status in statuses]
+    _services_cache_revision += 1
+    return True
 
 
 def get_cached_services() -> Optional[list]:
     """Read cached health check results. Returns None if no poll has completed yet."""
     return _services_cache
+
+
+async def refresh_cached_service_status(service_id: str) -> None:
+    """Re-check one service and replace its cached row after an owner action."""
+    global _services_cache, _services_cache_revision
+    config = SERVICES.get(service_id)
+    if config is None or _services_cache is None:
+        return
+    status = _normalize_cached_service_status(await check_service_health(service_id, config))
+    _services_cache = [status if item.id == service_id else item for item in _services_cache]
+    _services_cache_revision += 1
+
+
+async def refresh_cached_builtin_services(service_ids: list[str]) -> None:
+    """Publish current health after a Library start, before its response.
+
+    A newly selected built-in may be absent from both the import-time registry
+    and the cache. Use the same current manifests and Docker reconciliation as
+    the poller, and fence polls begun before or during this owner refresh.
+    The caller retains the affected extension operation locks throughout.
+    """
+    global _services_cache, _services_cache_revision
+    selected = set(service_ids) & LIBRARY_MANAGEABLE_BUILTINS
+    if not selected or _services_cache is None:
+        return  # An uncached catalog already performs a fresh full observation.
+    _services_cache_revision += 1
+    statuses = await get_all_services(only_service_ids=selected)
+    # Merge into the current list: an unrelated owner refresh may have finished
+    # while these probes awaited I/O. Never put its old row back.
+    _services_cache = [row for row in _services_cache if row.id not in selected]
+    _services_cache.extend(_normalize_cached_service_status(row) for row in statuses)
+    _services_cache_revision += 1
 
 
 # --- Service Health ---
@@ -635,14 +1051,49 @@ async def check_service_health(
     if config.get("type") == "host-systemd":
         return await _check_host_systemd_health(service_id, config)
 
-    if config.get("host_network") and int(config.get("port") or 0) <= 0:
+    def port_number(value):
+        if type(value) is not int and not (
+            isinstance(value, str) and re.fullmatch(r"[0-9]{1,5}", value.strip())
+        ):
+            raise ValueError("port must be an integer")
+        port = int(value)
+        if not 0 <= port <= 65535:
+            raise ValueError("port outside valid range")
+        return port
+
+    # Keep the service visible as down on malformed configuration, without
+    # probing an unrelated default port. Zero represents an invalid/absent port.
+    safe = {**config, "name": str(config.get("name") or service_id), "port": 0, "external_port": 0}
+    try:
+        safe["port"] = port_number(config.get("port"))
+        safe["external_port"] = port_number(config.get("external_port", safe["port"]))
+    except (ValueError, TypeError):
+        return _service_status_from_config(service_id, safe, "down")
+    config = safe
+
+    if config.get("host_network") and config["port"] == 0:
         if service_id == "tailscale":
             return await _check_tailscale_health(service_id, config)
         return _service_status_from_config(service_id, config, "not_deployed")
 
     host = config.get('host', 'localhost')
-    health_port = config.get('health_port', config['port'])
-    url = f"http://{host}:{health_port}{config['health']}"
+    try:
+        health_path = config.get('health', '/')
+        if not isinstance(health_path, str):
+            raise ValueError("health path must be a string")
+        if not health_path.startswith('/'):
+            health_path = f"/{health_path}"
+        health_port = port_number(config.get('health_port', config['port']))
+        if health_port == 0:
+            raise ValueError("HTTP health port must be positive")
+    except (ValueError, TypeError):
+        return _service_status_from_config(service_id, config, "down")
+    # A model API (API mode) is not a local service: probe it with its own
+    # scheme and Host header. The probe carries no key (only LiteLLM holds
+    # it), so an API that answers 401/403 is up; this checks reachability.
+    external_api = config.get("external_api") is True
+    scheme = config.get("scheme") if external_api and config.get("scheme") in ("http", "https") else "http"
+    url = f"{scheme}://{host}:{health_port}{health_path}"
     status = "unknown"
     response_time = None
 
@@ -650,14 +1101,32 @@ async def check_service_health(
         session = await _get_aio_session()
         start = asyncio.get_event_loop().time()
         # Send Host header so reverse-proxy services (e.g. Caddy in Baserow)
-        # route the request correctly instead of returning 404.
-        headers = {"Host": "localhost"}
+        # route the request correctly instead of returning 404. Some API
+        # front ends refuse a library User-Agent (Cloudflare error 1010).
+        headers = {"User-Agent": "ODS-Dashboard"} if external_api else {"Host": "localhost"}
         get_kwargs: dict = {"headers": headers}
+        health_auth_env = config.get("health_auth_env")
+        if health_auth_env is not None:
+            prefix = service_id.upper().replace("-", "_") + "_"
+            if (not isinstance(health_auth_env, str)
+                    or not re.fullmatch(r"[A-Z][A-Z0-9_]{1,127}", health_auth_env)
+                    or not health_auth_env.startswith(prefix)
+                    or host != service_id):
+                return _service_status_from_config(service_id, config, "unhealthy")
+            token = read_live_env_value(health_auth_env)
+            if not isinstance(token, str) or not token or len(token) > 8192 or any(ord(char) <= 32 or ord(char) >= 127 for char in token):
+                return _service_status_from_config(service_id, config, "unhealthy")
+            headers["Authorization"] = "Bearer " + token
+            # Never forward a local extension credential to a redirect target.
+            get_kwargs["allow_redirects"] = False
         if timeout is not None:
             get_kwargs["timeout"] = timeout
         async with session.get(url, **get_kwargs) as resp:
             response_time = (asyncio.get_event_loop().time() - start) * 1000
-            status = "healthy" if resp.status < 400 else "unhealthy"
+            if external_api:
+                status = "healthy" if resp.status < 400 or resp.status in (401, 403) else "unhealthy"
+            else:
+                status = "healthy" if resp.status < (300 if health_auth_env is not None else 400) else "unhealthy"
     except asyncio.TimeoutError:
         # Service is reachable but slow — report degraded rather than down
         # to avoid false "offline" flashes during startup or heavy load.
@@ -667,8 +1136,11 @@ async def check_service_health(
             status = "not_deployed"
         else:
             status = "down"
-    except (aiohttp.ClientError, OSError) as e:
-        logger.debug(f"Health check failed for {service_id} at {url}: {e}")
+    except (aiohttp.ClientError, OSError, ValueError) as e:
+        if config.get("health_auth_env") is None:
+            logger.debug(f"Health check failed for {service_id} at {url}: {e}")
+        else:
+            logger.debug("Authenticated health check failed for %s", service_id)
         status = "down"
 
     return ServiceStatus(
@@ -678,17 +1150,111 @@ async def check_service_health(
     )
 
 
-async def get_all_services() -> list[ServiceStatus]:
+def _switched_off_status(service_id: str, config: dict, **health_kwargs):
+    """An awaitable status for Open WebUI when the install switched it off, else None.
+
+    The Compose resolver leaves Open WebUI out when ENABLE_OPEN_WEBUI is not
+    "true" (docker-compose.gateway-only.yml). Probing it then failed on name
+    resolution, and only two exact DNS error texts count as not deployed;
+    Docker in WSL words it differently, so Windows counted a core service
+    offline (fleet, Strixy: "6/7 core services online").
+
+    Where this API cannot read the owner's .env (an install owner other than
+    UID 1000), the flag is the one Compose passed when the container started.
+    A Library add changes the choice later, and Open WebUI then read "not
+    deployed" beside a healthy container (Workstation06, 2026-10-27), so the
+    host agent's reading of the owner's choice decides.
+    """
+    if service_id != "open-webui":
+        return None
+    flag = read_live_env_value("ENABLE_OPEN_WEBUI")
+    env_unreadable = get_env_file_read_error() is not None
+    if (flag or "true").strip().lower() == "true":
+        return None
+
+    async def switched_off():
+        if env_unreadable and await _owner_selected_open_webui():
+            return await check_service_health(service_id, config, **health_kwargs)
+        return _service_status_from_config(service_id, config, "not_deployed")
+    return switched_off()
+
+
+async def _owner_selected_open_webui() -> bool:
+    """Whether the install owner's .env selects Open WebUI, as the host agent reads it."""
+    try:
+        selection = await request_agent_json("GET", "/v1/webui/selection", timeout=3)
+    except (AgentClientError, ValueError):
+        return False
+    return isinstance(selection, dict) and selection.get("enabled") is True
+
+
+# Last time each service's own probe succeeded (monotonic seconds).
+_last_probe_success: dict[str, float] = {}
+# First completed observation bounds startup grace even if no probe succeeds.
+_first_probe_seen: dict[str, float] = {}
+_probe_clock = time.monotonic
+_TIMEOUT_OVERRIDE_GRACE_S = 60.0
+
+
+def _timeout_override_allowed(service_id: str, now: float) -> bool:
+    """Bound Docker-only health to startup or a recent application success."""
+    last_ok = _last_probe_success.get(service_id)
+    anchor = last_ok if last_ok is not None else _first_probe_seen.get(service_id)
+    return anchor is not None and now - anchor <= _TIMEOUT_OVERRIDE_GRACE_S
+
+
+_CRASH_LOOP_RESTARTS = 3
+
+
+def container_crash_looping(item: dict) -> bool:
+    """Whether a host service-health row shows a restart policy reviving a crash.
+
+    Each restart begins the container's health check anew, so a crash loop
+    reads as "starting" and its card said "installing" indefinitely
+    (Workstation06, 2026-10-27: Qdrant and TEI on ARM64). One or two
+    restarts can be a start-up race; a third is a loop.
+    """
+    restarts = item.get("restart_count")
+    if type(restarts) is not int or restarts < _CRASH_LOOP_RESTARTS:
+        return False
+    state = str(item.get("state") or "").casefold()
+    return state == "restarting" or (
+        state == "running" and str(item.get("health") or "").casefold() == "starting")
+
+
+async def get_all_services(*, only_service_ids: Optional[set[str]] = None) -> list[ServiceStatus]:
     """Get all service health statuses.
 
     Uses ``return_exceptions=True`` so that one misbehaving service
     cannot take down the entire status response.
     """
-    tasks = [check_service_health(sid, cfg) for sid, cfg in SERVICES.items()]
+    # The API can stay up while Library actions rename an optional built-in's
+    # Compose fragment. Refresh only qualified later-add services here so an
+    # omitted service becomes visible after Add, and disappears after Disable,
+    # without changing the import-time registry or probing every omitted app.
+    service_configs = dict(SERVICES)
+    try:
+        current_optional, _, _ = await asyncio.to_thread(
+            load_extension_manifests, EXTENSIONS_DIR, GPU_BACKEND,
+            only_service_ids=LIBRARY_MANAGEABLE_BUILTINS,
+        )
+    except OSError as exc:
+        logger.warning("Library built-in manifest refresh failed: %s", exc)
+    else:
+        for service_id in LIBRARY_MANAGEABLE_BUILTINS:
+            if service_id in current_optional:
+                service_configs.setdefault(service_id, current_optional[service_id])
+            else:
+                service_configs.pop(service_id, None)
+    if only_service_ids is not None:
+        service_configs = {sid: cfg for sid, cfg in service_configs.items() if sid in only_service_ids}
+    health_kwargs = {"timeout": _CATALOG_HEALTH_TIMEOUT} if only_service_ids is not None else {}
+    tasks = [_switched_off_status(sid, cfg, **health_kwargs) or check_service_health(sid, cfg, **health_kwargs)
+             for sid, cfg in service_configs.items()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     statuses: list[ServiceStatus] = []
-    for (sid, cfg), result in zip(SERVICES.items(), results):
+    for (sid, cfg), result in zip(service_configs.items(), results):
         if isinstance(result, BaseException):
             logger.warning("Health check for %s raised %s: %s", sid, type(result).__name__, result)
             statuses.append(ServiceStatus(
@@ -698,6 +1264,11 @@ async def get_all_services() -> list[ServiceStatus]:
             ))
         else:
             statuses.append(result)
+    now = _probe_clock()
+    for status in statuses:
+        _first_probe_seen.setdefault(status.id, now)
+        if status.status == "healthy":
+            _last_probe_success[status.id] = now
     if not any(status.status in {"degraded", "down", "unhealthy"} for status in statuses):
         return statuses
 
@@ -719,46 +1290,64 @@ async def get_all_services() -> list[ServiceStatus]:
             if isinstance(item, dict) and item.get("container_name")
         }
     except (AgentClientError, ValueError):
+        containers = []
         by_service = {}
         by_name = {}
 
     reconciled: list[ServiceStatus] = []
     for status in statuses:
-        config = SERVICES.get(status.id, {})
+        config = service_configs.get(status.id, {})
         item = by_service.get(status.id) or by_name.get(str(config.get("container_name") or ""))
         replacement = status.status
+        startup_pending = False
+        crash_looping = False
         if item and config.get("type", "docker") == "docker":
             health = str(item.get("health") or "none").casefold()
             state = str(item.get("state") or "unknown").casefold()
-            if health == "healthy" and status.status == "degraded":
+            if container_crash_looping(item):
+                replacement = "unhealthy"
+                crash_looping = True
+            elif health == "healthy" and status.status == "degraded" and _timeout_override_allowed(status.id, now):
                 # A successful declared Docker healthcheck is authoritative for
                 # transient dashboard-network timeouts, but never masks HTTP
                 # errors or connection refusal from the application probe.
+                # The in-container check cannot see inter-container network
+                # loss, so it only covers startup or a short grace window.
                 replacement = "healthy"
             elif health == "unhealthy":
                 replacement = "unhealthy"
-            elif health == "starting" and status.status in {"down", "degraded"}:
+            elif state == "running" and health == "starting" and status.status in {"down", "degraded"}:
                 replacement = "degraded"
+                # Do not turn a timeout into startup guidance without one
+                # unambiguous running container's declared health state.
+                matches = [row for row in containers if isinstance(row, dict) and (
+                    row.get("service_id") == status.id or (
+                        config.get("container_name") and
+                        row.get("container_name") == config["container_name"]
+                    )
+                )]
+                startup_pending = len(matches) == 1
             elif state in {"exited", "dead", "removing"}:
                 replacement = "down"
-        if replacement != status.status:
-            status = status.model_copy(update={"status": replacement})
+        if (replacement != status.status or startup_pending != status.startup_pending
+                or crash_looping != status.crash_looping):
+            status = status.model_copy(update={"status": replacement, "startup_pending": startup_pending,
+                                               "crash_looping": crash_looping})
         reconciled.append(status)
 
-    if LLM_BACKEND == "lemonade" and read_live_env_value("AMD_INFERENCE_LOCATION").lower() == "host":
+    if _host_native_llm():
         llama_index = next(
             (index for index, status in enumerate(reconciled) if status.id == "llama-server"),
             None,
         )
         if llama_index is not None and reconciled[llama_index].status != "healthy":
             try:
-                host_status = await request_agent_json("GET", "/v1/llm/status", timeout=6)
-                health = host_status.get("health")
-                if isinstance(health, dict) and str(health.get("status") or "").casefold() == "ok":
+                health = (await _host_llm_status())["health"]
+                if str(health.get("status") or "").casefold() == "ok":
                     reconciled[llama_index] = reconciled[llama_index].model_copy(
                         update={"status": "healthy"},
                     )
-            except AgentClientError:
+            except (AgentClientError, ValueError):
                 pass
     return reconciled
 
@@ -812,93 +1401,110 @@ def get_disk_usage() -> DiskUsage:
     return DiskUsage(path=path, used_gb=round(used / (1024**3), 2), total_gb=round(total / (1024**3), 2), percent=percent)
 
 
+def owner_model_config() -> Optional[dict]:
+    """The configured model as the install owner's host agent reads it from .env.
+
+    For an install owner other than UID 1000, whose private .env this API
+    cannot read (Workstation06, 2026-10-26: nvuser, UID 1001). The agent
+    returns only validated identities. None when it cannot answer.
+    """
+    try:
+        snapshot = request_agent_json_sync("GET", "/v1/model/config", timeout=5)
+    except AgentClientError:
+        return None
+    model = snapshot.get("configuredModel") if isinstance(snapshot, dict) else None
+    return model if isinstance(model, dict) else None
+
+
 def get_model_info() -> Optional[ModelInfo]:
     """Get current model info from .env config."""
     env_path = Path(INSTALL_DIR) / ".env"
-    if env_path.exists():
+    if not env_path.exists():
+        return None
+    try:
+        env_values = {}
+        with open(env_path) as f:
+            for line in f:
+                if "=" not in line or line.lstrip().startswith("#"):
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = parse_env_value(value)
+                env_values[key] = value
+    except PermissionError:
+        # An install owner other than UID 1000 keeps its private .env from this
+        # API: every status poll logged the refusal and the Dashboard showed no
+        # configured model. The owner's host agent reads it instead.
+        owner = owner_model_config() or {}
+        env_values = {"LLM_MODEL": owner.get("llmModel") or "", "GGUF_FILE": owner.get("ggufFile") or "",
+                      "CTX_SIZE": str(owner.get("contextSize") or "")}
+    except OSError as e:
+        logger.warning("Failed to read .env for model info: %s", e)
+        return None
+
+    model_name = env_values.get("LLM_MODEL")
+    if not model_name:
+        return None
+    size_gb, quant = 15.0, None
+    # CTX_SIZE/MAX_CONTEXT come straight from .env and may be
+    # non-numeric (e.g. "auto", "8k", or a trailing comment); fall
+    # back to the default rather than 500-ing every caller. Mirrors
+    # the guard already used in routers/models.py.
+    context = 32768
+    for key in ("CTX_SIZE", "MAX_CONTEXT"):
         try:
-            env_values = {}
-            with open(env_path) as f:
-                for line in f:
-                    if "=" not in line or line.lstrip().startswith("#"):
-                        continue
-                    key, value = line.split("=", 1)
-                    key = key.strip()
-                    if not key:
-                        continue
-                    value = value.strip()
-                    # Strip exactly one matching pair of surrounding quotes.
-                    # str.strip("\"'") removes any run of either quote from
-                    # both ends, so a value legitimately ending in a quote is
-                    # truncated and "'literal'" loses its inner quotes. Keep
-                    # mismatched quotes verbatim, matching lib/safe-env.sh.
-                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                        value = value[1:-1]
-                    env_values[key] = value
+            candidate = int(env_values.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if candidate > 0:
+            context = candidate
+            break
 
-            model_name = env_values.get("LLM_MODEL")
-            if model_name:
-                size_gb, quant = 15.0, None
-                # CTX_SIZE/MAX_CONTEXT come straight from .env and may be
-                # non-numeric (e.g. "auto", "8k", or a trailing comment); fall
-                # back to the default rather than 500-ing every caller. Mirrors
-                # the guard already used in routers/models.py.
-                context = 32768
-                for key in ("CTX_SIZE", "MAX_CONTEXT"):
-                    try:
-                        candidate = int(env_values.get(key) or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if candidate > 0:
-                        context = candidate
-                        break
+    import re as _re
 
-                import re as _re
+    name_lower = model_name.lower()
+    if "gemma-4-e2b" in name_lower:
+        size_gb = 2.8
+    elif "gemma-4-e4b" in name_lower:
+        size_gb = 5.3
+    elif "gemma-4-26b" in name_lower:
+        size_gb = 18.0
+    elif "gemma-4-31b" in name_lower:
+        size_gb = 19.8
+    elif _re.search(r'\b2b\b', name_lower):
+        size_gb = 1.5
+    elif _re.search(r'\b4b\b', name_lower):
+        size_gb = 2.8
+    elif _re.search(r'\b7b\b', name_lower):
+        size_gb = 4.0
+    elif _re.search(r'\b8b\b', name_lower):
+        size_gb = 4.5
+    elif _re.search(r'\b9b\b', name_lower):
+        size_gb = 5.8
+    elif _re.search(r'\b14b\b', name_lower):
+        size_gb = 8.0
+    elif _re.search(r'\b26b\b', name_lower):
+        size_gb = 18.0
+    elif _re.search(r'\b30b\b', name_lower):
+        size_gb = 18.6
+    elif _re.search(r'\b31b\b', name_lower):
+        size_gb = 19.8
+    elif _re.search(r'\b32b\b', name_lower):
+        size_gb = 16.0
+    elif _re.search(r'\b70b\b', name_lower):
+        size_gb = 35.0
 
-                name_lower = model_name.lower()
-                if "gemma-4-e2b" in name_lower:
-                    size_gb = 2.8
-                elif "gemma-4-e4b" in name_lower:
-                    size_gb = 5.3
-                elif "gemma-4-26b" in name_lower:
-                    size_gb = 18.0
-                elif "gemma-4-31b" in name_lower:
-                    size_gb = 19.8
-                elif _re.search(r'\b2b\b', name_lower):
-                    size_gb = 1.5
-                elif _re.search(r'\b4b\b', name_lower):
-                    size_gb = 2.8
-                elif _re.search(r'\b7b\b', name_lower):
-                    size_gb = 4.0
-                elif _re.search(r'\b8b\b', name_lower):
-                    size_gb = 4.5
-                elif _re.search(r'\b9b\b', name_lower):
-                    size_gb = 5.8
-                elif _re.search(r'\b14b\b', name_lower):
-                    size_gb = 8.0
-                elif _re.search(r'\b26b\b', name_lower):
-                    size_gb = 18.0
-                elif _re.search(r'\b30b\b', name_lower):
-                    size_gb = 18.6
-                elif _re.search(r'\b31b\b', name_lower):
-                    size_gb = 19.8
-                elif _re.search(r'\b32b\b', name_lower):
-                    size_gb = 16.0
-                elif _re.search(r'\b70b\b', name_lower):
-                    size_gb = 35.0
+    gguf_file = env_values.get("GGUF_FILE", "").lower()
+    if "awq" in name_lower:
+        quant = "AWQ"
+    elif "gptq" in name_lower:
+        quant = "GPTQ"
+    elif "gguf" in name_lower or gguf_file.endswith(".gguf"):
+        quant = "GGUF"
 
-                gguf_file = env_values.get("GGUF_FILE", "").lower()
-                if "awq" in name_lower:
-                    quant = "AWQ"
-                elif "gptq" in name_lower:
-                    quant = "GPTQ"
-                elif "gguf" in name_lower or gguf_file.endswith(".gguf"):
-                    quant = "GGUF"
-
-                return ModelInfo(name=model_name, size_gb=size_gb, context_length=context, quantization=quant)
-        except OSError as e:
-            logger.warning("Failed to read .env for model info: %s", e)
-    return None
+    return ModelInfo(name=model_name, size_gb=size_gb, context_length=context, quantization=quant)
 
 
 def get_bootstrap_status() -> BootstrapStatus:
@@ -916,6 +1522,7 @@ def get_bootstrap_status() -> BootstrapStatus:
             return BootstrapStatus(active=False)
         if status == "" and not data.get("bytesDownloaded") and not data.get("percent"):
             return BootstrapStatus(active=False)
+        phase = status if status in ("starting", "downloading", "verifying", "swapping") else None
 
         # Reconcile with the filesystem only for non-active states. If the
         # target model file is already present on disk and the status is
@@ -961,7 +1568,7 @@ def get_bootstrap_status() -> BootstrapStatus:
             bytes_downloaded = max(0, min(bytes_downloaded, bytes_total))
 
         return BootstrapStatus(
-            active=True, model_name=data.get("model"), percent=percent,
+            active=True, phase=phase, model_name=data.get("model"), percent=percent,
             downloaded_gb=bytes_downloaded / (1024**3) if bytes_downloaded else None,
             total_gb=bytes_total / (1024**3) if bytes_total else None,
             speed_mbps=speed_bps / (1024**2) if speed_bps else None,
@@ -1002,7 +1609,7 @@ def get_uptime() -> int:
 
 def _get_cpu_metrics_linux() -> dict:
     """Get CPU usage from /proc/stat (Linux only)."""
-    result = {"percent": 0, "temp_c": None}
+    result = {"percent": None, "temp_c": None}
     try:
         with open("/proc/stat") as f:
             line = f.readline()
@@ -1016,27 +1623,33 @@ def _get_cpu_metrics_linux() -> dict:
             d_idle, d_total = idle - prev_idle, total - prev_total
             get_cpu_metrics._prev = (idle, total)
             if d_total > 0:
-                result["percent"] = round((1 - d_idle / d_total) * 100, 1)
-    except OSError as e:
+                result["percent"] = max(0.0, min(100.0, round((1 - d_idle / d_total) * 100, 1)))
+    except (OSError, ValueError) as e:
         logger.debug("Failed to read /proc/stat: %s", e)
 
     try:
         import glob
         for tz in sorted(glob.glob("/sys/class/thermal/thermal_zone*/type")):
-            with open(tz) as f:
-                zone_type = f.read().strip()
-            if any(k in zone_type.lower() for k in ("k10temp", "coretemp", "cpu", "soc", "tctl")):
-                with open(tz.replace("/type", "/temp")) as f:
-                    result["temp_c"] = int(f.read().strip()) // 1000
-                break
-        if result["temp_c"] is None:
-            for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*/name")):
-                with open(hwmon) as f:
-                    name = f.read().strip()
-                if name in ("k10temp", "coretemp", "zenpower"):
-                    with open(hwmon.replace("/name", "/temp1_input")) as f:
+            try:
+                with open(tz) as f:
+                    zone_type = f.read().strip()
+                if any(k in zone_type.lower() for k in ("k10temp", "coretemp", "cpu", "soc", "tctl")):
+                    with open(tz.replace("/type", "/temp")) as f:
                         result["temp_c"] = int(f.read().strip()) // 1000
                     break
+            except (OSError, ValueError):
+                continue
+        if result["temp_c"] is None:
+            for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*/name")):
+                try:
+                    with open(hwmon) as f:
+                        name = f.read().strip()
+                    if name in ("k10temp", "coretemp", "zenpower"):
+                        with open(hwmon.replace("/name", "/temp1_input")) as f:
+                            result["temp_c"] = int(f.read().strip()) // 1000
+                        break
+                except (OSError, ValueError):
+                    continue
     except OSError as e:
         logger.debug("Failed to read CPU temperature: %s", e)
     return result
@@ -1044,7 +1657,7 @@ def _get_cpu_metrics_linux() -> dict:
 
 def _get_cpu_metrics_darwin() -> dict:
     """Get CPU usage on macOS via host_processor_info."""
-    result = {"percent": 0, "temp_c": None}
+    result = {"percent": None, "temp_c": None}
     try:
         import subprocess
         out = subprocess.run(
@@ -1065,15 +1678,21 @@ def get_cpu_metrics() -> dict:
     """Get CPU usage percentage and temperature (cross-platform)."""
     _system = platform.system()
     if _system == "Linux":
-        return _get_cpu_metrics_linux()
+        if os.environ.get("GPU_BACKEND", "").lower() == "apple":
+            return apple_host_metrics()["cpu"]
+        if linux_scope() == "wsl":
+            native = windows_host_metrics()["cpu"]
+            if native is not None:
+                return native
+        return {**_get_cpu_metrics_linux(), "scope": linux_scope(), "source": "linux-procfs"}
     elif _system == "Darwin":
-        return _get_cpu_metrics_darwin()
-    return {"percent": 0, "temp_c": None}
+        return {**_get_cpu_metrics_darwin(), "scope": "host", "source": "macos-top"}
+    return {"percent": None, "temp_c": None}
 
 
 def _get_ram_metrics_linux() -> dict:
     """Get RAM usage from /proc/meminfo (Linux only)."""
-    result = {"used_gb": 0, "total_gb": 0, "percent": 0}
+    result = {"used_gb": None, "total_gb": None, "percent": None}
     try:
         meminfo = {}
         with open("/proc/meminfo") as f:
@@ -1082,31 +1701,22 @@ def _get_ram_metrics_linux() -> dict:
                 if len(parts) >= 2:
                     meminfo[parts[0].rstrip(":")] = int(parts[1])
         total = meminfo.get("MemTotal", 0)
-        available = meminfo.get("MemAvailable", 0)
-        used = total - available
+        if total <= 0 or "MemAvailable" not in meminfo:
+            return result
+        available = meminfo["MemAvailable"]
+        used = max(0, total - available)
         result["total_gb"] = round(total / (1024 * 1024), 1)
         result["used_gb"] = round(used / (1024 * 1024), 1)
         if total > 0:
-            result["percent"] = round(used / total * 100, 1)
-        # On Apple Silicon, override total_gb with the host's actual RAM
-        host_ram_gb_str = os.environ.get("HOST_RAM_GB", "")
-        gpu_backend = os.environ.get("GPU_BACKEND", "").lower()
-        if gpu_backend == "apple" and host_ram_gb_str:
-            try:
-                host_ram_gb = float(host_ram_gb_str)
-                if host_ram_gb > 0:
-                    result["total_gb"] = round(host_ram_gb, 1)
-                    result["percent"] = round(used / (host_ram_gb * 1024 * 1024) * 100, 1)
-            except ValueError:
-                pass
-    except OSError as e:
+            result["percent"] = max(0.0, min(100.0, round(used / total * 100, 1)))
+    except (OSError, ValueError) as e:
         logger.debug("Failed to read /proc/meminfo: %s", e)
     return result
 
 
 def _get_ram_metrics_sysctl() -> dict:
     """Get RAM usage on macOS via sysctl."""
-    result = {"used_gb": 0, "total_gb": 0, "percent": 0}
+    result = {"used_gb": None, "total_gb": None, "percent": None}
     try:
         import subprocess
         out = subprocess.run(
@@ -1115,6 +1725,8 @@ def _get_ram_metrics_sysctl() -> dict:
         )
         if out.returncode == 0:
             total_bytes = int(out.stdout.strip())
+            if total_bytes <= 0:
+                return result
             total_gb = total_bytes / (1024 ** 3)
             result["total_gb"] = round(total_gb, 1)
             # vm_stat for used memory
@@ -1128,11 +1740,13 @@ def _get_ram_metrics_sysctl() -> dict:
                     match = re.match(r"(.+?):\s+(\d+)", line)
                     if match:
                         pages[match.group(1).strip()] = int(match.group(2))
-                page_size = 16384  # default on Apple Silicon
+                page_size = None
                 ps_match = re.search(r"page size of (\d+) bytes", vm.stdout)
                 if ps_match:
                     page_size = int(ps_match.group(1))
-                active = pages.get("Pages active", 0)
+                if page_size is None or not all(key in pages for key in ("Pages active", "Pages wired down", "Pages occupied by compressor")):
+                    return result
+                active = pages["Pages active"]
                 wired = pages.get("Pages wired down", 0)
                 compressed = pages.get("Pages occupied by compressor", 0)
                 used_bytes = (active + wired + compressed) * page_size
@@ -1148,7 +1762,222 @@ def get_ram_metrics() -> dict:
     """Get RAM usage (cross-platform)."""
     _system = platform.system()
     if _system == "Linux":
-        return _get_ram_metrics_linux()
+        if os.environ.get("GPU_BACKEND", "").lower() == "apple":
+            return apple_host_metrics()["ram"]
+        if linux_scope() == "wsl":
+            native = windows_host_metrics()["ram"]
+            if native is not None:
+                return native
+        return {**_get_ram_metrics_linux(), "scope": linux_scope(), "source": "linux-procfs"}
     elif _system == "Darwin":
-        return _get_ram_metrics_sysctl()
-    return {"used_gb": 0, "total_gb": 0, "percent": 0}
+        return {**_get_ram_metrics_sysctl(), "scope": "host", "source": "macos-vm-stat"}
+    return {"used_gb": None, "total_gb": None, "percent": None}
+
+
+def string_extract_domain_names_safe(text: str) -> list:
+    """
+    Safely extract domain names (hostnames) from a raw string or text block.
+    Guards against None, non-string input, empty string, malformed URLs, and regex exceptions.
+    Returns a sorted list of unique lowercase domain names.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    if len(text) > 65536:
+        return []
+    # Tokenize first so an invalid long label cannot match a valid suffix.
+    # This extracts text candidates; it is not an SSRF/URL authorization check.
+    domains = set()
+    for candidate in re.findall(r"[A-Za-z0-9.-]+", text):
+        candidate = candidate.lower().strip(".")
+        labels = candidate.split(".")
+        if (len(candidate) <= 253 and len(labels) >= 2
+                and 2 <= len(labels[-1]) <= 63 and labels[-1].isalpha()
+                and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                        for label in labels)):
+            domains.add(candidate)
+    return sorted(domains)
+
+
+def dict_key_path_setter_safe(d: dict, path_keys: list, value: any) -> dict:
+    """
+    Safely set a nested key value in a dictionary given a list of path keys.
+    Guards against invalid dictionaries, paths over 128 keys, and unsupported keys.
+    Invalid paths leave the dictionary untouched; valid paths replace scalar parents.
+    Returns the modified dictionary (or a new dict if d is None/invalid).
+    """
+    if d is None or not isinstance(d, dict):
+        d = {}
+    if (not isinstance(path_keys, (list, tuple)) or not 1 <= len(path_keys) <= 128
+            or any(type(key) not in (str, int) for key in path_keys)):
+        return d
+
+    current = d
+    for key in path_keys[:-1]:
+        k_str = key
+        if k_str not in current or not isinstance(current[k_str], dict):
+            current[k_str] = {}
+        current = current[k_str]
+
+    final_key = path_keys[-1]
+    current[final_key] = value
+    return d
+
+
+def numeric_safe_geometric_mean(numbers: list) -> float:
+    """
+    Safely compute the geometric mean of a list of positive numbers.
+    Guards against None, empty list, non-sequence types, negative/zero numbers,
+    NaN/Inf values, and float overflow/underflow using log-sum.
+    """
+    if not isinstance(numbers, (list, tuple)) or not numbers:
+        return 0.0
+    import math
+    valid_nums = []
+    for x in numbers:
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            try:
+                number = float(x)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(number) and number > 0:
+                valid_nums.append(number)
+    if not valid_nums:
+        return 0.0
+    try:
+        scale = max(valid_nums)
+        smallest = min(valid_nums)
+        if smallest == scale:
+            return scale
+        mean_log = math.fsum(math.log(x) / len(valid_nums) for x in valid_nums)
+        return min(scale, max(smallest, math.exp(mean_log)))
+    except OverflowError:
+        return scale  # Rounding at the largest representable finite float.
+    except ValueError:
+        return 0.0
+
+
+def list_deduplicate_by_key_safe(items: list, key_or_attr: any) -> list:
+    """
+    Safely deduplicate a list of dictionaries or objects by a specified key or attribute,
+    preserving original order and guarding against None, unhashable keys, type errors, or missing keys.
+    """
+    if not isinstance(items, (list, tuple)):
+        return []
+    if key_or_attr is None or not isinstance(key_or_attr, (str, int)):
+        return list(items)
+
+    seen = set()
+    structured = []
+    missing = object()
+    result = []
+    for item in items:
+        val = missing
+        if isinstance(item, dict):
+            val = item.get(key_or_attr, missing)
+        else:
+            try:
+                val = getattr(item, str(key_or_attr), missing)
+            except (AttributeError, TypeError, ValueError):
+                val = missing
+        if val is missing:
+            result.append(item)
+            continue
+        try:
+            key_val = (type(val), val)
+            hash(key_val)
+        except TypeError:
+            # Do not equate a list with its string representation or discard
+            # unrelated records that have no key.
+            try:
+                duplicate = any(type(val) is type(previous) and val == previous for previous in structured)
+            except (TypeError, ValueError, RecursionError):
+                duplicate = False
+            if not duplicate:
+                structured.append(val)
+                result.append(item)
+            continue
+
+        if key_val not in seen:
+            seen.add(key_val)
+            result.append(item)
+    return result
+
+
+def string_snake_to_pascal_case_safe(text: str) -> str:
+    """
+    Safely convert snake_case or kebab-case string to PascalCase.
+    Guards against None, non-string, whitespace, numbers, and multiple delimiters.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    import re
+    clean = text.strip().replace("-", "_")
+    parts = [p for p in re.split(r'_+', clean) if p]
+    if not parts:
+        return ""
+    return "".join(p.capitalize() for p in parts)
+
+
+def dict_flatten_nested_safe(d: dict, separator: str = '.', max_depth: int = 10) -> dict:
+    """
+    Safely flatten a nested dictionary into a flat dictionary with delimiter-separated keys.
+    Guards against None, non-dict, maximum recursion depth limit, circular references, and non-string separators.
+    """
+    if not isinstance(d, dict):
+        return {}
+    if not isinstance(separator, str):
+        separator = '.'
+    if type(max_depth) is not int or max_depth < 1:
+        max_depth = 10
+    max_depth = min(max_depth, 128)
+
+    result = {}
+
+    # Iterative traversal avoids Python recursion limits. Cycles and depth
+    # boundaries remain leaf values, just like other unflattened dictionaries.
+    pending = [(d, '', 0, frozenset({id(d)}))]
+    while pending:
+        current, prefix, depth, ancestors = pending.pop()
+        for k, v in current.items():
+            str_key = str(k)
+            new_key = f"{prefix}{separator}{str_key}" if prefix else str_key
+            if isinstance(v, dict) and v and depth + 1 < max_depth and id(v) not in ancestors:
+                pending.append((v, new_key, depth + 1, ancestors | {id(v)}))
+            else:
+                result[new_key] = v
+
+    return result
+
+
+def numeric_exponential_moving_average_safe(values: list, alpha: float = 0.2) -> list:
+    """
+    Safely compute Exponential Moving Average (EMA) over a numeric sequence.
+    Guards against None, non-sequence types, empty lists, NaN/Inf floats, and invalid alpha range (0 < alpha <= 1).
+    """
+    if not isinstance(values, (list, tuple)) or not values:
+        return []
+    import math
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not 0 < alpha <= 1:
+        alpha = 0.2
+    if alpha <= 0 or alpha > 1:
+        alpha = 0.2
+
+    valid_vals = []
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            try:
+                number = float(v)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(number):
+                valid_vals.append(number)
+    if not valid_vals:
+        return []
+
+    ema = []
+    current = valid_vals[0]
+    ema.append(current)
+    for v in valid_vals[1:]:
+        current = alpha * v + (1 - alpha) * current
+        ema.append(current)
+    return ema

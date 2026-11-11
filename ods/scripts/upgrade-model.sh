@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+# shellcheck source=../lib/safe-env.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/safe-env.sh"
+
 # Prerequisites
 command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed." >&2; exit 1; }
 
@@ -38,28 +41,64 @@ INFERENCE_PORT="$OLLAMA_PORT"
 INFERENCE_CONTAINER="$LLAMA_SERVER_CONTAINER"
 MODEL_ENV_KEY="LLM_MODEL"
 
+# Every GPU overlay file ships on every install, so which overlay files exist
+# says nothing about this host. Prefer the stack the installer recorded in
+# .compose-flags (base + GPU overlay + enabled extensions); otherwise pick the
+# overlay named by GPU_BACKEND.
 detect_compose_file() {
     COMPOSE_FILE_ARGS=()
-    if [[ -f "$ODS_DIR/docker-compose.base.yml" && -f "$ODS_DIR/docker-compose.amd.yml" ]]; then
-        COMPOSE_FILE_ARGS=(-f "$ODS_DIR/docker-compose.base.yml" -f "$ODS_DIR/docker-compose.amd.yml")
-    elif [[ -f "$ODS_DIR/docker-compose.base.yml" && -f "$ODS_DIR/docker-compose.nvidia.yml" ]]; then
-        COMPOSE_FILE_ARGS=(-f "$ODS_DIR/docker-compose.base.yml" -f "$ODS_DIR/docker-compose.nvidia.yml")
+    if [[ -s "$ODS_DIR/.compose-flags" ]]; then
+        local -a recorded=()
+        local token previous="" saved_flags
+        saved_flags="$(cat "$ODS_DIR/.compose-flags")" || return 1
+        # read returns failure at EOF without a newline; normalize the saved
+        # one-line format before splitting, including Windows CRLF files.
+        read -ra recorded <<< "${saved_flags%$'\r'}"
+        for token in "${recorded[@]}"; do
+            if [[ "$previous" == "-f" ]]; then
+                [[ "$token" == /* ]] || token="$ODS_DIR/$token"
+                COMPOSE_FILE_ARGS+=(-f "$token")
+            fi
+            previous="$token"
+        done
+    elif [[ -f "$ODS_DIR/docker-compose.base.yml" ]]; then
+        local backend="" overlay
+        if [[ -f "$ODS_DIR/.env" ]]; then
+            backend="$(sed -n 's/^[[:space:]]*GPU_BACKEND[[:space:]]*=//p' "$ODS_DIR/.env" | tail -n 1)"
+            backend="$(safe_env_decode_value "$backend")"
+        fi
+        overlay="$ODS_DIR/docker-compose.${backend:-nvidia}.yml"
+        COMPOSE_FILE_ARGS=(-f "$ODS_DIR/docker-compose.base.yml")
+        if [[ -f "$overlay" ]]; then
+            COMPOSE_FILE_ARGS+=(-f "$overlay")
+        fi
     elif [[ -f "$ODS_DIR/docker-compose.yml" ]]; then
         COMPOSE_FILE_ARGS=(-f "$ODS_DIR/docker-compose.yml")
     fi
 }
 
 detect_inference_service() {
-    if [[ ${#COMPOSE_FILE_ARGS[@]} -eq 0 ]]; then
-        echo "llama-server"
-        return
-    fi
+    # Both legacy and current layouts use the same service name. Parsing the
+    # entire Compose stack is unnecessary for this read-only lookup.
+    echo "llama-server"
+}
 
-    if docker compose "${COMPOSE_FILE_ARGS[@]}" config --services 2>/dev/null | grep -q '^llama-server$'; then
-        echo "llama-server"
-    else
-        echo "llama-server"
+validate_model_compose() {
+    local policy="$ODS_DIR/scripts/compose-cache-policy.py"
+    local python_cmd="${ODS_PYTHON_CMD:-}"
+    if [[ -z "$python_cmd" ]]; then
+        python_cmd="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
     fi
+    if [[ ! -f "$policy" || -z "$python_cmd" ]]; then
+        echo "Cannot validate the saved Compose stack; repair the ODS installation before upgrading models." >&2
+        return 1
+    fi
+    "$python_cmd" "$policy" --install-dir "$ODS_DIR" --arguments "${COMPOSE_FILE_ARGS[@]}" >/dev/null
+}
+
+run_model_compose() {
+    validate_model_compose || return 1
+    docker compose "${COMPOSE_FILE_ARGS[@]}" "$@"
 }
 
 resolve_inference_runtime() {
@@ -73,6 +112,128 @@ resolve_inference_runtime() {
     INFERENCE_PORT="$OLLAMA_PORT"
     INFERENCE_CONTAINER="$LLAMA_SERVER_CONTAINER"
     MODEL_ENV_KEY="LLM_MODEL"
+}
+
+resolve_env_file() {
+    local path="$1" link dir hops=0
+
+    # Preserve former in-place write behavior: a .env symlink must keep
+    # pointing at its target rather than being replaced by the temp file.
+    while [[ -L "$path" ]]; do
+        hops=$((hops + 1))
+        [[ "$hops" -le 40 ]] || return 1
+        dir="$(cd -P "$(dirname "$path")" && pwd)" || return 1
+        link="$(readlink "$path")" || return 1
+        case "$link" in
+            /*) path="$link" ;;
+            [A-Za-z]:/*|[A-Za-z]:\\*)
+                command -v cygpath >/dev/null 2>&1 || return 1
+                path="$(cygpath -u "$link")" || return 1
+                ;;
+            *) path="$dir/$link" ;;
+        esac
+    done
+
+    dir="$(cd -P "$(dirname "$path")" && pwd)" || return 1
+    printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+
+copy_env_permissions() {
+    local source="$1" target="$2" source_windows target_windows
+
+    # Git Bash replacement uses the source file ACL. Copy the protected NTFS
+    # DACL to the still-empty temp file before it receives .env contents.
+    case "$(uname -s 2>/dev/null || true)" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 || return 1
+            command -v powershell.exe >/dev/null 2>&1 || return 1
+            source_windows="$(cygpath -aw "$source")" || return 1
+            target_windows="$(cygpath -aw "$target")" || return 1
+            if ! ODS_ENV_ACL_SOURCE="$source_windows" ODS_ENV_ACL_TARGET="$target_windows" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '
+$ErrorActionPreference = [System.Management.Automation.ActionPreference]::Stop
+$sourceAcl = [System.IO.File]::GetAccessControl($env:ODS_ENV_ACL_SOURCE, [System.Security.AccessControl.AccessControlSections]::Access)
+$sddl = $sourceAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+$targetAcl = [System.IO.File]::GetAccessControl($env:ODS_ENV_ACL_TARGET, [System.Security.AccessControl.AccessControlSections]::Access)
+$targetAcl.SetSecurityDescriptorSddlForm($sddl, [System.Security.AccessControl.AccessControlSections]::Access)
+[System.IO.File]::SetAccessControl($env:ODS_ENV_ACL_TARGET, $targetAcl)
+' >/dev/null; then
+                return 1
+            fi
+            return 0
+    esac
+
+    cp -p "$source" "$target"
+}
+
+replace_env_file() {
+    local source="$1" target="$2" backup source_windows target_windows backup_windows
+
+    case "$(uname -s 2>/dev/null || true)" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 || return 1
+            command -v powershell.exe >/dev/null 2>&1 || return 1
+            backup="$(umask 077; mktemp "${target}.bak.XXXXXX")" || return 1
+            if ! copy_env_permissions "$target" "$backup"; then
+                rm -f "$backup" 2>/dev/null || true
+                return 1
+            fi
+            if ! source_windows="$(cygpath -aw "$source")"; then
+                rm -f "$backup" 2>/dev/null || true
+                return 1
+            fi
+            if ! target_windows="$(cygpath -aw "$target")"; then
+                rm -f "$backup" 2>/dev/null || true
+                return 1
+            fi
+            if ! backup_windows="$(cygpath -aw "$backup")"; then
+                rm -f "$backup" 2>/dev/null || true
+                return 1
+            fi
+            if ! ODS_ENV_REPLACE_SOURCE="$source_windows" ODS_ENV_REPLACE_TARGET="$target_windows" \
+                ODS_ENV_REPLACE_BACKUP="$backup_windows" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '
+$ErrorActionPreference = [System.Management.Automation.ActionPreference]::Stop
+[System.IO.File]::Replace($env:ODS_ENV_REPLACE_SOURCE, $env:ODS_ENV_REPLACE_TARGET, $env:ODS_ENV_REPLACE_BACKUP)
+' >/dev/null; then
+                rm -f "$backup" 2>/dev/null || true
+                return 1
+            fi
+            rm -f "$backup" || return 1
+            return 0
+    esac
+
+    mv -f "$source" "$target"
+}
+
+# Atomically update or append a simple KEY=value entry without weakening the
+# existing .env permissions. The temporary file is created beside the target,
+# so the final replacement cannot expose a truncated live configuration.
+update_env_value() {
+    local env_file="$1" key="$2" value="$3" tmp target_file
+    target_file="$(resolve_env_file "$env_file")" || return 1
+    [[ -f "$target_file" ]] || return 1
+
+    tmp="$(umask 077; mktemp "${target_file}.tmp.XXXXXX")" || return 1
+    if ! copy_env_permissions "$target_file" "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! awk -v k="$key" -v v="$value" '
+        BEGIN { found = 0 }
+        index($0, k "=") == 1 { print k "=" v; found = 1; next }
+        { print }
+        END { if (!found) print k "=" v }
+    ' "$target_file" > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! replace_env_file "$tmp" "$target_file"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
 }
 
 # Colors
@@ -214,7 +375,7 @@ stop_llm() {
     
     if command -v docker &> /dev/null; then
         if [[ ${#COMPOSE_FILE_ARGS[@]} -gt 0 ]]; then
-            docker compose "${COMPOSE_FILE_ARGS[@]}" stop "$INFERENCE_SERVICE" 2>/dev/null || true
+            run_model_compose stop "$INFERENCE_SERVICE" || return 1
         else
             docker stop "$INFERENCE_CONTAINER" 2>/dev/null || true
             docker wait "$INFERENCE_CONTAINER" 2>/dev/null || true
@@ -232,27 +393,24 @@ stop_llm() {
 start_llm() {
     local model="$1"
     resolve_inference_runtime
+    # Refuse an unsafe recipe before changing the selected model in .env.
+    if command -v docker >/dev/null 2>&1 && [[ ${#COMPOSE_FILE_ARGS[@]} -gt 0 ]]; then
+        validate_model_compose || return 1
+    fi
     
     log "Starting ${INFERENCE_SERVICE} with model: $model"
     
     # Update environment or compose file
     local env_file="$ODS_DIR/.env"
-    if [[ -f "$env_file" ]]; then
-        # Update active model env key for detected inference backend.
-        if grep -q "^${MODEL_ENV_KEY}=" "$env_file"; then
-            # Use awk index() instead of sed to avoid delimiter collisions
-            awk -v k="$MODEL_ENV_KEY" -v v="$model" '{
-                if (index($0, k "=") == 1) print k "=" v; else print
-            }' "$env_file" > "${env_file}.tmp" && cat "${env_file}.tmp" > "$env_file" && rm -f "${env_file}.tmp"
-        else
-            echo "${MODEL_ENV_KEY}=$model" >> "$env_file"
-        fi
+    if [[ -f "$env_file" ]] && ! update_env_value "$env_file" "$MODEL_ENV_KEY" "$model"; then
+        error "Could not atomically update ${MODEL_ENV_KEY} in $env_file"
+        return 1
     fi
     
     if command -v docker &> /dev/null; then
         # Start via docker compose (supports canonical base+overlay and legacy files)
         if [[ ${#COMPOSE_FILE_ARGS[@]} -gt 0 ]]; then
-            docker compose "${COMPOSE_FILE_ARGS[@]}" up -d "$INFERENCE_SERVICE"
+            run_model_compose up -d "$INFERENCE_SERVICE"
         else
             docker start "$INFERENCE_CONTAINER"
         fi
@@ -404,7 +562,7 @@ cmd_rollback() {
     local model_path="$MODELS_DIR/$previous_model"
     
     stop_llm || true
-    start_llm "$model_path"
+    start_llm "$model_path" || return 1
     
     if wait_for_llm $HEALTH_CHECK_TIMEOUT && test_inference; then
         success "Rollback complete"

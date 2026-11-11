@@ -1,0 +1,489 @@
+"""Run real installer helpers against private, disposable onboarding records."""
+
+import sys
+if sys.platform == "win32":
+    from unittest import SkipTest
+    raise SkipTest("Requires POSIX host ownership, file locks, or Unix sockets; run under Linux/WSL")
+
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import subprocess
+import tempfile
+import unittest
+
+
+LIBRARY = Path(__file__).resolve().parents[1] / "installers/lib/pixel-host-install.sh"
+
+
+class OnboardingUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.answers = self.home / "data/onboarding.json"
+        self.owner = pwd.getpwuid(os.getuid()).pw_name
+        self.env = dict(os.environ, MAX_CONTEXT="65536", LLAMA_REASONING="off",
+                        ODS_MODEL_SWITCHBOARD="observe", LITELLM_PORT="4000",
+                        LITELLM_KEY="disposable-shared-test-key",
+                        PIXEL_MODEL_RELAY_PORT="4006",
+                        PIXEL_MODEL_RELAY_KEY="disposable-test-key", INSTALL_DIR=str(self.home),
+                        EXTERNAL_LLM_URL="http://127.0.0.1:18080",
+                        EXTERNAL_LLM_MODEL="test-model")
+        self.write()
+        self.original = json.loads(self.answers.read_text())
+        self.original["modelMaxTokens"] = 16384
+        self.save(self.original)
+
+    def invoke(self, function, *arguments, success=True, env=None):
+        command = ('set -euo pipefail; source "$1"; shift; '
+                   'ods_sudo_available() { return 1; }; '
+                   'ai_bad() { printf "%s\\n" "$*" >&2; }; "$@"')
+        result = subprocess.run(
+            ["bash", "-c", command, "onboarding-test", str(LIBRARY), function,
+             self.owner, str(self.home), *map(str, arguments)],
+            env=env or self.env, text=True, capture_output=True, timeout=15)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0)
+        return result
+
+    def write(self, **kwargs):
+        return self.invoke("_ods_pixel_write_onboarding", self.answers,
+                           "/usr/bin/openclaw", "/opt/ods/pixel-ods", "a" * 64,
+                           "parallel-free", "/opt/ods/parallel", "b" * 64, **kwargs)
+
+    def save(self, value):
+        self.answers.write_text(json.dumps(value))
+        self.answers.chmod(0o600)
+
+    def test_fresh_local_qwen_bootstrap_defaults_reasoning_on(self):
+        for identity in ("qwen3.5-2b", "Qwen3.5-2B-Q4_K_M.gguf"):
+            with self.subTest(identity=identity):
+                self.answers.unlink()
+                env = {k: v for k, v in self.env.items()
+                       if k not in ("LLAMA_REASONING", "EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+                env["GGUF_FILE"] = identity
+                self.write(env=env)
+                value = json.loads(self.answers.read_text())
+                self.assertIs(value["modelReasoning"], True)
+                self.assertEqual(value["modelName"], f"ODS Current ({identity})")
+
+    def test_explicit_off_including_empty_wins_over_bootstrap(self):
+        for setting in ("off", "none", "false", "0", ""):
+            with self.subTest(setting=setting):
+                self.answers.unlink()
+                env = {k: v for k, v in self.env.items()
+                       if k not in ("EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+                env["GGUF_FILE"] = "qwen3.5-2b"
+                env["LLAMA_REASONING"] = setting
+                self.write(env=env)
+                self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], False)
+
+    def test_remote_exact_qwen_name_does_not_bootstrap(self):
+        self.answers.unlink()
+        env = {k: v for k, v in self.env.items() if k != "LLAMA_REASONING"}
+        env["EXTERNAL_LLM_MODEL"] = "qwen3.5-2b"
+        self.write(env=env)
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], False)
+
+    def test_unspecified_regular_route_preserves_previous_reasoning(self):
+        self.save(dict(self.original, modelReasoning=True))
+        env = {k: v for k, v in self.env.items() if k != "LLAMA_REASONING"}
+        self.write(env=env)
+        value = json.loads(self.answers.read_text())
+        self.assertIs(value["modelReasoning"], True)
+        self.assertEqual(value["modelMaxTokens"], 16384)
+
+    def test_explicit_off_overrides_saved_bootstrap_reasoning(self):
+        self.answers.unlink()
+        env = {k: v for k, v in self.env.items()
+               if k not in ("LLAMA_REASONING", "EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+        env["GGUF_FILE"] = "qwen3.5-2b"
+        self.write(env=env)
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], True)
+        self.write(env=dict(env, LLAMA_REASONING="off"))
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], False)
+
+    def test_local_non_bootstrap_model_defaults_reasoning_off(self):
+        self.answers.unlink()
+        env = {k: v for k, v in self.env.items()
+               if k not in ("LLAMA_REASONING", "EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+        env["GGUF_FILE"] = "qwen3.5-9b-q4_k_m.gguf"
+        self.write(env=env)
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], False)
+
+    def test_same_route_reinstall_preserves_reasoning_and_budget(self):
+        for prior, expected in ((True, True), (False, False)):
+            with self.subTest(prior=prior):
+                self.answers.unlink()
+                env = {k: v for k, v in self.env.items()
+                       if k not in ("LLAMA_REASONING", "EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+                env["GGUF_FILE"] = "qwen3.5-2b"
+                self.write(env=env)
+                value = json.loads(self.answers.read_text())
+                value["modelReasoning"] = prior
+                value["modelMaxTokens"] = 2048
+                self.save(value)
+                self.write(env=env)
+                value = json.loads(self.answers.read_text())
+                self.assertIs(value["modelReasoning"], expected)
+                self.assertEqual(value["modelMaxTokens"], 2048)
+
+    def test_changed_route_does_not_inherit_prior_reasoning(self):
+        self.answers.unlink()
+        env = {k: v for k, v in self.env.items()
+               if k not in ("LLAMA_REASONING", "EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+        env["GGUF_FILE"] = "qwen3.5-2b"
+        self.write(env=env)
+        value = json.loads(self.answers.read_text())
+        self.assertIs(value["modelReasoning"], True)
+        self.write(env=dict(env, GGUF_FILE="qwen3.5-9b-q4_k_m.gguf"))
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], False)
+
+    def test_explicit_on_preserved_across_route_change(self):
+        self.answers.unlink()
+        env = {k: v for k, v in self.env.items()
+               if k not in ("EXTERNAL_LLM_URL", "EXTERNAL_LLM_MODEL")}
+        env["GGUF_FILE"] = "qwen3.5-2b"
+        env["LLAMA_REASONING"] = "on"
+        self.write(env=env)
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], True)
+        self.write(env=dict(env, GGUF_FILE="qwen3.5-9b-q4_k_m.gguf"))
+        self.assertIs(json.loads(self.answers.read_text())["modelReasoning"], True)
+
+    def test_upgrade_preserves_budget_across_credential_rotation(self):
+        self.write(env=dict(self.env, PIXEL_MODEL_RELAY_KEY="rotated-test-key"))
+        value = json.loads(self.answers.read_text())
+        self.assertEqual(value["modelMaxTokens"], 16384)
+        self.assertEqual(value["modelContextWindow"], 65536)
+        self.assertEqual(value["modelApiKey"], "rotated-test-key")
+        self.assertEqual(value["gatewayExtensions"], self.original["gatewayExtensions"])
+
+    def test_changed_model_context_or_reasoning_uses_factory_budget(self):
+        for change in ({"EXTERNAL_LLM_MODEL": "other-model"},
+                       {"MAX_CONTEXT": "32768"}, {"LLAMA_REASONING": "on"}):
+            with self.subTest(change=change):
+                self.save(self.original)
+                self.write(env=dict(self.env, **change))
+                self.assertEqual(json.loads(self.answers.read_text())["modelMaxTokens"], 8192)
+
+    def test_explicit_setting_on_same_model_remains_effective(self):
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 1024, "false")
+        self.write()
+        value = json.loads(self.answers.read_text())
+        self.assertEqual(value["modelMaxTokens"], 1024)
+        self.assertEqual(value["gatewayExtensions"], self.original["gatewayExtensions"])
+
+    def test_invalid_existing_budget_refused_without_overwrite(self):
+        for field, invalid in (("modelMaxTokens", True), ("modelMaxTokens", 0),
+                               ("modelMaxTokens", 65537), ("modelContextWindow", 4095),
+                               ("modelReasoning", "false")):
+            with self.subTest(field=field, value=invalid):
+                self.save(dict(self.original, **{field: invalid}))
+                before = self.answers.read_bytes()
+                self.write(success=False)
+                self.assertEqual(self.answers.read_bytes(), before)
+        self.answers.write_text("{malformed")
+        self.write(success=False)
+        self.assertEqual(self.answers.read_text(), "{malformed")
+
+    def test_unsafe_existing_record_refused_without_overwrite(self):
+        before = self.answers.read_bytes()
+        self.answers.chmod(0o640)
+        self.write(success=False)
+        self.assertEqual(self.answers.read_bytes(), before)
+        self.answers.chmod(0o600)
+        linked = self.home / "linked.json"
+        os.link(self.answers, linked)
+        self.write(success=False)
+        self.assertEqual(linked.read_bytes(), before)
+        linked.unlink()
+        self.answers.rename(linked)
+        self.answers.symlink_to(linked)
+        self.write(success=False)
+        self.assertEqual(linked.read_bytes(), before)
+
+    def snapshot(self, **kwargs):
+        return self.invoke("_ods_pixel_model_reconciliation_snapshot", self.answers, **kwargs)
+
+    def prepare_snapshot(self):
+        model = {"id": "ods/current", "name": "ODS Current (test-model)",
+                 "contextWindow": 65536, "maxTokens": 16384, "reasoning": False}
+        live = {"models": {"providers": {"ods-gateway": {
+                    "api": "openai-completions", "apiKey": "disposable-test-key",
+                    "baseUrl": "http://127.0.0.1:4006/v1", "models": [model]}}},
+                "agents": {"list": [{"id": "pixel", "model": "ods-gateway/ods/current"}]}}
+        for name, value in ((".openclaw/openclaw.json", live),
+                            (".config/ods/pixel-managed.json", {"manager": "ods"}),
+                            (".config/pixel-deployment/onboarding.json", self.original)):
+            path = self.home / name
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+
+    def test_search_provider_change_skips_model_only_alias_shortcut(self):
+        self.prepare_snapshot()
+        live_path = self.home / ".openclaw/openclaw.json"
+        live = json.loads(live_path.read_text())
+        parallel_path = str(self.home / "data/pixel/native-search/parallel-2026.6.33")
+        parallel_contract = copy.deepcopy(self.original)
+        for extension in parallel_contract["gatewayExtensions"]:
+            if extension["id"] == "parallel":
+                extension["path"] = parallel_path
+        self.save(parallel_contract)
+        live["tools"] = {"web": {"search": {"provider": "parallel-free"}}}
+        live["plugins"] = {
+            "allow": ["pixel-ods", "parallel"],
+            "entries": {"parallel": {"enabled": True}},
+            "load": {"paths": ["/opt/ods/pixel-ods", parallel_path]},
+        }
+        live_path.write_text(json.dumps(live))
+        live_path.chmod(0o600)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers)
+
+        selected = copy.deepcopy(parallel_contract)
+        selected["webSearchProvider"] = "searxng"
+        selected["gatewayExtensions"] = [
+            item for item in selected["gatewayExtensions"] if item["id"] != "parallel"]
+        selected["searxngBaseUrl"] = "http://127.0.0.1:8888"
+        self.save(selected)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers,
+                    success=False)
+
+        live["tools"]["web"]["search"]["provider"] = "searxng"
+        live["plugins"]["allow"] = ["pixel-ods", "searxng"]
+        live["plugins"]["entries"] = {"searxng": {"enabled": True, "config": {
+            "webSearch": {"baseUrl": selected["searxngBaseUrl"]}}}}
+        live["plugins"]["load"]["paths"] = ["/opt/ods/pixel-ods"]
+        live_path.write_text(json.dumps(live))
+        live_path.chmod(0o600)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers)
+        selected["searxngBaseUrl"] = "http://127.0.0.1:8899"
+        self.save(selected)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers,
+                    success=False)
+        live["plugins"]["entries"]["searxng"]["config"]["webSearch"]["baseUrl"] = selected["searxngBaseUrl"]
+        live_path.write_text(json.dumps(live))
+        live_path.chmod(0o600)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers)
+        self.save(parallel_contract)
+        self.invoke("_ods_pixel_search_provider_matches_contract", self.answers,
+                    success=False)
+
+    def test_snapshot_and_update_preserve_additional_digest_bound_extensions(self):
+        self.prepare_snapshot()
+        value = copy.deepcopy(self.original)
+        # Generic integration contract: no special case for the search provider.
+        value["gatewayExtensions"].insert(0, {"id": "future-tool", "path": "/opt/tool", "sha256": "c" * 64})
+        self.save(value)
+        backup = Path(self.snapshot().stdout.strip())
+        rollback = json.loads((backup / "rollback-onboarding.json").read_text())
+        self.assertEqual(rollback["gatewayExtensions"], value["gatewayExtensions"])
+        self.assertEqual(rollback["modelMaxTokens"], 16384)
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers, "next-model", 32768, 2048, "false")
+        updated = json.loads(self.answers.read_text())
+        self.assertEqual(updated["gatewayExtensions"], value["gatewayExtensions"])
+        self.assertEqual(updated["modelName"], "ODS Current (next-model)")
+
+    def test_invalid_extensions_rejected_by_snapshot_and_update(self):
+        self.prepare_snapshot()
+        base, extra = self.original["gatewayExtensions"]
+        invalid_sets = [[], [extra], [base, base], [base, {"id": "parallel"}],
+                        [base, None], [base, dict(extra, path="/")],
+                        [base, dict(extra, path="/opt/../tool")],
+                        [base, dict(extra, path="/opt/tool\n")],
+                        [base, dict(extra, sha256="unverified")],
+                        [base, dict(extra, id="INVALID")], [base] + [extra] * 32]
+        for extensions in invalid_sets:
+            with self.subTest(extensions=extensions):
+                self.save(dict(self.original, gatewayExtensions=extensions))
+                before = self.answers.read_bytes()
+                self.snapshot(success=False)
+                self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                            "next-model", 65536, 2048, "false", success=False)
+                self.assertEqual(self.answers.read_bytes(), before)
+
+    def test_remote_route_identity_updates_fast_path_candidate_and_rollback(self):
+        self.prepare_snapshot()
+        first, second = "a" * 64, "b" * 64
+        live_path = self.home / ".openclaw/openclaw.json"
+        live = json.loads(live_path.read_text())
+        live["agents"]["defaults"] = {}
+        live["plugins"] = {"entries": {"pixel-ods": {"config": {"modelRouteFingerprint": first, "modelImageInput": "unknown"}}}}
+        live["models"]["providers"]["ods-gateway"]["models"][0]["input"] = ["text", "image"]
+        live_path.write_text(json.dumps(live))
+        self.save(dict(self.original, modelRouteFingerprint=first))
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", first)
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", second, success=False)
+        backup = Path(self.snapshot().stdout.strip())
+        rollback = json.loads((backup / "rollback-onboarding.json").read_text())
+        self.assertEqual(rollback["modelRouteFingerprint"], first)
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false", second)
+        staged = Path(self.invoke("_ods_pixel_stage_stable_alias_candidate", self.answers).stdout.strip())
+        self.assertEqual(json.loads(staged.read_text())["plugins"]["entries"]["pixel-ods"]["config"]["modelRouteFingerprint"], second)
+        self.assertEqual(json.loads(live_path.read_text())["plugins"]["entries"]["pixel-ods"]["config"]["modelRouteFingerprint"], first)
+        live_path.write_bytes(staged.read_bytes())
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", second)
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false")
+        self.assertNotIn("modelRouteFingerprint", json.loads(self.answers.read_text()))
+        cleared = Path(self.invoke("_ods_pixel_stage_stable_alias_candidate", self.answers).stdout.strip())
+        self.assertNotIn("modelRouteFingerprint", json.loads(cleared.read_text())["plugins"]["entries"]["pixel-ods"]["config"])
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", success=False)
+        before = self.answers.read_bytes()
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false", "https://secret.invalid", success=False)
+        self.assertEqual(self.answers.read_bytes(), before)
+
+    def test_installer_reuse_requires_live_route_and_owned_configuration(self):
+        self.prepare_snapshot()
+        live_path = self.home / ".openclaw/openclaw.json"
+        marker_path = self.home / ".config/ods/pixel-managed.json"
+        live = json.loads(live_path.read_text())
+        model = live["models"]["providers"]["ods-gateway"]["models"][0]
+        model["input"] = ["text", "image"]
+        live["plugins"] = {"entries": {"pixel-ods": {"config": {
+            "modelImageInput": "unknown"}}}}
+        contract = "e" * 64
+        env = dict(self.env, PIXEL_SOURCE_REF="a" * 40)
+
+        def bind(value, state):
+            canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            marker = {
+                "schema_version": 2, "manager": "ods", "state": state,
+                "initial_active_state": "absent", "install_dir": str(self.home),
+                "pixel_source_ref": env["PIXEL_SOURCE_REF"], "contract_sha256": contract,
+                "configuration_sha256": hashlib.sha256(
+                    b"ods-pixel-openclaw-v1\0" + canonical).hexdigest(),
+                "release_identity_sha256": "b" * 64,
+                "install_manifest_sha256": "c" * 64,
+                "active_release_version": "test", "sandbox_image": "test-image",
+                "sandbox_image_id": "sha256:" + "d" * 64,
+            }
+            marker_path.write_text(json.dumps(marker))
+
+        # Execute the installer's real decision block, not a test copy of its
+        # conditions. Only the surrounding host installation is omitted.
+        source = LIBRARY.read_text()
+        assignment = source.index("        reuse_active=true")
+        start = source.rfind("\n    if ", 0, assignment) + 1
+        end = source.index("\n    fi", assignment) + len("\n    fi")
+        gate = source[start:end]
+        command = ('set -euo pipefail; source "$1"; '
+                   'owner="$2"; home="$3"; answers="$4"; contract_sha256="$5"; '
+                   'ods_sudo_available() { return 1; }; reuse_active=false;\n'
+                   + gate + '\nprintf "%s\\n" "$reuse_active"')
+
+        cases = [("unchanged", live, True, True)]
+        for field, changed in (("name", "ODS Current (deepseek-v4.1-flash)"),
+                               ("contextWindow", 409600), ("maxTokens", 8192),
+                               ("reasoning", True), ("input", ["text"])):
+            value = copy.deepcopy(live)
+            value["models"]["providers"]["ods-gateway"]["models"][0][field] = changed
+            cases.append((field, value, True, False))
+        for field, changed in (("modelImageInput", "unsupported"),
+                               ("modelRouteFingerprint", "f" * 64)):
+            value = copy.deepcopy(live)
+            value["plugins"]["entries"]["pixel-ods"]["config"][field] = changed
+            cases.append((field, value, True, False))
+        drift = copy.deepcopy(live)
+        drift["unprovedChange"] = True
+        cases.append(("unproved configuration drift", drift, False, False))
+
+        for state in ("ready", "installing"):
+            for name, value, approved, expected in cases:
+                with self.subTest(state=state, change=name):
+                    live_path.write_text(json.dumps(value))
+                    bind(value if approved else live, state)
+                    # Model coordination legitimately rebinds only the config
+                    # digest; the install contract stays unchanged in these cases.
+                    self.invoke("_ods_pixel_managed_contract_matches", contract,
+                                env=env, success=approved)
+                    result = subprocess.run(
+                        ["bash", "-c", command, "installer-reuse-test", str(LIBRARY),
+                         self.owner, str(self.home), str(self.answers), contract],
+                        env=env, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), str(expected).lower())
+
+    def test_upgrade_preserves_valid_route_identity_only_for_same_model(self):
+        self.save(dict(self.original, modelRouteFingerprint="a" * 64))
+        self.write()
+        self.assertEqual(json.loads(self.answers.read_text())["modelRouteFingerprint"], "a" * 64)
+        self.write(env=dict(self.env, EXTERNAL_LLM_MODEL="new-local-model"))
+        self.assertNotIn("modelRouteFingerprint", json.loads(self.answers.read_text()))
+
+    def test_image_policy_candidate_fast_path_and_rollback_use_exact_live_policy(self):
+        self.prepare_snapshot()
+        live_path = self.home / ".openclaw/openclaw.json"
+        live = json.loads(live_path.read_text())
+        live["agents"]["defaults"] = {}
+        live["plugins"] = {"entries": {"pixel-ods": {"config": {"modelImageInput": "supported"}}}}
+        live["models"]["providers"]["ods-gateway"]["models"][0]["input"] = ["text", "image"]
+        live_path.write_text(json.dumps(live))
+        self.save(dict(self.original, modelImageInput="supported"))
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "supported")
+        backup = Path(self.snapshot().stdout.strip())
+        self.assertEqual(json.loads((backup / "rollback-onboarding.json").read_text())["modelImageInput"], "supported")
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "unsupported")
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "unsupported", success=False)
+        staged = Path(self.invoke("_ods_pixel_stage_stable_alias_candidate", self.answers).stdout.strip())
+        candidate = json.loads(staged.read_text())
+        self.assertEqual(candidate["models"]["providers"]["ods-gateway"]["models"][0]["input"], ["text"])
+        self.assertEqual(candidate["plugins"]["entries"]["pixel-ods"]["config"]["modelImageInput"], "unsupported")
+        self.assertEqual(json.loads(live_path.read_text()), live)
+        live_path.write_bytes(staged.read_bytes())
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "unsupported")
+
+    def test_thinking_control_fast_path_and_rollback_belong_to_the_live_model(self):
+        self.prepare_snapshot()
+        live_path = self.home / ".openclaw/openclaw.json"
+        live = json.loads(live_path.read_text())
+        live["agents"]["defaults"] = {}
+        live["plugins"] = {"entries": {"pixel-ods": {"config": {"modelImageInput": "unknown"}}}}
+        live["models"]["providers"]["ods-gateway"]["models"][0]["input"] = ["text", "image"]
+        live_path.write_text(json.dumps(live))
+        self.save(dict(self.original, modelThinkingControl="always"))
+        # The no-op shortcut needs the same control; a new one is applied.
+        self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "unknown", "always")
+        for other in ("", "enable_thinking", "none"):
+            self.invoke("_ods_pixel_stable_alias_matches_promoted_model", self.answers,
+                        "test-model", 65536, 16384, "false", "", "unknown", other, success=False)
+        backup = Path(self.snapshot().stdout.strip())
+        rollback = json.loads((backup / "rollback-onboarding.json").read_text())
+        self.assertEqual(rollback["modelThinkingControl"], "always")
+        # Answers that lag a native switch name another model: no control moves over.
+        self.save(dict(self.original, modelName="ODS Current (other-model)", modelThinkingControl="always"))
+        backup = Path(self.snapshot().stdout.strip())
+        rollback = json.loads((backup / "rollback-onboarding.json").read_text())
+        self.assertEqual(rollback["modelName"], "ODS Current (test-model)")
+        self.assertNotIn("modelThinkingControl", rollback)
+        self.save(dict(self.original, modelThinkingControl="sometimes"))
+        self.snapshot(success=False)
+        self.save(self.original)
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false", "", "unknown", "none")
+        self.assertEqual(json.loads(self.answers.read_text())["modelThinkingControl"], "none")
+        self.invoke("_ods_pixel_update_onboarding_model", self.answers,
+                    "test-model", 65536, 16384, "false")
+        self.assertNotIn("modelThinkingControl", json.loads(self.answers.read_text()))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,5 @@
 import { createElement } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Models from './Models'
 
@@ -19,6 +19,7 @@ function baseDownloadState(overrides = {}) {
     isDownloading: false,
     progress: null,
     completedDownload: null,
+    statusError: null,
     cancelError: null,
     isCancelling: false,
     refresh: vi.fn(),
@@ -51,6 +52,7 @@ function baseState(overrides = {}) {
     activationModeError: null,
     recommendationAlternatives: [],
     hermesMinimumContext: 65536,
+    pixelMinimumContext: 16384,
     loading: false,
     error: null,
     actionLoading: null,
@@ -97,9 +99,396 @@ function renderModels() {
   return render(createElement(MemoryRouter, null, createElement(Models)))
 }
 
+test.each([false, true])('shows the live model API instead of the loaded local engine (compact=%s)', (compact) => {
+  useModelsMock.mockReturnValue(baseState({
+    odsMode: 'local', configuredMode: 'cloud', llmBackend: 'llama-server',
+    currentModel: 'qwen3.5-9b-q4', loadedModel: 'Qwen3.5-9B-Q4_K_M.gguf',
+    activeRuntime: {source: 'remote-provider', model: 'deepseek-v4.1-flash', contextLength: 409600},
+    canActivateModels: false, activationModeError: 'Local mode does not match configured cloud mode.',
+    models: [model({status: 'loaded'})],
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, {compact})))
+  const runtime = screen.getByRole('region', {name: 'Model runtime'})
+  expect(runtime).toHaveTextContent('Using a model API')
+  expect(runtime).toHaveTextContent('deepseek-v4.1-flash')
+  expect(runtime).toHaveTextContent('400K')
+  expect(runtime).not.toHaveTextContent('Qwen')
+  expect(within(runtime).getByRole('link', {name: 'Model connections'})).toHaveAttribute('href', '/settings?section=remote')
+  expect(screen.queryByText('Local model runtime unavailable')).toBeNull()
+  expect(screen.queryByText(/Runtime: Local/)).toBeNull()
+  expect(screen.getByText('Loaded locally')).toBeVisible()
+  expect(screen.queryByText('Active')).toBeNull()
+  expect(screen.getByRole('button', {name: 'Configure context for Qwen 3.5 9B'})).toBeDisabled()
+})
+
+test('lists the catalog picks for this hardware right after the recommended model', () => {
+  // Workstation06 (346 GB of GPU memory): every model fits, and catalog order
+  // alone put the smallest models right after the recommended one.
+  useModelsMock.mockReturnValue(baseState({
+    gpu: { vramUsed: 26, vramTotal: 346, vramFree: 320 },
+    recommendationAlternatives: [{ id: 'catalog-fit-2', name: 'Second Fit Pick' }, { id: 'catalog-fit-1', name: 'First Fit Pick' }],
+    models: [
+      model({ id: 'tiny-1', name: 'Tiny One', sizeGb: 1.3, vramRequired: 3 }),
+      model({ id: 'catalog-fit-1', name: 'First Fit Pick', sizeGb: 49, vramRequired: 52 }),
+      model({ id: 'tiny-2', name: 'Tiny Two', sizeGb: 1.9, vramRequired: 3 }),
+      model({ id: 'catalog-fit-2', name: 'Second Fit Pick', sizeGb: 62, vramRequired: 70 }),
+      model({ id: 'too-big', name: 'Too Big', sizeGb: 400, vramRequired: 420, fitsVram: false }),
+      model({ id: 'recommended', name: 'Recommended Pick', sizeGb: 22, vramRequired: 26, recommended: true }),
+    ],
+  }))
+  renderModels()
+  const order = ['Recommended Pick', 'Second Fit Pick', 'First Fit Pick', 'Tiny One', 'Tiny Two', 'Too Big']
+  const rows = order.map(name => screen.getAllByText(name)[0])
+  for (let index = 1; index < rows.length; index += 1) {
+    expect(rows[index - 1].compareDocumentPosition(rows[index]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  }
+})
+
+test('keeps the local Active state when no active remote route is verified', () => {
+  useModelsMock.mockReturnValue(baseState({
+    currentModel: 'qwen3.5-9b-q4',
+    models: [model({status: 'loaded'})],
+  }))
+  renderModels()
+  expect(screen.queryByText('Loaded locally')).toBeNull()
+  expect(screen.getByText('Active')).toBeVisible()
+  expect(screen.getByRole('button', {name: 'Configure context for Qwen 3.5 9B'})).toBeEnabled()
+})
+
+test('keeps the existing diagnostic when no active remote route is verified', () => {
+  useModelsMock.mockReturnValue(baseState({
+    odsMode: 'local', configuredMode: 'cloud', llmBackend: 'llama-server', activeRuntime: null,
+    canActivateModels: false, activationModeError: 'Runtime status is unconfirmed.',
+  }))
+  renderModels()
+  expect(screen.queryByText('Using a model API')).toBeNull()
+  expect(screen.getByText('Runtime status is unconfirmed.')).toBeVisible()
+  expect(screen.getByText('Local model runtime unavailable')).toBeVisible()
+})
+
+test('does not present a previous model API as active during a connection change', () => {
+  useModelsMock.mockReturnValue(baseState({
+    activeRuntime: {source: 'remote-provider', model: 'deepseek-v4.1-flash', contextLength: 409600},
+    modelLifecycle: {active: true, operation: 'remote_provider_apply'}, canActivateModels: false,
+  }))
+  renderModels()
+  expect(screen.queryByText('Using a model API')).toBeNull()
+  expect(screen.getByText(/ODS is checking or changing the model connection/)).toBeVisible()
+})
+
 function confirmModelRun() {
   fireEvent.click(screen.getByRole('button', { name: 'Run model' }))
 }
+
+test.each([false, true])('refreshes the profile after first activation finishes in the Models page (compact=%s)', async (compact) => {
+  const selected = model({status: 'loaded'})
+  useModelsMock.mockReturnValue(baseState({models: [selected], currentModel: selected.id,
+    modelLifecycle: {active: true, operation: 'model_activation'}, modelActivation: {active: true, phase: 'profiling'}}))
+  const fetchMock = vi.fn(async () => ({ok: true, json: async () => ({mode: 'observe', modelId: selected.id,
+    profile: {modelId: selected.id, recordedAt: '2026-10-10T20:10:26Z', result: {status: 'complete', summary: {chat: true, tools: true}}}})}))
+  vi.stubGlobal('fetch', fetchMock)
+  try {
+    const view = render(createElement(MemoryRouter, null, createElement(Models, {compact})))
+    await act(async () => {})
+    expect(fetchMock).not.toHaveBeenCalled()
+    useModelsMock.mockReturnValue(baseState({models: [selected], currentModel: selected.id,
+      modelLifecycle: {active: false}, modelActivation: {active: false, phase: 'complete'}}))
+    view.rerender(createElement(MemoryRouter, null, createElement(Models, {compact})))
+    await act(async () => {})
+    const profileRegion = screen.getByRole('region', {name: 'What this model can do'})
+    expect(profileRegion).toHaveTextContent('Tool-call check passed')
+    expect(profileRegion).toHaveTextContent('Streaming tool check not verified')
+    expect(profileRegion).not.toHaveTextContent('Calls tools (Pixel and agents)')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(`/api/models/${selected.id}/profile`, expect.objectContaining({cache: 'no-store'}))
+    expect(fetchMock.mock.calls[0][1].method).toBeUndefined()
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
+
+test('uses compact source tabs and collapsible filters in the portal panel', () => {
+  useModelsMock.mockReturnValue(baseState({models:[model({status:'downloaded'})]}))
+  const {container} = render(createElement(MemoryRouter, null, createElement(Models, {compact:true})))
+  expect(screen.getByRole('tablist',{name:'Model sources'})).toHaveClass('portal-model-tabs')
+  expect(screen.getByRole('tab',{name:/ODS Recommended/})).toHaveAttribute('aria-selected','true')
+  expect(screen.getByRole('button',{name:'Browse 1 model ↓'})).toBeVisible()
+  expect(container.querySelector('.model-filter-disclosure')).not.toHaveAttribute('open')
+  expect(container.querySelector('[class*="min-w-[1074px]"]')).toBeNull()
+  fireEvent.click(screen.getByRole('tab',{name:/Installed/}))
+  expect(screen.getByRole('tab',{name:/Installed/})).toHaveAttribute('aria-selected','true')
+})
+
+test('compact Models highlights the running model and keeps configuration behind confirmation', () => {
+  const state = baseState({currentModel:'qwen3.5-9b-q4',models:[model({status:'loaded'})]})
+  useModelsMock.mockReturnValue(state)
+  render(createElement(MemoryRouter, null, createElement(Models, {compact:true})))
+  expect(screen.getByRole('tab',{name:/ODS Recommended/})).toHaveAttribute('aria-selected','true')
+  expect(within(screen.getByRole('region',{name:'Model runtime'})).getByText('Qwen 3.5 9B')).toBeVisible()
+  expect(screen.getByRole('textbox',{name:'Search models'})).toBeVisible()
+  expect(screen.getByRole('article',{name:'Qwen 3.5 9B'})).toHaveClass('model-entry')
+  expect(screen.getByRole('button',{name:'Delete Qwen 3.5 9B unavailable'})).toBeDisabled()
+  fireEvent.click(screen.getByRole('button',{name:'Configure context for Qwen 3.5 9B'}))
+  expect(screen.getByRole('dialog')).toBeVisible()
+  expect(state.loadModel).not.toHaveBeenCalled()
+})
+
+test.each([true, false])('API mode names the API model and host, without local leftovers (compact=%s)', (compact) => {
+  // Fleet, Tower3: API mode showed "Runtime: Local", "No model running" and
+  // the installer's stale local pick, and never named the API in use.
+  useModelsMock.mockReturnValue(baseState({
+    models: [model()], llmBackend: 'external', canActivateModels: false,
+    activationModeError: 'ODS uses a model API at api.example.test.',
+    externalApi: { model: 'deepseek-v4.1-flash', host: 'api.example.test' },
+    configuredModel: 'qwen3.5-27b-q4',
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, {compact})))
+
+  expect(screen.getByText('Using a model API')).toBeVisible()
+  expect(screen.getByText(/deepseek-v4\.1-flash/)).toBeVisible()
+  expect(screen.getByText('Served by the API at api.example.test')).toBeVisible()
+  expect(screen.getByText('Runtime: API (api.example.test)')).toBeVisible()
+  expect(screen.queryByText('No model running')).toBeNull()
+  expect(screen.queryByText(/Selected during install/)).toBeNull()
+})
+
+test.each([true, false])('a downloaded model in API mode says API mode instead of offering Run (compact=%s)', (compact) => {
+  // Fleet, Strixy: in API mode a greyed "Run" on installed models read as available.
+  useModelsMock.mockReturnValue(baseState({
+    models: [model({ status: 'downloaded' })], llmBackend: 'external', canActivateModels: false,
+    activationModeError: 'ODS uses a model API at api.example.test.',
+    externalApi: { model: 'deepseek-v4.1-flash', host: 'api.example.test' },
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, {compact})))
+
+  const button = screen.getByRole('button', { name: 'API mode' })
+  expect(button).toBeDisabled()
+  expect(button).toHaveAttribute('title', 'ODS uses a model API at api.example.test.')
+  expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+})
+
+test('compact external mode keeps the catalog visible without promising local activation', () => {
+  useModelsMock.mockReturnValue(baseState({
+    models: [model()], llmBackend: 'external', canActivateModels: false,
+    activationModeError: 'ODS uses a model API.',
+    externalApi: { model: null, host: null },
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, {compact:true})))
+
+  expect(screen.getByText('Using a model API')).toBeVisible()
+  expect(screen.getByRole('button',{name:'Browse 1 model ↓'})).toBeVisible()
+  expect(screen.getByRole('tab',{name:/ODS Recommended/})).toHaveAttribute('aria-selected','true')
+  expect(screen.getByRole('button',{name:'Download'})).toBeVisible()
+  expect(screen.queryByText(/--no-external-llm/)).not.toBeInTheDocument()
+})
+
+test.each([false, true])('an unmanaged Windows-hosted server describes model changes as external, with nothing to adopt (compact=%s)', async (compact) => {
+  const state = baseState({
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server',
+    hostRuntime: true, canActivateModels: false,
+    modelManagement: { managed: false, canActivate: false, canUnload: false, running: false },
+    activationModeError: 'The model server on this computer is not managed by this ODS installation.',
+    currentModel: 'qwen3.5-9b-q4', loadedModel: 'Qwen3.5-9B-Q4_K_M.gguf',
+    models: [model({ status: 'loaded' }), model({ id: 'another-model', name: 'Another model', status: 'downloaded' })],
+  })
+  useModelsMock.mockReturnValue(state)
+  vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('no adoption probe') }))
+  try {
+    render(createElement(MemoryRouter, null, createElement(Models, { compact })))
+    expect(screen.getByText('Model changes managed externally')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Adopt loaded model in ODS' })).toBeNull()
+    expect(fetch).not.toHaveBeenCalled()
+    expect(screen.queryByText('Local model runtime unavailable')).not.toBeInTheDocument()
+    const notice = screen.getByText('Model changes managed externally').closest('section')
+    expect(within(notice).getByText(state.activationModeError)).toBeVisible()
+    for (const button of screen.getAllByRole('button', { name: 'Run' })) {
+      expect(button).toBeDisabled()
+    }
+    expect(screen.getByRole('button', { name: 'Configure context for Qwen 3.5 9B' })).toBeDisabled()
+    expect(state.loadModel).not.toHaveBeenCalled()
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
+
+test.each([true, false])('only managed runtimes expose unload/resume and hide adoption (running=%s)', async running => {
+  const state = baseState({
+    models: [model({ status: running ? 'loaded' : 'downloaded' })],
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server', hostRuntime: true,
+    modelManagement: { managed: true, canActivate: running, canUnload: true, running },
+    canActivateModels: running,
+    stopRuntime: vi.fn(), startRuntime: vi.fn(),
+  })
+  useModelsMock.mockReturnValue(state)
+  renderModels()
+  const button = screen.getByRole('button', { name: running ? 'Unload model' : 'Resume model' })
+  fireEvent.click(button)
+  // Unloading asks first; Resume starts at once.
+  if (running) fireEvent.click(within(screen.getByRole('dialog', { name: 'Unload the model?' })).getByRole('button', { name: 'Unload model' }))
+  else expect(screen.queryByRole('dialog')).toBeNull()
+  expect(running ? state.stopRuntime : state.startRuntime).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('button', { name: 'Adopt loaded model in ODS' })).toBeNull()
+  if (!running) expect(screen.queryByText('Local model runtime unavailable')).toBeNull()
+})
+
+test('an open unload question closes for good when the model stops or another operation starts', () => {
+  const state = baseState({
+    models: [model({ status: 'loaded' })],
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server', hostRuntime: true,
+    modelManagement: { managed: true, canActivate: true, canUnload: true, running: true },
+    stopRuntime: vi.fn(), startRuntime: vi.fn(),
+  })
+  useModelsMock.mockReturnValue(state)
+  const view = renderModels()
+  const show = (next, download = baseDownloadState()) => {
+    useModelsMock.mockReturnValue(next)
+    useDownloadProgressMock.mockReturnValue(download)
+    view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  }
+  const ask = () => {
+    fireEvent.click(within(screen.getByRole('region', { name: 'Model runtime controls' })).getByRole('button', { name: 'Unload model' }))
+    expect(screen.getByRole('dialog', { name: 'Unload the model?' })).toBeVisible()
+  }
+
+  // The model stopped elsewhere: nothing is left to unload.
+  ask()
+  show({ ...state, modelManagement: { ...state.modelManagement, canActivate: false, running: false } })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  show(state)
+  expect(screen.queryByRole('dialog')).toBeNull()
+
+  // A download started elsewhere: the runtime controls wait for it.
+  ask()
+  show(state, baseDownloadState({ isDownloading: true }))
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Unload model' })).toBeDisabled()
+  show(state)
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(state.stopRuntime).not.toHaveBeenCalled()
+})
+
+test('a stopped runtime shows the launcher error, and a memory refusal turns Resume into Start anyway', () => {
+  const refusal = 'The model was not started: Windows can lend it only 1.0 GiB right now (memory limit 30.5 GiB, 29.5 GiB in use) and it needs about 25.8 GiB.'
+  const state = baseState({
+    models: [model({ status: 'downloaded' })],
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server', hostRuntime: true,
+    modelManagement: { managed: true, canActivate: false, canUnload: true, running: false, runtimeError: refusal, startRefusal: 'memory_refused' },
+    canActivateModels: false,
+    stopRuntime: vi.fn(), startRuntime: vi.fn(),
+  })
+  useModelsMock.mockReturnValue(state)
+  const view = renderModels()
+  const controls = screen.getByRole('region', { name: 'Model runtime controls' })
+  expect(within(controls).getByRole('status')).toHaveTextContent(refusal)
+  fireEvent.click(within(controls).getByRole('button', { name: 'Start anyway' }))
+  expect(state.startRuntime).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('button', { name: 'Resume model' })).toBeNull()
+
+  // An AMD launch failure: its text, and the ordinary Resume.
+  useModelsMock.mockReturnValue({ ...state,
+    modelManagement: { ...state.modelManagement, runtimeError: 'llama-server startup failed: Port 18080 is already occupied.', startRefusal: '' } })
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  expect(within(screen.getByRole('region', { name: 'Model runtime controls' })).getByRole('status')).toHaveTextContent('llama-server startup failed: Port 18080 is already occupied.')
+  expect(screen.getByRole('button', { name: 'Resume model' })).toBeEnabled()
+
+  // A running model shows no launcher error.
+  useModelsMock.mockReturnValue({ ...state, canActivateModels: true,
+    modelManagement: { managed: true, canActivate: true, canUnload: true, running: true, runtimeError: '', startRefusal: '' } })
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  expect(within(screen.getByRole('region', { name: 'Model runtime controls' })).queryByRole('status')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Unload model' })).toBeEnabled()
+})
+
+test.each([false, true])('unavailable management proof never offers adoption and recovers to managed controls (compact=%s)', compact => {
+  const state = baseState({
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server', hostRuntime: true,
+    modelManagement: { managed: null, canActivate: false, canUnload: false, running: false },
+    canActivateModels: false, activationModeError: 'Runtime management could not be verified',
+    currentModel: 'qwen3.5-9b-q4', loadedModel: 'Qwen3.5-9B-Q4_K_M.gguf',
+    models: [model({ status: 'loaded' }), model({ id: 'next', name: 'Next model', status: 'downloaded' })],
+  })
+  useModelsMock.mockReturnValue(state)
+  const view = render(createElement(MemoryRouter, null, createElement(Models, { compact })))
+  expect(screen.getByText('Runtime management unavailable')).toBeVisible()
+  expect(screen.queryByText('Model changes managed externally')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Adopt loaded model in ODS' })).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Model runtime controls' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Configure context for Qwen 3.5 9B' })).toBeDisabled()
+  for (const button of screen.getAllByRole('button', { name: 'Run' })) expect(button).toBeDisabled()
+
+  useModelsMock.mockReturnValue({ ...state,
+    modelManagement: { managed: true, canActivate: true, canUnload: true, running: true },
+    canActivateModels: true, activationModeError: null,
+  })
+  view.rerender(createElement(MemoryRouter, null, createElement(Models, { compact })))
+  expect(screen.queryByText('Runtime management unavailable')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Unload model' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Configure context for Qwen 3.5 9B' })).toBeEnabled()
+  expect(screen.queryByRole('button', { name: 'Adopt loaded model in ODS' })).toBeNull()
+})
+
+test('revoked capability disables a context dialog that is already open', () => {
+  const state = baseState({ models: [model({ status: 'loaded' })], currentModel: 'qwen3.5-9b-q4' })
+  useModelsMock.mockReturnValue(state)
+  const view = renderModels()
+  fireEvent.click(screen.getByRole('button', { name: 'Configure context for Qwen 3.5 9B' }))
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Custom context in tokens' }), { target: { value: '32768' } })
+  useModelsMock.mockReturnValue({ ...state, canActivateModels: false, activationModeError: 'Ownership could not be verified.' })
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  expect(screen.getByRole('button', { name: 'Apply context' })).toBeDisabled()
+  expect(state.loadModel).not.toHaveBeenCalled()
+})
+
+test('ordinary external capability never exposes runtime controls', () => {
+  useModelsMock.mockReturnValue(baseState({ modelManagement: { managed: false, canUnload: true, running: true } }))
+  renderModels()
+  expect(screen.queryByRole('region', { name: 'Model runtime controls' })).toBeNull()
+})
+
+test('compact catalog uses fitted pages and preserves filter reset behavior', () => {
+  useModelsMock.mockReturnValue(baseState({models:Array.from({length:12},(_,i)=>model({id:`m${i}`,name:`Catalog model ${i}`}))}))
+  render(createElement(MemoryRouter,null,createElement(Models,{compact:true})))
+  fireEvent.click(screen.getByRole('tab',{name:/ODS Recommended/}))
+  expect(screen.getByRole('article',{name:'Catalog model 0'})).toBeVisible()
+  expect(screen.queryByRole('article',{name:'Catalog model 11'})).toBeNull()
+  fireEvent.change(screen.getByRole('textbox',{name:'Search models'}),{target:{value:'Catalog model 11'}})
+  expect(screen.getByRole('article',{name:'Catalog model 11'})).toBeVisible()
+  expect(screen.queryByRole('button',{name:'Page 2'})).toBeNull()
+})
+
+test.each([false, true])('displays an observed runtime outside the catalog without marking a catalog model loaded (compact=%s)', (compact) => {
+  useModelsMock.mockReturnValue(baseState({
+    loadedModel: 'Qwen3.6-35B-A3B-GGUF',
+    configuredModel: 'qwen3.5-9b-q4',
+    models: [
+      model({ status: 'downloaded' }),
+      model({
+        id: 'runtime-123456789abc',
+        name: 'Qwen3.6-35B-A3B-GGUF',
+        status: 'loaded',
+        size: null,
+        sizeGb: null,
+        vramRequired: null,
+        contextLength: null,
+        quantization: null,
+        fitsVram: null,
+        metadata: { source: 'runtime', catalogSource: 'runtime', readable: false },
+      }),
+    ],
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, { compact })))
+  expect(screen.getAllByText(/Qwen3\.6-35B-A3B-GGUF/).length).toBeGreaterThan(0)
+  expect(screen.getByRole('tab', { name: /ODS Recommended/i })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('tab', { name: /ODS Recommended/i })).toHaveTextContent('1')
+  expect(screen.queryByText('Managed by runtime')).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('tab', { name: /Installed/i }))
+  expect(screen.getByText('Managed by runtime')).toBeInTheDocument()
+  expect(screen.getByText('Runtime managed')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Configure context for Qwen3.6-35B-A3B-GGUF' })).toBeNull()
+  expect(screen.queryByRole('button', { name: /benchmark/i })).toBeNull()
+  expect(screen.queryByText(/Selected during install:/)).not.toBeInTheDocument()
+  expect(screen.getAllByTitle('Run Qwen 3.5 9B')[0]).not.toBeDisabled()
+})
 
 test('renders the model library layout from catalog fields only', () => {
   useModelsMock.mockReturnValue(baseState({
@@ -128,7 +517,7 @@ test('renders the model library layout from catalog fields only', () => {
   expect(screen.getAllByText('VRAM').length).toBeGreaterThan(0)
   expect(screen.getAllByText('Speed').length).toBeGreaterThan(0)
   expect(screen.getByText('Currently running: qwen3.5-9b-q4')).toBeInTheDocument()
-  expect(screen.getByRole('link', { name: /dashboard/i })).toHaveAttribute('href', '/')
+  expect(screen.getByRole('link', { name: /dashboard/i })).toHaveAttribute('href', '/dashboard')
   expect(screen.getByText('51.7 tok/s')).toBeInTheDocument()
   expect(screen.getByText('69.8 tok/s')).toBeInTheDocument()
   expect(screen.getByText('~3.2 GB incl. KV')).toBeInTheDocument()
@@ -317,7 +706,7 @@ test('ignores repository metadata that arrives after its dialog was replaced', a
       label: `${name}-only-Q4.gguf`,
       quantization: 'Q4_K_M',
       sizeBytes: 1024,
-      files: [{ filename: `${name}.gguf` }],
+      files: [{ filename: `${name}/${name}-only-Q4.gguf` }],
     }],
     url: `https://huggingface.co/org/${name}`,
   })
@@ -343,15 +732,15 @@ test('ignores repository metadata that arrives after its dialog was replaced', a
     await act(async () => {
       resolveFirstDetails({ ok: true, json: async () => details('first') })
     })
-    expect(screen.queryByText('first-only-Q4.gguf')).not.toBeInTheDocument()
+    expect(screen.queryByText('first/first-only-Q4.gguf')).not.toBeInTheDocument()
     expect(screen.getByText('Reading repository metadata...')).toBeInTheDocument()
 
     await act(async () => {
       resolveSecondDetails({ ok: true, json: async () => details('second') })
     })
-    expect(await screen.findByText('second-only-Q4.gguf')).toBeInTheDocument()
+    expect(await screen.findByText('second/second-only-Q4.gguf')).toBeInTheDocument()
     expect(screen.getByText('Hub config')).toBeInTheDocument()
-    expect(screen.queryByText('first-only-Q4.gguf')).not.toBeInTheDocument()
+    expect(screen.queryByText('first/first-only-Q4.gguf')).not.toBeInTheDocument()
   } finally {
     vi.unstubAllGlobals()
   }
@@ -637,8 +1026,8 @@ test('allows low-context downloaded models to run with an agent-readiness warnin
   fireEvent.click(runButton)
   confirmModelRun()
   expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 8192 })
-  expect(screen.getByText('Direct chat only')).toBeInTheDocument()
-  expect(screen.getByText('Needs 64K')).toBeInTheDocument()
+  expect(screen.getByText('Portal compact')).toBeInTheDocument()
+  expect(screen.getByText('8K context')).toBeInTheDocument()
 
   const deleteButton = screen.getByRole('button', { name: /delete qwen 3\.5 9b$/i })
   expect(deleteButton).toBeEnabled()
@@ -678,14 +1067,98 @@ test('allows explicit Talk-incompatible models to run with an agent-readiness wa
   fireEvent.click(runButton)
   confirmModelRun()
   expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 128000 })
-  expect(screen.getByText('Direct chat only')).toBeInTheDocument()
-  expect(screen.getByText('Agent blocked')).toBeInTheDocument()
+  expect(screen.getByText('Portal adaptive')).toBeInTheDocument()
+  expect(screen.getByText('Capability varies')).toBeInTheDocument()
 
   const deleteButton = screen.getByRole('button', { name: /delete phi-4 mini$/i })
   expect(deleteButton).toBeEnabled()
 })
 
-test('blocks direct-chat-incompatible models before Run', () => {
+test.each([false, true])('explains blocked apps with user copy, never the internal fleet note (compact=%s)', (compact) => {
+  const fleetNote = 'Fleet model-UI run 2026-07-16T18-10Z on windows-laptop failed; keep it out of ODS Talk release coverage until revalidated.'
+  const talkCopy = "This model isn't supported in ODS Talk yet. Switch to a recommended model to use ODS Talk."
+  const agentCopy = 'Not verified for agent tasks, so responses may fail. Switch to a recommended model for agent features.'
+  useModelsMock.mockReturnValue(baseState({
+    models: [model({
+      name: 'IBM Granite 3.3 2B Instruct',
+      status: 'downloaded',
+      appCompatibility: {
+        openaiChat: { status: 'verified', reason: 'direct chat passed', userMessage: 'Verified for chat.' },
+        hermesTalk: { status: 'unsupported_until_revalidated', reason: fleetNote, userMessage: talkCopy },
+        agentViability: { status: 'not_agent_viable', reason: fleetNote, userMessage: agentCopy },
+      },
+    })],
+  }))
+
+  const { container } = render(createElement(MemoryRouter, null, createElement(Models, { compact })))
+
+  if (compact) {
+    expect(screen.getByText(talkCopy)).toBeInTheDocument()
+    expect(screen.getByText(agentCopy)).toBeInTheDocument()
+    expect(screen.queryByText('Verified for chat.')).not.toBeInTheDocument()
+  } else {
+    expect(container.querySelector(`[title="${talkCopy} ${agentCopy}"]`)).not.toBeNull()
+  }
+  expect(container.innerHTML).not.toMatch(/Fleet model-UI run|release coverage|revalidated/)
+})
+
+test('distinguishes verified and adaptive Pixel capability without excluding models', () => {
+  useModelsMock.mockReturnValue(baseState({
+    models: [
+      model({
+        id: 'pixel-blocked',
+        name: 'Pixel Blocked',
+        appCompatibility: {
+          agentViability: { status: 'verified' },
+          pixelAgent: { status: 'not_agent_viable' },
+        },
+      }),
+      model({
+        id: 'pixel-untested',
+        name: 'Pixel Untested',
+        appCompatibility: {
+          agentViability: { status: 'verified' },
+        },
+      }),
+      model({
+        id: 'pixel-ready',
+        name: 'Pixel Ready',
+        appCompatibility: {
+          agentViability: { status: 'verified' },
+          hermesTalk: { status: 'verified' },
+          pixelAgent: { status: 'verified' },
+        },
+      }),
+    ],
+  }))
+
+  renderModels()
+
+  expect(screen.getAllByText('Portal adaptive')).toHaveLength(2)
+  expect(screen.getAllByText('Available to use')).toHaveLength(2)
+  expect(screen.getByText('Portal verified', { selector: 'span' })).toBeInTheDocument()
+})
+
+test('shows adaptive Pixel capability in the activation dialog without blocking Run', () => {
+  useModelsMock.mockReturnValue(baseState({
+    models: [model({
+      status: 'downloaded',
+      contextLength: 32768,
+      appCompatibility: {
+        agentViability: { status: 'verified' },
+        pixelAgent: { status: 'not_agent_viable' },
+      },
+    })],
+  }))
+
+  renderModels()
+  fireEvent.click(screen.getByRole('button', { name: 'Run' }))
+
+  expect(screen.getAllByText('Portal adaptive')).toHaveLength(2)
+  expect(screen.queryByText('Hermes ready')).not.toBeInTheDocument()
+})
+
+test('allows models with failed direct-chat qualification to run adaptively', () => {
   const loadModel = vi.fn()
   const deleteModel = vi.fn()
   const reason = 'Fleet validation could not load this model into the local chat runtime.'
@@ -707,13 +1180,15 @@ test('blocks direct-chat-incompatible models before Run', () => {
 
   renderModels()
 
-  const runButton = screen.getByRole('button', { name: /chat unsupported/i })
-  expect(runButton).toBeDisabled()
-  expect(runButton).toHaveAttribute('title', reason)
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeEnabled()
+  expect(runButton).toHaveAttribute('title', 'Run Phi-3.5 Mini')
   fireEvent.click(runButton)
+  expect(screen.getAllByText('Portal adaptive')).toHaveLength(2)
+  expect(screen.getByText('Capability varies')).toBeInTheDocument()
   expect(loadModel).not.toHaveBeenCalled()
-  expect(screen.getByText('Unavailable')).toBeInTheDocument()
-  expect(screen.getByText('Chat blocked')).toBeInTheDocument()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 128000 })
 
   const deleteButton = screen.getByRole('button', { name: /delete phi-3\.5 mini$/i })
   expect(deleteButton).toBeEnabled()
@@ -760,11 +1235,26 @@ test('shows terminal download failures with a retry action', async () => {
 
   expect(screen.getByText('Download Failed')).toBeInTheDocument()
   expect(screen.getByText('The download checksum did not match.')).toBeInTheDocument()
+  // A failed download names where to get help, like the page's other errors.
+  expect(screen.getByRole('link', { name: /get help on discord/i }))
+    .toHaveAttribute('href', expect.stringContaining('discord.gg/'))
   fireEvent.click(screen.getByRole('button', { name: /retry/i }))
 
   expect(clearTerminal).toHaveBeenCalled()
   expect(downloadModel).toHaveBeenCalledWith('qwen3.5-9b-q4')
   await act(async () => {})
+})
+
+test('shows download status polling failures instead of an empty progress area', () => {
+  useModelsMock.mockReturnValue(baseState({ models: [model()] }))
+  useDownloadProgressMock.mockReturnValue(baseDownloadState({
+    statusError: 'Download status unavailable (HTTP 503).',
+  }))
+
+  renderModels()
+
+  expect(screen.getByText('Download Failed')).toBeInTheDocument()
+  expect(screen.getByText('Download status unavailable (HTTP 503).')).toBeInTheDocument()
 })
 
 test.each([
@@ -991,20 +1481,182 @@ test('keeps Run visible with the runtime-mode reason when activation is unavaila
   expect(loadModel).not.toHaveBeenCalled()
 })
 
-test('keeps Run visible with the VRAM requirement when the model does not fit', () => {
+const RUN_ANYWAY_TEXT = 'Run it anyway. It may run slowly using system memory, or ODS goes back to your current model if it cannot load.'
+
+test('keeps Run visible with the VRAM requirement when the model does not fit, and runs only after Run anyway is ticked', () => {
+  // The host does not refuse a model above the GPU estimate on one GPU, so the
+  // requirement is a warning the owner accepts in the run dialog, not a stop.
   const loadModel = vi.fn()
   useModelsMock.mockReturnValue(baseState({
     loadModel,
-    models: [model({ status: 'downloaded', fitsVram: false, vramRequired: 12 })],
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: false }],
+    })],
   }))
 
   renderModels()
 
   const runButton = screen.getByRole('button', { name: /^run$/i })
-  expect(runButton).toBeDisabled()
+  expect(runButton).toBeEnabled()
   expect(runButton).toHaveAttribute('title', 'Requires 12 GB VRAM; the detected GPU has 8.0 GB total.')
   fireEvent.click(runButton)
   expect(loadModel).not.toHaveBeenCalled()
+
+  const dialog = screen.getByRole('dialog', { name: 'Qwen 3.5 9B' })
+  expect(within(dialog).getByText(/exceeds the reported GPU memory estimate/i)).toBeInTheDocument()
+  const runAnyway = within(dialog).getByRole('checkbox', { name: RUN_ANYWAY_TEXT })
+  expect(runAnyway).not.toBeChecked()
+  expect(within(dialog).getByRole('link', { name: 'Get help on Discord' })).toHaveAttribute('href', 'https://discord.gg/4ntNp9MAwC')
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+  confirmModelRun()
+  expect(loadModel).not.toHaveBeenCalled()
+
+  fireEvent.click(runAnyway)
+  expect(runAnyway).toBeChecked()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 65536 })
+})
+
+test('shows the memory warning in compact details while Run stays available', () => {
+  useModelsMock.mockReturnValue(baseState({
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: false }],
+    })],
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, { compact: true })))
+  const entry = screen.getByRole('article', { name: 'Qwen 3.5 9B' })
+  expect(within(entry).getByText('Requires 12 GB VRAM; the detected GPU has 8.0 GB total.')).toBeInTheDocument()
+  expect(within(entry).getByRole('button', { name: /^run$/i })).toBeEnabled()
+})
+
+test('a busy runtime still disables Run for a model that does not fit', () => {
+  useModelsMock.mockReturnValue(baseState({
+    activationLoading: 'another-model',
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: false }],
+    })],
+  }))
+  renderModels()
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeDisabled()
+  expect(runButton).toHaveAttribute('title', 'Wait for the current model swap to finish.')
+})
+
+test('keeps the hard stop when ODS cannot read the machine memory', () => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: null,
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: null }],
+    })],
+  }))
+  renderModels()
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeDisabled()
+  expect(runButton).toHaveAttribute('title', 'GPU capacity is unavailable. Wait for the memory reading before running this model.')
+  fireEvent.click(runButton)
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(loadModel).not.toHaveBeenCalled()
+})
+
+test.each([false, true])('unavailable capacity stays unknown and recovers without an activation (compact=%s)', compact => {
+  const loadModel = vi.fn()
+  const active = model({id: 'active', status: 'loaded', name: 'Active model'})
+  const candidate = model({status: 'downloaded'})
+  const known = baseState({currentModel: 'active', gpu: {vramTotal: 32}, models: [active, candidate], loadModel})
+  useModelsMock.mockReturnValue(known)
+  const page = () => createElement(MemoryRouter, null, createElement(Models, {compact}))
+  const view = render(page())
+  expect(screen.getByRole('button', {name: /^run$/i})).toBeEnabled()
+  useModelsMock.mockReturnValue({...known, gpu: null, models: [active, {...candidate, fitsVram: false, tokensPerSec: null, performance: {source: 'benchmark_required'}}]})
+  view.rerender(page())
+  expect(screen.getByText(/GB; capacity unavailable/)).toBeVisible()
+  expect(screen.queryByText(/\/ 0.0 GB/)).toBeNull()
+  expect(screen.queryByText('Too large')).toBeNull()
+  const activePanel = screen.getAllByText('Active model')[0].closest('section')
+  expect(within(activePanel).queryByText('Fits GPU')).toBeNull()
+  expect(screen.queryByText('Benchmark required')).toBeNull()
+  expect(screen.getAllByText('Fit unknown').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('Speed unavailable').length).toBeGreaterThan(0)
+  expect(screen.getByRole('button', {name: /^run$/i})).toBeDisabled()
+  useModelsMock.mockReturnValue(known)
+  view.rerender(page())
+  expect(screen.queryByText(/capacity unavailable/)).toBeNull()
+  expect(screen.getByRole('button', {name: /^run$/i})).toBeEnabled()
+  expect(loadModel).not.toHaveBeenCalled()
+})
+
+test.each([null, {vramTotal: 0}, {vramTotal: NaN}, {vramTotal: Infinity}])('unknown capacity holds even a recommended model with a stale fit result (%s)', gpu => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({gpu, loadModel, models: [model({status: 'downloaded', recommended: true, fitsVram: true})]}))
+  renderModels()
+  const run = screen.getByRole('button', {name: /^run$/i})
+  expect(run).toBeDisabled()
+  expect(run).toHaveAttribute('title', 'GPU capacity is unavailable. Wait for the memory reading before running this model.')
+  fireEvent.click(run)
+  expect(loadModel).not.toHaveBeenCalled()
+})
+
+test('losing capacity holds an already-open context dialog and recovery does not submit it', () => {
+  const state = baseState({models: [model({status: 'downloaded'})]})
+  useModelsMock.mockReturnValue(state)
+  const view = renderModels()
+  fireEvent.click(screen.getByRole('button', {name: /^run$/i}))
+  expect(screen.getByRole('button', {name: 'Run model'})).toBeEnabled()
+  useModelsMock.mockReturnValue({...state, gpu: null})
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  expect(screen.getByRole('button', {name: 'Run model'})).toBeDisabled()
+  expect(screen.getByText('GPU capacity is unavailable. Wait for the memory reading before running this model.')).toBeVisible()
+  useModelsMock.mockReturnValue(state)
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  expect(screen.getByRole('button', {name: 'Run model'})).toBeEnabled()
+  expect(state.loadModel).not.toHaveBeenCalled()
+})
+
+test('runs a downloaded model at the highest fitting Hermes context when its default context exceeds VRAM', () => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    models: [model({
+      id: 'granite4.1-3b-q4',
+      name: 'Granite 4.1 3B',
+      status: 'downloaded',
+      contextLength: 131072,
+      maxContextLength: 131072,
+      estimatedRequired: 12.05,
+      vramRequired: 4,
+      fitsVram: false,
+      contextOptions: [
+        { contextLength: 16384, estimatedRequired: 4, fitsVram: true },
+        { contextLength: 65536, estimatedRequired: 7.05, fitsVram: true },
+        { contextLength: 131072, estimatedRequired: 12.05, fitsVram: false, recommended: true },
+      ],
+    })],
+  }))
+
+  renderModels()
+
+  expect(screen.getByText('Shorter context')).toBeInTheDocument()
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeEnabled()
+  fireEvent.click(runButton)
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('granite4.1-3b-q4', { contextLength: 65536 })
 })
 
 test('allows the selected install model to run even when the VRAM estimate is high', () => {
@@ -1092,4 +1744,89 @@ test('filters models by search and category without changing catalog data', () =
 
   fireEvent.click(screen.getByRole('button', { name: /reset/i }))
   expect(screen.getByText('Qwen 3.5 9B')).toBeInTheDocument()
+})
+
+
+test('explains the model memory budget separately from detected shared GPU memory', () => {
+  useModelsMock.mockReturnValue(baseState({
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({ status: 'downloaded', fitsVram: false, estimatedRequired: 23.8,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 23.8, fitsVram: false }] })],
+  }))
+  renderModels()
+  const run = screen.getByRole('button', { name: /^run$/i })
+  // Above the budget but within the machine's 32 GB of shared memory, the
+  // requirement is a warning: Run stays available behind the Run anyway tick.
+  expect(run).toBeEnabled()
+  expect(run).toHaveAttribute('title', 'Requires 23.8 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
+})
+
+test('does not invent a fitting context above the supplied model memory budget', () => {
+  useModelsMock.mockReturnValue(baseState({
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({ status: 'downloaded', fitsVram: false, estimatedRequired: 23.8,
+      sizeGb: 20.6, contextLength: 65536, maxContextLength: 65536, contextOptions: [] })],
+  }))
+  renderModels()
+  // No context is treated as fitting: the budget warning stays on Run, and the
+  // dialog runs only after the explicit Run anyway tick.
+  const run = screen.getByRole('button', { name: /^run$/i })
+  expect(run).toHaveAttribute('title', 'Requires 23.8 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
+  fireEvent.click(run)
+  expect(screen.getByRole('checkbox', { name: RUN_ANYWAY_TEXT })).not.toBeChecked()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+})
+
+test('keeps a hard stop on shared memory when the model needs more than the machine has', () => {
+  // Apple silicon reports its whole memory as the GPU total and a smaller
+  // model budget. A model larger than that total cannot run at all there.
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({ status: 'downloaded', fitsVram: false, estimatedRequired: 40,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 40, fitsVram: false }] })],
+  }))
+  renderModels()
+  const run = screen.getByRole('button', { name: /^run$/i })
+  expect(run).toBeDisabled()
+  expect(run).toHaveAttribute('title', 'Requires 40 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
+  fireEvent.click(run)
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(loadModel).not.toHaveBeenCalled()
+})
+
+test('on shared memory, offers Run anyway only for contexts within the machine memory', () => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({
+      status: 'downloaded', fitsVram: false, estimatedRequired: 20,
+      contextLength: 65536, maxContextLength: 131072,
+      contextOptions: [
+        { contextLength: 16384, estimatedRequired: 12, fitsVram: true },
+        { contextLength: 65536, estimatedRequired: 20, fitsVram: false, recommended: true },
+        { contextLength: 131072, estimatedRequired: 36, fitsVram: false, fullContext: true },
+      ],
+    })],
+  }))
+  renderModels()
+  fireEvent.click(screen.getByRole('button', { name: /^run$/i }))
+  const dialog = screen.getByRole('dialog', { name: 'Qwen 3.5 9B' })
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+
+  fireEvent.click(within(dialog).getByRole('button', { name: /128K Full context/i }))
+  expect(within(dialog).getByText(/This context needs about 36 GB, more than the 32 GB of memory this machine has\. Choose a shorter context\./)).toBeInTheDocument()
+  expect(within(dialog).getByRole('link', { name: 'Get help on Discord' })).toBeInTheDocument()
+  expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+
+  fireEvent.click(within(dialog).getByRole('button', { name: /64K Recommended/i }))
+  expect(within(dialog).queryByText(/more than the 32 GB of memory this machine has/)).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+  fireEvent.click(within(dialog).getByRole('checkbox', { name: RUN_ANYWAY_TEXT }))
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 65536 })
 })

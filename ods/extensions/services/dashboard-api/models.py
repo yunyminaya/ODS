@@ -5,7 +5,7 @@ from typing import Annotated, Any, Optional
 from pydantic import BaseModel, Field
 
 from config import GPU_BACKEND
-from context_policy import HERMES_MIN_CONTEXT, HERMES_TARGET_CONTEXT
+from context_policy import HERMES_MIN_CONTEXT, HERMES_TARGET_CONTEXT, PIXEL_MIN_CONTEXT
 
 
 class GPUInfo(BaseModel):
@@ -31,6 +31,10 @@ class ServiceStatus(BaseModel):
     external_port: int
     status: str  # "healthy", "unhealthy", "unknown", "degraded", "down", "not_deployed"
     response_time_ms: Optional[float] = None
+    # Internal health provenance; a slow HTTP probe alone cannot establish startup.
+    startup_pending: bool = Field(default=False, exclude=True)
+    # Internal: the restart policy keeps bringing a crashing container back up.
+    crash_looping: bool = Field(default=False, exclude=True)
 
 
 class NodeCapabilities(BaseModel):
@@ -58,6 +62,7 @@ class ModelInfo(BaseModel):
 
 class BootstrapStatus(BaseModel):
     active: bool
+    phase: Optional[str] = None
     model_name: Optional[str] = None
     percent: Optional[float] = None
     downloaded_gb: Optional[float] = None
@@ -107,6 +112,9 @@ class VersionInfo(BaseModel):
     update_available: bool = False
     changelog_url: Optional[str] = None
     checked_at: Optional[str] = None
+    check_status: str = "unavailable"
+    # Why GitHub gave no release, while a failed check holds further requests.
+    check_error: Optional[str] = None
 
 
 class UpdateAction(BaseModel):
@@ -182,11 +190,11 @@ class ModelLibraryEntry(BaseModel):
     downloadUrl: Optional[str] = None
     downloadSha256: Optional[str] = None
     llmModelName: Optional[str] = None
-    size: str
-    sizeGb: float
-    vramRequired: float
+    size: Optional[str]
+    sizeGb: Optional[float]
+    vramRequired: Optional[float]
     estimatedRequired: Optional[float] = None
-    contextLength: int
+    contextLength: Optional[int]
     maxContextLength: Optional[int] = None
     contextOptions: list[dict[str, Any]] = Field(default_factory=list)
     specialty: str
@@ -204,14 +212,16 @@ class ModelLibraryEntry(BaseModel):
     recommended: bool = False
     configured: bool = False
     recommendation: Optional[dict[str, Any]] = None
-    fitsVram: bool
-    fitsCurrentVram: bool
+    fitsVram: Optional[bool]
+    activationSupport: Optional[dict[str, Any]] = None
+    fitsCurrentVram: Optional[bool]
     performance: Optional[dict[str, Any]] = None
     performanceLabel: Optional[str] = None
 
 
 class ModelLibraryGpu(BaseModel):
     vramTotal: float
+    modelMemoryBudgetGb: Optional[float] = None
     vramUsed: float
     vramFree: float
 
@@ -225,9 +235,24 @@ class ModelLibraryResponse(BaseModel):
     configuredModel: Optional[str] = None
     hermesMinimumContext: int = HERMES_MIN_CONTEXT
     hermesTargetContext: int = HERMES_TARGET_CONTEXT
+    pixelMinimumContext: int = PIXEL_MIN_CONTEXT
     recommendationPolicy: Optional[str] = None
     recommendationAlternatives: list[dict[str, Any]] = Field(default_factory=list)
     modelLifecycle: Optional[dict[str, Any]] = None
+    modelActivation: Optional[dict[str, Any]] = None
+    modelRecoveryPending: bool = False
     odsMode: str = "unknown"
     configuredMode: str = "unknown"
     llmBackend: str = "unknown"
+    # API mode (llmBackend "external"): the model the API serves and the API's
+    # host, so the Models page can say what answers chat. Never the key.
+    externalModel: Optional[str] = None
+    externalHost: Optional[str] = None
+    # The model runs on the Windows host (the WSL Portal); modelManagement
+    # carries the host agent's proof of what this installation may control.
+    hostRuntime: bool = False
+    modelManagement: Optional[dict[str, Any]] = None
+    # Host-authoritative active runtime projection (local-switchboard,
+    # external-host, or remote-provider). Nonsecret identity, limits and
+    # capabilities; None when unknown, pending, or malformed.
+    activeRuntime: Optional[dict[str, Any]] = None

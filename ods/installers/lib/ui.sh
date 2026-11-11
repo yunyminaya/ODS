@@ -7,7 +7,7 @@
 #          screens, boot splash, lore messages, hardware/tier display boxes,
 #          install menu, success card
 #
-# Expects: GRN, BGRN, DGRN, AMB, WHT, NC, CURSOR, LOG_FILE, VERSION,
+# Expects: GRN, BGRN, DGRN, MAG, BMAG, AMB, WHT, NC, CURSOR, LOG_FILE, VERSION,
 #           INTERACTIVE, DRY_RUN, DOCKER_CMD (at call time), install_elapsed()
 # Provides: type_line(), type_line_dramatic(), static_line(), bootline(),
 #           ai(), ai_ok(), ai_warn(), ai_bad(), signal(), chapter(),
@@ -24,12 +24,41 @@
 
 DIVIDER="──────────────────────────────────────────────────────────────────────────────"
 
+# Resolve presentation separately from install interactivity. The cinematic UI
+# is for a human at a real terminal; pipes, CI, GUI front ends, and unattended installs
+# get stable one-line output with no cursor motion or screen clearing.
+ods_ui_cinematic() {
+  case "${ODS_UI_MODE:-auto}" in
+    cinematic)
+      [[ "${INTERACTIVE:-false}" == "true" \
+        && -z "${NO_COLOR:-}" \
+        && -z "${ODS_INSTALLER_GUI:-}" ]]
+      ;;
+    plain) return 1 ;;
+    auto|"")
+      [[ "${INTERACTIVE:-false}" == "true" \
+        && -t 1 \
+        && "${TERM:-}" != "dumb" \
+        && -z "${CI:-}" \
+        && -z "${NO_COLOR:-}" \
+        && -z "${ODS_INSTALLER_GUI:-}" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+ods_apply_presentation_mode() {
+  if ! ods_ui_cinematic; then
+    RED='' GRN='' BGRN='' DGRN='' MAG='' BMAG='' AMB='' WHT='' DIM='' NC=''
+  fi
+}
+
 # Typing effect with block cursor
 type_line() {
   local s="$1"
   local color="${2:-$GRN}"
   local delay="${3:-0.035}"
-  if [[ "$INTERACTIVE" != "true" ]]; then
+  if ! ods_ui_cinematic; then
     printf '%b%s%b\n' "$color" "$s" "$NC"
     return
   fi
@@ -53,7 +82,7 @@ type_line_dramatic() {
   local s="$1"
   local color="${2:-$GRN}"
   local delay="${3:-0.05}"
-  if [[ "$INTERACTIVE" != "true" ]]; then
+  if ! ods_ui_cinematic; then
     printf '%b%s%b\n' "$color" "$s" "$NC"
     return
   fi
@@ -79,15 +108,15 @@ type_line_dramatic() {
 
 # Static noise transition line
 static_line() {
-  if [[ "$INTERACTIVE" != "true" ]]; then return; fi
+  if ! ods_ui_cinematic; then return; fi
   local chars='░▒▓█'
   local width=63
   local i
-  printf "  "
+  printf "  %b" "$MAG"
   for ((i=0; i<width; i++)); do
     printf "%s" "${chars:RANDOM%4:1}"
   done
-  printf "\n"
+  printf "%b\n" "$NC"
   sleep 0.3
 }
 
@@ -98,6 +127,24 @@ ai()       { echo -e "  ${GRN}▸${NC} $1" | tee -a "$LOG_FILE"; }
 ai_ok()    { echo -e "  ${BGRN}✓${NC} $1" | tee -a "$LOG_FILE"; }
 ai_warn()  { echo -e "  ${AMB}⚠${NC} $1" | tee -a "$LOG_FILE"; }
 ai_bad()   { echo -e "  ${RED}✗${NC} $1" | tee -a "$LOG_FILE"; }
+
+# One-shot operational status. Cinematic terminals may overwrite an active
+# spinner line; plain/CI/GUI output always receives a fresh control-code-free line.
+ui_status_line() {
+  local kind="$1" message="$2"
+  local color marker label
+  case "$kind" in
+    ok)    color="$BGRN"; marker='✓'; label='OK' ;;
+    warn)  color="$AMB";  marker='⚠'; label='WARN' ;;
+    error) color="$RED";  marker='✗'; label='ERROR' ;;
+    *)     color="$GRN";  marker='>'; label='INFO' ;;
+  esac
+  if ods_ui_cinematic; then
+    printf '\r\033[K  %b%s%b %-60s\n' "$color" "$marker" "$NC" "$message"
+  else
+    printf '  [%s] %s\n' "$label" "$message"
+  fi
+}
 
 # Little signal flourish (tasteful)
 signal()   { echo -e "  ${GRN}░▒▓█▓▒░${NC} $1" | tee -a "$LOG_FILE"; }
@@ -118,23 +165,25 @@ show_phase() {
   ts=$(date '+%H:%M:%S')
   echo ""
   bootline
-  echo -e "${BGRN}ODSGATE SEQUENCE [${ts}]${NC}  ${GRN}PHASE ${phase}/${total} — ${name}${NC}"
+  echo -e "${BMAG}ODSGATE SEQUENCE [${ts}]${NC}  ${BGRN}PHASE ${phase}/${total} — ${name}${NC}"
   [[ -n "$estimate" ]] && echo -e "${AMB}EST. TIME:${NC} ${estimate}"
   bootline
 }
 
 # Cinematic boot splash
 show_stranger_boot() {
-  clear 2>/dev/null || true
+  if ods_ui_cinematic; then
+    clear 2>/dev/null || true
+  fi
   echo ""
-  echo -e "${BGRN}   OOOOO  DDDD   SSSSS${NC}"
-  echo -e "${BGRN}  OO   OO DD DD SS${NC}"
-  echo -e "${BGRN}  OO   OO DD DD  SSS${NC}"
-  echo -e "${BGRN}  OO   OO DD DD    SS${NC}"
-  echo -e "${BGRN}   OOOOO  DDDD  SSSS${NC}"
+  echo -e "${BGRN}    ____   ____    _____${NC}"
+  echo -e "${BGRN}   / __ \\ / __ \\  / ___/${NC}"
+  echo -e "${BGRN}  / / / // / / /  \\__ \\ ${NC}"
+  echo -e "${BGRN} / /_/ // /_/ /  ___/ / ${NC}"
+  echo -e "${BGRN} \\____//_____/  /____/  ${NC}"
   echo ""
   static_line
-  echo -e "${BGRN}  O D S G A T E${NC}   ${GRN}Local AI // Sovereign Intelligence // $(date +%Y)${NC}"
+  echo -e "${BMAG}  O D S G A T E${NC}   ${GRN}Local AI // Sovereign Intelligence // $(date +%Y)${NC}"
   echo -e "${DGRN}  CLASSIFICATION: FREEDOM IMMINENT${NC}"
   echo -e "${DGRN}  BUILD: v${VERSION} // $(date '+%Y-%m-%d %H:%M')${NC}"
   static_line
@@ -150,23 +199,48 @@ show_stranger_boot() {
   echo ""
 }
 
-# Lore messages — shown during long waits
-LORE_MESSAGES=(
-  "Your AI runs on your hardware. No one else's."
-  "No API keys expire. No rate limits apply."
-  "Corporations rent intelligence. You will own it."
-  "No cloud. No middleman. Just you and the machine."
-  "Every byte stays on your network. Every thought is private."
-  "This gateway answers to one operator: you."
-  "No telemetry. No usage reports. No surveillance."
-  "When the internet goes dark, your AI keeps running."
-  "You are building something they cannot take away."
-  "Sovereign compute. Sovereign intelligence. Sovereign you."
-  "The model weights live on your disk. They belong to you."
-  "No terms of service. No content policy. Just freedom."
-  "This is a modifiable system. It is yours to control."
+# Lore messages — shown during long waits. Keep the voice, but only make
+# promises that are true for the selected runtime mode.
+ODS_LOCAL_LORE_MESSAGES=(
+  "Local inference runs on hardware you control."
+  "Your model weights live on your disk."
+  "This gateway answers to its operator: you."
+  "Local services remain available without a cloud inference provider."
+  "You can inspect, modify, and extend this stack."
   "The code is yours. Make something never imagined."
+  "Your local model choice remains yours to change."
+  "The gateway is built from open, inspectable components."
+  "Your configuration stays in the ODS install you control."
+  "One machine. One operator. A stack you can shape."
 )
+ODS_CLOUD_LORE_MESSAGES=(
+  "Cloud mode is active; configured providers may receive prompts and responses."
+  "Your local gateway keeps provider settings in your ODS configuration."
+  "Review each provider's privacy, retention, and usage terms."
+  "You can switch runtime modes after installation."
+  "This is a modifiable system. It is yours to control."
+)
+ODS_EXTERNAL_LORE_MESSAGES=(
+  "ODS will use the external inference endpoint you selected."
+  "Traffic handling depends on that endpoint and its operator."
+  "Your ODS services and configuration remain under your control."
+  "You can replace the inference endpoint after installation."
+  "This is a modifiable system. It is yours to control."
+)
+
+ods_select_lore_messages() {
+  if [[ -n "${EXTERNAL_LLM_URL:-}" ]]; then
+    LORE_MESSAGES=("${ODS_EXTERNAL_LORE_MESSAGES[@]}")
+    return 0
+  fi
+  case "${ODS_MODE:-local}" in
+    cloud) LORE_MESSAGES=("${ODS_CLOUD_LORE_MESSAGES[@]}") ;;
+    external) LORE_MESSAGES=("${ODS_EXTERNAL_LORE_MESSAGES[@]}") ;;
+    *) LORE_MESSAGES=("${ODS_LOCAL_LORE_MESSAGES[@]}") ;;
+  esac
+}
+
+ods_select_lore_messages
 
 # Size of an in-flight download, in bytes. Missing file reads as 0 so callers
 # can poll before curl has created it. GNU stat first, BSD stat second.
@@ -229,38 +303,171 @@ cancel_active_download() {
   ODS_ACTIVE_DOWNLOAD_PID=""
 }
 
+# Fit visible text without splitting UTF-8 characters or emitting terminal controls.
+# Non-ASCII characters count as two cells, deliberately conservative for combining
+# marks and accented text. The C-locale fallback replaces non-ASCII bytes with '?'.
+# Assign the result directly so each frame does not fork a shell for clipping.
+ods_hud_fit() {
+  local text="$1" limit="$2" char width used=0 fitted='' shortened='' index
+  local LC_COLLATE=C locale_name="${LC_ALL:-${LC_CTYPE:-${LANG:-C}}}" unicode=false
+  ODS_HUD_FIT=''
+  [[ "$limit" =~ ^[0-9]{1,5}$ ]] || return 0
+  limit=$((10#$limit))
+  (( limit > 0 )) || return 0
+  case "$locale_name" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) unicode=true ;; esac
+  if [[ "$unicode" != true ]]; then
+    local LC_ALL=C
+  fi
+  for ((index=0; index<${#text}; index++)); do
+    char="${text:index:1}"
+    case "$char" in
+      [[:cntrl:]]) char='?'; width=1 ;;
+      [\ -~]) width=1 ;;
+      *)
+        if [[ "$unicode" == true ]]; then width=2; else char='?'; width=1; fi
+        ;;
+    esac
+    if (( used + width > limit )); then
+      ODS_HUD_FIT="${shortened}~"
+      return 0
+    fi
+    fitted+="$char"
+    used=$((used + width))
+    if (( used < limit )); then shortened="$fitted"; fi
+  done
+  ODS_HUD_FIT="$fitted"
+}
+
+# Read the output terminal, even if stdin is redirected. A redirected cinematic
+# test can supply COLUMNS; ordinary redirected installs use the plain branch.
+ods_hud_columns() {
+  local dimensions='' columns="${COLUMNS:-80}"
+  if [[ -t 1 ]]; then
+    { dimensions=$(stty size <&3 2>/dev/null) || dimensions=''; } 3<&1
+    [[ -z "$dimensions" ]] || columns="${dimensions#* }"
+  fi
+  if [[ "$columns" =~ ^[0-9]{1,5}$ ]] && (( 10#$columns > 0 )); then
+    ODS_HUD_COLUMNS=$((10#$columns))
+  else
+    ODS_HUD_COLUMNS=80
+  fi
+}
+
+# The live counter spin_task shows: the reader function's text when one is
+# given, else the .part file's bytes against the expected size.
+_ods_spin_counter() {
+  local progress_part="$1" progress_total_mb="$2" progress_reader="$3"
+  if [[ -n "$progress_reader" ]]; then
+    "$progress_reader"
+  else
+    format_download_progress "$(download_part_bytes "$progress_part")" "$progress_total_mb"
+  fi
+}
+
 # Spinner with mm:ss timer + lore messages every 8 seconds.
 # Optional args 3/4 turn the label into a live download counter: pass the .part
 # file the task is writing and the expected size in MB (0 when unknown). Without
-# them a long download is indistinguishable from a stalled one.
+# them a long download is indistinguishable from a stalled one. Optional arg 5
+# names a function that prints a short live status instead (a download of many
+# files, a model loading); pass "" and 0 for args 3/4 with it.
 spin_task() {
   local pid=$1
   local msg=$2
   local progress_part="${3:-}"
   local progress_total_mb="${4:-0}"
+  local progress_reader="${5:-}"
   local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
   local i=0
   local elapsed=0
   local lore_idx=0
+  local has_lore=0
+  local ODS_HUD_FIT='' ODS_HUD_COLUMNS=80
 
-  printf "  ${GRN}⠋${NC} [00:00] %s " "$msg"
-  while kill -0 "$pid" 2>/dev/null; do
+  ods_select_lore_messages
+  if ! ods_ui_cinematic; then
+    local plain_label="$msg"
+    if [[ -n "$progress_part" || -n "$progress_reader" ]]; then
+      plain_label="$msg — $(_ods_spin_counter "$progress_part" "$progress_total_mb" "$progress_reader")"
+    fi
+    printf "  ... %s\n" "$plain_label"
+    if [[ -n "$progress_part" || -n "$progress_reader" ]]; then
+      # Plain/redirected installs have no spinner: retain a bounded heartbeat
+      # for large downloads instead of leaving the initial byte count frozen.
+      while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if (( elapsed % 30 == 0 )); then
+          printf "  ... [%02d:%02d] %s — %s\n" \
+            "$((elapsed / 60))" "$((elapsed % 60))" "$msg" \
+            "$(_ods_spin_counter "$progress_part" "$progress_total_mb" "$progress_reader")"
+        fi
+      done
+    fi
+    local plain_rc=0
+    wait "$pid" || plain_rc=$?
+    return "$plain_rc"
+  fi
+
+  local timer prefix available lore='' fit_label locale_name counter title_budget
+  locale_name="${LC_ALL:-${LC_CTYPE:-${LANG:-C}}}"
+  case "$locale_name" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;; *) spin='|/-\' ;; esac
+  while :; do
     local mm=$((elapsed / 60))
     local ss=$((elapsed % 60))
     local label="$msg"
-    if [[ -n "$progress_part" ]]; then
-      label="$msg — $(format_download_progress "$(download_part_bytes "$progress_part")" "$progress_total_mb")"
+    counter=''
+    if [[ -n "$progress_part" || -n "$progress_reader" ]]; then
+      counter="$(_ods_spin_counter "$progress_part" "$progress_total_mb" "$progress_reader")"
     fi
-    printf "\r  ${GRN}%s${NC} [%02d:%02d] %s " "${spin:$i:1}" "$mm" "$ss" "$label"
+    ods_hud_columns
+    printf -v timer '[%02d:%02d]' "$mm" "$ss"
+    prefix="  ${spin:$i:1} $timer "
+    available=$((ODS_HUD_COLUMNS - 1 - ${#prefix}))
+    if (( available >= 0 )); then
+      if [[ -n "$counter" ]]; then
+        # Keep the live byte/percentage counter visible before spending the
+        # remaining cells on a potentially long model filename.
+        title_budget=$((available - ${#counter} - 4))
+        if (( title_budget > 0 )); then
+          ods_hud_fit "$msg" "$title_budget"
+          label="$ODS_HUD_FIT — $counter"
+        else
+          label="$counter"
+          if (( ${#counter} > available )) && [[ "$counter" =~ \(([0-9]+)%\)$ ]]; then
+            label="${BASH_REMATCH[1]}%"
+          fi
+        fi
+      fi
+      ods_hud_fit "$label" "$available"
+      fit_label="$ODS_HUD_FIT"
+      printf "\r\033[K  ${GRN}%s${NC} %s %s" "${spin:$i:1}" "$timer" "$fit_label"
+    else
+      ods_hud_fit "$timer" "$((ODS_HUD_COLUMNS - 1))"
+      printf '\r\033[K%s' "$ODS_HUD_FIT"
+    fi
+    if [[ -n "$lore" ]]; then
+      available=$((ODS_HUD_COLUMNS - 11))
+      if (( available >= 0 )); then
+        ods_hud_fit "$lore" "$available"
+        printf "\n\033[K  ${DGRN}  « %s »${NC}\033[A\r" "$ODS_HUD_FIT"
+        has_lore=1
+      elif (( has_lore )); then
+        printf '\n\033[K\033[A\r'
+      fi
+    fi
+    kill -0 "$pid" 2>/dev/null || break
     i=$(( (i + 1) % ${#spin} ))
     elapsed=$((elapsed + 1))
-    # Show lore every 8 seconds
+    # Keep both physical rows within the terminal width, including on redraw.
     if (( elapsed > 0 && elapsed % 8 == 0 )); then
-      printf "\n  ${DGRN}  « %s »${NC}\n" "${LORE_MESSAGES[$lore_idx]}"
+      lore="${LORE_MESSAGES[$lore_idx]}"
       lore_idx=$(( (lore_idx + 1) % ${#LORE_MESSAGES[@]} ))
     fi
     sleep 1
   done
+  if (( has_lore )); then
+    printf "\n\033[K\033[A\r"
+  fi
   local rc=0
   wait "$pid" || rc=$?
   return $rc
@@ -336,38 +543,47 @@ pull_with_progress() {
       if $DOCKER_CMD inspect "$img" >/dev/null 2>&1; then
         cat "$attempt_log" >> "$LOG_FILE" 2>&1 || true
         rm -f "$attempt_log"
-        printf "\r  ${BGRN}✓${NC} [$count/$total] %-60s\n" "$label"
+        ui_status_line ok "[$count/$total] $label"
         return 0
       else
         cat "$attempt_log" >> "$LOG_FILE" 2>&1 || true
         rm -f "$attempt_log"
-        printf "\r  ${RED}✗${NC} [$count/$total] %-60s (image validation failed)\n" "$label"
+        ui_status_line error "[$count/$total] $label (image validation failed)"
         continue
       fi
     else
+      local pull_status=$?
       cat "$attempt_log" >> "$LOG_FILE" 2>&1 || true
+
+      # Docker Desktop's credential helper can fail outside the interactive
+      # Windows logon session. Retrying the same helper cannot restore it.
+      if grep -qiE 'error getting credentials|logon session does not exist|credential helper.*(failed|error|unavailable)' "$attempt_log"; then
+        rm -f "$attempt_log"
+        ui_status_line error "[$count/$total] $label (Docker credential helper failed; check Docker config/session)"
+        return 1
+      fi
 
       # Check for non-retryable errors
       if grep -qiE 'unauthorized|denied|not[[:space:]-]?found|\b404\b|no space left on device|cannot connect to the docker daemon|is the docker daemon running' "$attempt_log"; then
         rm -f "$attempt_log"
-        printf "\r  ${RED}✗${NC} [$count/$total] %-60s (non-retryable error)\n" "$label"
+        ui_status_line error "[$count/$total] $label (non-retryable error)"
         return 1
       fi
 
       # Check for timeout
-      if grep -qiE 'timeout|timed out' "$attempt_log" || ! kill -0 "$pull_pid" 2>/dev/null; then
+      if (( pull_status == 124 )) || grep -qiE 'timeout|timed out' "$attempt_log"; then
         rm -f "$attempt_log"
-        printf "\r  ${RED}✗${NC} [$count/$total] %-60s (network timeout on attempt $attempt)\n" "$label"
+        ui_status_line error "[$count/$total] $label (network timeout on attempt $attempt)"
         continue
       fi
 
       rm -f "$attempt_log"
-      printf "\r  ${RED}✗${NC} [$count/$total] %-60s (attempt $attempt failed)\n" "$label"
+      ui_status_line error "[$count/$total] $label (attempt $attempt failed; see installer log)"
     fi
   done
 
   # All attempts failed
-  printf "  ${RED}✗${NC} [$count/$total] Failed after $max_attempts attempts: $label\n"
+  ui_status_line error "[$count/$total] Failed after $max_attempts attempts: $label"
   return 1
 }
 
@@ -382,13 +598,21 @@ check_service() {
   local i=0
   local lore_idx=$(( RANDOM % ${#LORE_MESSAGES[@]} ))
   local elapsed=0
+  local cinematic=false
+
+  ods_select_lore_messages
+  ods_ui_cinematic && cinematic=true
 
   if $DRY_RUN; then
     ai "[DRY RUN] Would link ${name} at ${url}"
     return 0
   fi
 
-  printf "  ${GRN}%s${NC} Linking %-20s " "${spin:0:1}" "$name"
+  if $cinematic; then
+    printf "  ${GRN}%s${NC} Linking %-20s " "${spin:0:1}" "$name"
+  else
+    printf "  ... Linking %s\n" "$name"
+  fi
   for attempt in $(seq 1 $max_attempts); do
     # Exponential backoff: 2s, 4s, 8s, then 8s for remaining attempts
     local backoff=2
@@ -400,7 +624,11 @@ check_service() {
     # Add timeout to prevent indefinite hangs
     # Capture exit code directly — an if/then would consume it (always 0)
     timeout "$timeout" curl -sf "$url" > /dev/null 2>&1 && {
-      printf "\r  ${BGRN}✓${NC} %-55s\n" "$name online"
+      if $cinematic; then
+        printf "\r  ${BGRN}✓${NC} %-55s\n" "$name online"
+      else
+        printf "  [OK] %s online\n" "$name"
+      fi
       return 0
     }
 
@@ -414,10 +642,22 @@ check_service() {
       [[ ${#docker_cmd_arr[@]} -gt 0 ]] || docker_cmd_arr=(docker)
       local container_state=""
       if command -v "${docker_cmd_arr[0]}" >/dev/null 2>&1; then
-        container_state=$("${docker_cmd_arr[@]}" inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || echo "missing")
+        if ! container_state=$("${docker_cmd_arr[@]}" inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null); then
+          # Docker 29 can emit a blank stdout line before failing an inspect.
+          # Appending "missing" with `|| echo` produced a leading newline, so
+          # the exact-state case below missed it and retried for up to 20 min.
+          container_state="missing"
+        fi
+        container_state="${container_state//$'\r'/}"
+        container_state="${container_state//$'\n'/}"
+        [[ -n "$container_state" ]] || container_state="missing"
         case "$container_state" in
           exited|dead|missing)
-            printf "\r  ${RED}✗${NC} %-55s\n" "$name container $container_state"
+            if $cinematic; then
+              printf "\r  ${RED}✗${NC} %-55s\n" "$name container $container_state"
+            else
+              printf "  [ERROR] %s container %s\n" "$name" "$container_state"
+            fi
             ai_warn "$name container is $container_state; not retrying health probe."
             return 1
             ;;
@@ -427,7 +667,9 @@ check_service() {
 
     # Distinguish between timeout (124), connection refused (7),
     # and transient startup errors (56 = recv error, 52 = empty reply)
-    if [[ $curl_exit -eq 124 ]]; then
+    if ! $cinematic; then
+      : # Keep plain/CI output concise; the final status still reports the result.
+    elif [[ $curl_exit -eq 124 ]]; then
       # Timeout - service may be overloaded or slow
       printf "\r  ${AMB}⟳${NC} Linking %-20s [%ds] (timeout, retrying) " "$name" "$elapsed"
     elif [[ $curl_exit -eq 7 ]]; then
@@ -445,7 +687,7 @@ check_service() {
     i=$(( (i + 1) % ${#spin} ))
 
     # Show lore every 16 seconds of elapsed time
-    if (( elapsed > 0 && elapsed % 16 == 0 )); then
+    if $cinematic && (( elapsed > 0 && elapsed % 16 == 0 )); then
       printf "\n  ${DGRN}  « %s »${NC}\n" "${LORE_MESSAGES[$lore_idx]}"
       lore_idx=$(( (lore_idx + 1) % ${#LORE_MESSAGES[@]} ))
     fi
@@ -453,27 +695,38 @@ check_service() {
     sleep "$backoff"
   done
 
-  printf "\r  ${AMB}⚠${NC} %-55s\n" "$name delayed (may still be starting)"
+  if $cinematic; then
+    printf "\r  ${AMB}⚠${NC} %-55s\n" "$name delayed (may still be starting)"
+  else
+    printf "  [WARN] %s delayed (may still be starting)\n" "$name"
+  fi
   ai_warn "$name not responding yet. I will continue."
   return 1
 }
 
-# Show hardware summary — CRT monospace box
+# Show hardware summary — memory arguments include their display units.
 show_hardware_summary() {
     local gpu_name="$1"
     local gpu_vram="$2"
     local cpu_info="$3"
     local ram_gb="$4"
     local disk_gb="$5"
+    local windows_ram="${6:-}"
+    local is_wsl="${7:-false}"
 
     echo ""
     echo -e "${GRN}+-------------------------------------------------------------+${NC}"
     echo -e "${GRN}|${NC}  ${BGRN}HARDWARE SCAN RESULTS${NC}                                      ${GRN}|${NC}"
     echo -e "${GRN}+-------------------------------------------------------------+${NC}"
     printf "${GRN}|${NC}  GPU:    %-50s ${GRN}|${NC}\n" "${gpu_name:-Not detected}"
-    [[ -n "$gpu_vram" ]] && printf "${GRN}|${NC}  VRAM:   %-50s ${GRN}|${NC}\n" "${gpu_vram}GB"
+    [[ -n "$gpu_vram" ]] && printf "${GRN}|${NC}  VRAM:   %-50s ${GRN}|${NC}\n" "$gpu_vram"
     printf "${GRN}|${NC}  CPU:    %-50s ${GRN}|${NC}\n" "${cpu_info:-Unknown}"
-    printf "${GRN}|${NC}  RAM:    %-50s ${GRN}|${NC}\n" "${ram_gb}GB"
+    if [[ "$is_wsl" == true ]]; then
+        printf "${GRN}|${NC}  Windows RAM: %-45s ${GRN}|${NC}\n" "${windows_ram:-Unavailable (Windows interop)}"
+        printf "${GRN}|${NC}  WSL RAM:     %-45s ${GRN}|${NC}\n" "$ram_gb"
+    else
+        printf "${GRN}|${NC}  RAM:    %-50s ${GRN}|${NC}\n" "$ram_gb"
+    fi
     printf "${GRN}|${NC}  Disk:   %-50s ${GRN}|${NC}\n" "${disk_gb}GB available"
     echo -e "${GRN}+-------------------------------------------------------------+${NC}"
 }
@@ -505,22 +758,34 @@ show_tier_recommendation() {
 
 # Show installation menu
 show_install_menu() {
+    local default_choice=2
+    [[ "${ODS_EXISTING_INSTALL:-false}" == true ]] && default_choice=4
     echo ""
-    ai "Choose how deep you want to go. I can install everything, or keep it minimal."
+    ai "Choose the services you want to install."
     echo ""
-    echo -e "  ${BGRN}[1]${NC} Full Stack ${AMB}(recommended — just press Enter)${NC}"
+    echo -e "  ${BGRN}[1]${NC} Full Stack"
     echo "      Chat + Voice + Workflows + Document Q&A + AI Agents"
     echo "      ~16GB download, all features enabled"
     echo ""
-    echo -e "  ${BGRN}[2]${NC} Core Only"
+    echo -e "  ${BGRN}[2]${NC} Core Only ${AMB}(recommended for new installs)${NC}"
     echo "      Chat interface + API"
     echo "      ~12GB download, minimal footprint"
     echo ""
     echo -e "  ${BGRN}[3]${NC} Custom"
     echo "      Choose exactly what you want"
     echo ""
-    read -p "  Select an option [1]: " -r INSTALL_CHOICE < /dev/tty
-    INSTALL_CHOICE="${INSTALL_CHOICE:-1}"
+    if [[ "${ODS_EXISTING_INSTALL:-false}" == true ]]; then
+        echo -e "  ${BGRN}[4]${NC} Keep current selection"
+        echo "      Preserve optional services already installed"
+        echo ""
+    fi
+    read -p "  Select an option [$default_choice]: " -r INSTALL_CHOICE < /dev/tty
+    INSTALL_CHOICE="${INSTALL_CHOICE:-$default_choice}"
+    case "$INSTALL_CHOICE" in
+        1|2|3) ;;
+        4) [[ "${ODS_EXISTING_INSTALL:-false}" == true ]] || INSTALL_CHOICE="$default_choice" ;;
+        *) warn "Invalid choice '$INSTALL_CHOICE', using option $default_choice"; INSTALL_CHOICE="$default_choice" ;;
+    esac
     echo ""
     case "$INSTALL_CHOICE" in
         1)
@@ -530,8 +795,11 @@ show_install_menu() {
             ENABLE_WORKFLOWS=true
             ENABLE_RAG=true
             ENABLE_RECOMMENDED=true
-            ENABLE_HERMES=true
-            ENABLE_OPENCLAW=false  # deprecated; Hermes is the new default
+            # --hermes/--no-hermes on the command line wins over the preset
+            # (the Windows Pixel path passes --no-hermes).
+            [[ "${HERMES_EXPLICIT:-false}" == true ]] || ENABLE_HERMES=true
+            ENABLE_OPENCODE=true
+            [[ "${DEVTOOLS_EXPLICIT:-false}" == true ]] || ENABLE_DEVTOOLS=true
             ENABLE_COMFYUI=true
             ENABLE_APE=true
             ENABLE_PERPLEXICA=true
@@ -556,8 +824,9 @@ show_install_menu() {
             ENABLE_WORKFLOWS=false
             ENABLE_RAG=false
             ENABLE_RECOMMENDED=false
-            ENABLE_HERMES=false
-            ENABLE_OPENCLAW=false
+            [[ "${HERMES_EXPLICIT:-false}" == true ]] || ENABLE_HERMES=false
+            ENABLE_OPENCODE=false
+            [[ "${DEVTOOLS_EXPLICIT:-false}" == true ]] || ENABLE_DEVTOOLS=false
             ENABLE_COMFYUI=false
             ENABLE_APE=false
             ENABLE_PERPLEXICA=false
@@ -568,30 +837,9 @@ show_install_menu() {
             signal "Acknowledged."
             log "Selected: Custom"
             ;;
-        *)
-            warn "Invalid choice '$INSTALL_CHOICE', defaulting to Full Stack"
-            ENABLE_VOICE=true
-            ENABLE_WORKFLOWS=true
-            ENABLE_RAG=true
-            ENABLE_RECOMMENDED=true
-            ENABLE_HERMES=true
-            ENABLE_OPENCLAW=false  # deprecated; Hermes is the new default
-            ENABLE_COMFYUI=true
-            ENABLE_APE=true
-            ENABLE_PERPLEXICA=true
-            ENABLE_PRIVACY_SHIELD=true
-            ENABLE_LANGFUSE=true
-
-            # Disable image generation on low-tier systems (insufficient RAM/VRAM)
-            # ComfyUI requires shm_size 8GB + 24GB memory limit
-            case "${TIER:-}" in
-                0|1)
-                    ENABLE_COMFYUI=false
-                    log "ComfyUI auto-disabled for Tier $TIER (insufficient RAM/VRAM)"
-                    ai_warn "Image generation (ComfyUI) disabled — your hardware doesn't have enough RAM."
-                    ai "  You can enable it later with: ods enable comfyui"
-                    ;;
-            esac
+        4)
+            signal "Acknowledged."
+            log "Selected: Keep current selection"
             ;;
     esac
 }
@@ -600,32 +848,53 @@ show_install_menu() {
 show_success_card() {
     local webui_url=$1
     local dashboard_url=$2
-    local ip_addr=$3
+    local lan_address=$3  # host:port other devices can reach, or empty
 
-    printf '\a'  # terminal bell
+    if ods_ui_cinematic; then
+        printf '\a'  # terminal bell only for a human terminal
+    fi
     echo ""
     static_line
     echo ""
-    echo -e "  ${BGRN}T H E   G A T E W A Y   I S   O P E N${NC}"
+    echo -e "  ${BMAG}T H E   O D S   G A T E W A Y   I S   O P E N${NC}"
     echo ""
     static_line
     echo ""
-    type_line_dramatic "ODSGATE INSTALLATION COMPLETE." "$BGRN"
+    type_line_dramatic "ODSGATE INSTALLATION COMPLETE." "$BMAG"
     echo ""
     echo -e "${GRN}+--------------------------------------------------------------+${NC}"
     echo -e "${GRN}|${NC}                                                              ${GRN}|${NC}"
     printf "${GRN}|${NC}   Dashboard:   ${WHT}%-43s${NC} ${GRN}|${NC}\n" "${dashboard_url}"
-    printf "${GRN}|${NC}   Chat:        ${WHT}%-43s${NC} ${GRN}|${NC}\n" "${webui_url}"
+    if [[ -n "$webui_url" ]]; then
+        printf "${GRN}|${NC}   Chat:        ${WHT}%-43s${NC} ${GRN}|${NC}\n" "${webui_url}"
+    fi
     echo -e "${GRN}|${NC}                                                              ${GRN}|${NC}"
-    if [[ -n "$ip_addr" ]]; then
+    if [[ -n "$lan_address" ]]; then
         echo -e "${GRN}|${NC}   ${AMB}Access from other devices:${NC}                               ${GRN}|${NC}"
-        printf "${GRN}|${NC}   ${WHT}http://%-51s${NC} ${GRN}|${NC}\n" "${ip_addr}:3001"
+        printf "${GRN}|${NC}   ${WHT}http://%-51s${NC} ${GRN}|${NC}\n" "${lan_address}"
         echo -e "${GRN}|${NC}                                                              ${GRN}|${NC}"
     fi
     echo -e "${GRN}+--------------------------------------------------------------+${NC}"
     echo ""
-    type_line "Your data never leaves this machine." "$DGRN" 0.04
-    type_line "No subscriptions. No limits. It's yours." "$DGRN" 0.04
+    if [[ -n "${EXTERNAL_LLM_URL:-}" ]]; then
+        type_line "Inference uses the external endpoint you configured." "$DGRN" 0.04
+        type_line "Traffic handling depends on that endpoint and its operator." "$DGRN" 0.04
+    else
+      case "${ODS_MODE:-local}" in
+        cloud)
+            type_line "Cloud mode is active; your configured providers may receive prompts and responses." "$DGRN" 0.04
+            type_line "Review provider privacy, retention, and usage terms before sending sensitive data." "$DGRN" 0.04
+            ;;
+        external)
+            type_line "Inference uses the external endpoint you configured." "$DGRN" 0.04
+            type_line "Traffic handling depends on that endpoint and its operator." "$DGRN" 0.04
+            ;;
+        *)
+            type_line "Local inference runs on this machine by default." "$DGRN" 0.04
+            type_line "The stack is inspectable, modifiable, and under your control." "$DGRN" 0.04
+            ;;
+      esac
+    fi
     echo ""
     echo -e "  ${GRN}Elapsed: $(install_elapsed)${NC}"
     echo ""

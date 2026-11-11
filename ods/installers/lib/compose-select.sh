@@ -8,7 +8,10 @@
 #
 # Expects: SCRIPT_DIR, TIER, GPU_BACKEND, CAP_COMPOSE_OVERLAYS, LOG_FILE,
 #          GPU_COUNT, log(), warn()
-# Provides: resolve_compose_config() → sets COMPOSE_FILE, COMPOSE_FLAGS
+# Provides: resolve_compose_config() → sets COMPOSE_FILE, COMPOSE_FLAGS;
+#           the service-set checks ods_gateway_assert_no_managed_inference(),
+#           ods_host_native_assert_no_managed_llama(),
+#           ods_vllm_assert_engine_stack() and ods_compose_assert_no_webui()
 #
 # Modder notes:
 #   Add new compose overlay mappings or backends here.
@@ -112,3 +115,98 @@ resolve_compose_config() {
 
     log "Compose selection: $COMPOSE_FLAGS"
 }
+
+# Compose overlays append profile lists. Verify the effective service set, not
+# only the selected files, before an API-only gateway pulls or starts images.
+ods_gateway_assert_no_managed_inference() {
+    local services compose_root="${INSTALL_DIR:-$PWD}"
+    # Phase 08 still runs from the source checkout during an upgrade. Resolve
+    # against the installed project, whose generated .env supplies Compose
+    # interpolation values and reflects the runtime selection being changed.
+    services="$(cd "$compose_root" && $DOCKER_COMPOSE_CMD "$@" config --services)" || return 1
+    if grep -Eq '^(llama-server|model-router)$' <<< "$services"; then
+        printf 'Gateway-only Compose includes ODS-managed inference. Clear COMPOSE_PROFILES and retry.\n' >&2
+        return 1
+    fi
+    return 0
+}
+
+# A host-native install (llama-server.exe on Windows, this stack in WSL) still
+# runs the ODS model-router for Pixel, but it must never pull or launch the
+# in-stack llama-server. Check the effective service set because inherited
+# profiles can override an overlay.
+ods_host_native_assert_no_managed_llama() {
+    local services compose_root="${INSTALL_DIR:-$PWD}"
+    services="$(cd "$compose_root" && $DOCKER_COMPOSE_CMD "$@" config --services)" || return 1
+    if grep -qx 'llama-server' <<< "$services"; then
+        printf 'Host-native llama-server Compose also starts the in-stack llama-server. Clear COMPOSE_PROFILES and retry.\n' >&2
+        return 1
+    fi
+    return 0
+}
+
+# The vLLM engine (LLM_BACKEND=vllm) serves the model in vllm-server, and the
+# in-stack llama-server must stay off: both would claim the same GPU. Check the
+# effective service set, because inherited profiles can override an overlay.
+ods_vllm_assert_engine_stack() {
+    local services compose_root="${INSTALL_DIR:-$PWD}"
+    services="$(cd "$compose_root" && $DOCKER_COMPOSE_CMD "$@" config --services)" || return 1
+    if ! grep -qx 'vllm-server' <<< "$services"; then
+        printf 'The vLLM Compose stack has no vllm-server service; docker-compose.vllm.yml is not selected.\n' >&2
+        return 1
+    fi
+    if grep -qx 'llama-server' <<< "$services"; then
+        printf 'The vLLM Compose stack also starts the in-stack llama-server. Clear COMPOSE_PROFILES and retry.\n' >&2
+        return 1
+    fi
+    return 0
+}
+
+# Supply the early checks' placeholder GID to Compose. On a fresh install Phase
+# 05 selects "sudo docker compose" because the new docker group does not apply
+# to the running session yet, and sudo does not pass exported variables, so
+# hand the value to Compose explicitly. Call only inside a subshell function.
+_ods_compose_placeholder_pixel_gid() {
+    export PIXEL_INGRESS_GID="${PIXEL_INGRESS_GID:-1}"
+    # An inherited real GID also needs forwarding when the initial .env still
+    # has no installed identity. Keep the command-string assignment numeric.
+    [[ "$PIXEL_INGRESS_GID" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ "${DOCKER_COMPOSE_CMD:-}" == "sudo "* ]]; then
+        DOCKER_COMPOSE_CMD="sudo env PIXEL_INGRESS_GID=$PIXEL_INGRESS_GID ${DOCKER_COMPOSE_CMD#sudo }"
+    fi
+}
+
+# Before image pulls, Pixel's ingress group has not been created yet. Supply
+# an ephemeral numeric GID only for Compose's read-only service selection.
+# Phase 11 still validates the installed identity and uses the strict helper.
+ods_host_native_assert_no_managed_llama_before_pixel_identity() (
+    _ods_compose_placeholder_pixel_gid || return 1
+    ods_host_native_assert_no_managed_llama "$@"
+)
+
+ods_vllm_assert_engine_stack_before_pixel_identity() (
+    _ods_compose_placeholder_pixel_gid || return 1
+    ods_vllm_assert_engine_stack "$@"
+)
+
+# A caller can inherit COMPOSE_PROFILES=gateway-webui. Check the effective
+# service set before pulling or starting a Portal-only stack.
+ods_compose_assert_no_webui() {
+    local services compose_root="${INSTALL_DIR:-$PWD}"
+    services="$(cd "$compose_root" && $DOCKER_COMPOSE_CMD "$@" config --services)" || return 1
+    if grep -qx 'open-webui' <<< "$services"; then
+        printf 'No-WebUI Compose still enables Open WebUI. Clear COMPOSE_PROFILES and retry.\n' >&2
+        return 1
+    fi
+    return 0
+}
+
+# Phase 08 checks the selected service list before image pulls, while Pixel's
+# private ingress group is created in Phase 11. Compose interpolates every
+# selected service even for `config --services`, so supply a numeric GID only
+# within this read-only early check. Phase 11 validates the real installed GID
+# before starting containers and repeats the no-WebUI check.
+ods_compose_assert_no_webui_before_pixel_identity() (
+    _ods_compose_placeholder_pixel_gid || return 1
+    ods_compose_assert_no_webui "$@"
+)

@@ -32,6 +32,28 @@ pass "rootless detection has deterministic test override"
 
 (
     source "$LIB"
+    install_dir="$TMP_DIR/config-repair"
+    mkdir -p "$install_dir/config/searxng"
+    _ods_rootless_ensure_helper_image() { return 0; }
+    docker() {
+        [[ "$*" == *'-v '*'/config/searxng:/target'* ]] || return 1
+        return 0
+    }
+    ods_rootless_make_host_writable "$install_dir" config/searxng
+) || fail "rootless config ownership repair"
+pass "rootless config ownership repair stays inside config/"
+
+(
+    source "$LIB"
+    install_dir="$TMP_DIR/config-escape"
+    mkdir -p "$install_dir/config" "$TMP_DIR/outside"
+    ln -s "$TMP_DIR/outside" "$install_dir/config/escape"
+    ! ods_rootless_make_host_writable "$install_dir" config/escape
+) || fail "rootless config symlink escape guard"
+pass "rootless config ownership repair rejects symlinks"
+
+(
+    source "$LIB"
     unset ODS_ASSUME_ROOTLESS
     docker() { return 1; }
     state_rc=0
@@ -39,6 +61,50 @@ pass "rootless detection has deterministic test override"
     [[ "$state_rc" -eq 2 ]]
 ) || fail "docker-info failure was treated as rootful"
 pass "indeterminate Docker rootless state fails closed"
+
+(
+    source "$LIB"
+    unset ODS_ASSUME_ROOTLESS
+    # A fresh installer process has not inherited its new docker group yet.
+    # Phase 05 has already selected and verified the sudo-backed wrapper.
+    docker() { return 1; }
+    docker_run() {
+        [[ "$*" == "info --format {{json .SecurityOptions}}" ]] || return 1
+        printf '%s\n' '["name=seccomp,profile=builtin"]'
+    }
+    state_rc=0
+    ods_docker_rootless_state || state_rc=$?
+    [[ "$state_rc" -eq 1 ]]
+) || fail "fresh-install Docker detection ignored the selected command"
+pass "fresh-install Docker detection uses the verified installer command"
+
+(
+    source "$LIB"
+    unset ODS_ASSUME_ROOTLESS
+    docker() { return 1; }
+    docker_run() { printf '%s\n' '["name=rootless"]'; }
+    ods_docker_rootless_state
+) || fail "selected-command rootless detection"
+pass "selected-command rootless detection preserves ownership mode"
+
+(
+    source "$LIB"
+    unset ODS_ASSUME_ROOTLESS
+    docker() {
+        # Mirrors the real CLI: an empty template result on stdout, then the
+        # connection error (and a template error) on stderr.
+        echo ""
+        echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+        echo "template: :1:7: executing \"\" at <.Host.Security.Rootless>: can't evaluate field Host in type system.dockerInfo" >&2
+        return 1
+    }
+    state_rc=0
+    probe_err="$(ods_docker_rootless_state 2>&1)" || state_rc=$?
+    [[ "$state_rc" -eq 2 ]] || exit 1
+    [[ "$probe_err" == *"Could not determine whether Docker is running in rootless mode"* ]] || exit 1
+    [[ "$probe_err" == *"docker info: Cannot connect to the Docker daemon"* ]] || exit 1
+) || fail "daemon-unreachable probe did not surface docker's own error"
+pass "indeterminate rootless state reports why docker info failed"
 
 INSTALL_DIR="$TMP_DIR/ods"
 mkdir -p "$INSTALL_DIR/data"/{ape,privacy-shield,token-spy,n8n,whisper,hermes,comfyui}
@@ -70,6 +136,24 @@ pass "only active compose services are repaired"
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
+        printf '%s|%s|%s\n' "$2" "$3" "$4" >> "$CALLS"
+    }
+    ODS_ROOTLESS_COMPOSE_FLAGS="-f extensions/services/ape/compose.yaml"
+    ods_fix_rootless_ownership "$INSTALL_DIR"
+)
+grep -q '^data/ape|100:65534|ods-ape$' "$CALLS" \
+    || fail "ape state directory was not repaired for its container UID/GID"
+[[ "$(wc -l < "$CALLS" | tr -d ' ')" == "1" ]] \
+    || fail "ape repair modified unrelated directories"
+pass "APE private state is repaired to the container UID 100:GID 65534"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    _ods_rootless_ensure_helper_image() { return 0; }
+    _ods_rootless_fix_directory() {
         printf '%s|%s\n' "$2" "$3" >> "$CALLS"
     }
     ODS_ROOTLESS_COMPOSE_FLAGS="-f extensions/services/token-spy/compose.yaml"
@@ -80,6 +164,170 @@ grep -q '^data/hermes|10000:10000$' "$CALLS" \
 [[ "$(wc -l < "$CALLS" | tr -d ' ')" == "1" ]] \
     || fail "targeted repair modified unrelated active services"
 pass "targeted repair covers newly enabled service only"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    id() { [[ "$1" == -g ]] && printf '4242\n'; }
+    _ods_rootless_ensure_helper_image() { return 0; }
+    _ods_rootless_fix_directory() {
+        printf '%s|%s|%s|%s\n' "$2" "$3" "$4" "$5" >> "$CALLS"
+    }
+    ods_prepare_whisper_cache_ownership "$INSTALL_DIR"
+)
+grep -q '^data/whisper|1000:4242|ods-whisper|775$' "$CALLS" \
+    || fail "rootful Library Whisper cache was not prepared for UID 1000"
+pass "rootful Library Whisper add-back prepares its UID 1000 cache"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    ods_fix_rootless_ownership() { printf '%s|%s\n' "$1" "$2" >> "$CALLS"; }
+    ods_prepare_whisper_cache_ownership "$INSTALL_DIR"
+)
+grep -q "^$INSTALL_DIR|whisper$" "$CALLS" \
+    || fail "rootless Library Whisper cache bypassed namespace repair"
+pass "rootless Library Whisper add-back keeps its namespace repair"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    # The installer account owns both; Tower3's installer user is UID 1000,
+    # so Token Spy is shown under another installer UID.
+    stat() {
+        case "$3" in
+            */data/ape) printf '1000:1000:700\n' ;;
+            */data/token-spy) printf '1001:1001:755\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    _ods_rootless_ensure_helper_image() { printf 'helper\n' >> "$CALLS"; }
+    _ods_rootless_fix_directory() {
+        printf '%s|%s|%s|%s\n' "$2" "$3" "$4" "$5" >> "$CALLS"
+    }
+    ods_prepare_service_state_ownership "$INSTALL_DIR" ape
+    ods_prepare_service_state_ownership "$INSTALL_DIR" token-spy
+)
+grep -q '^data/ape|100:65534|ods-ape|700$' "$CALLS" \
+    || fail "rootful Library APE add-back left data/ape with the installer owner"
+grep -q '^data/token-spy|1000:1000|ods-token-spy|$' "$CALLS" \
+    || fail "rootful Library Token Spy add-back was not prepared for UID 1000"
+pass "rootful Library APE and Token Spy add-backs prepare their container owners"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    stat() { printf '100:65534:700\n'; }
+    _ods_rootless_ensure_helper_image() { printf 'helper\n' >> "$CALLS"; }
+    _ods_rootless_fix_directory() { printf 'fix %s\n' "$2" >> "$CALLS"; }
+    ods_prepare_service_state_ownership "$INSTALL_DIR" ape
+) || fail "rootful APE state that already matches was refused"
+[[ ! -s "$CALLS" ]] || fail "rootful APE state that already matches ran Docker: $(cat "$CALLS")"
+pass "rootful APE state that already matches is left alone without Docker"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    stat() { printf '1000:1000:700\n'; }
+    _ods_rootless_ensure_helper_image() { :; }
+    _ods_rootless_ensure_directory() { :; }
+    _ods_rootless_resolve_target() { printf '%s/%s\n' "$1" "$2"; }
+    _ods_rootless_stat_metadata() { printf '1000:1000:700\n'; }
+    _ods_rootless_container_state() { printf 'running\n'; }
+    if ods_prepare_service_state_ownership "$INSTALL_DIR" ape 2>> "$CALLS"; then
+        exit 1
+    fi
+) || fail "rootful APE state was repaired while ods-ape was running"
+grep -q 'Refusing recursive ownership repair while ods-ape is running' "$CALLS" \
+    || fail "the rootful refusal did not say why: $(cat "$CALLS")"
+grep -qF "Stop it with 'ods stop ape', then choose Retry on its card in Extensions." "$CALLS" \
+    || fail "the rootful refusal did not name a remedy that works on rootful Docker: $(cat "$CALLS")"
+! grep -q 'ods repair rootless-ownership' "$CALLS" \
+    || fail "the rootful refusal named the rootless-only repair, which does nothing there"
+pass "a rootful APE refusal names the stop-and-retry remedy"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    ods_fix_rootless_ownership() { printf '%s|%s\n' "$1" "$2" >> "$CALLS"; }
+    ods_prepare_service_state_ownership "$INSTALL_DIR" ape
+    if ods_prepare_service_state_ownership "$INSTALL_DIR" n8n; then
+        printf 'n8n accepted\n' >> "$CALLS"
+    fi
+)
+[[ "$(cat "$CALLS")" == "$INSTALL_DIR|ape" ]] \
+    || fail "rootless APE add-back did not keep its namespace repair, or another service was accepted: $(cat "$CALLS")"
+pass "rootless APE add-back keeps its namespace repair; other services are refused"
+
+# Workstation06 (2026-10-26): the install owner is UID 1001 and ComfyUI was
+# added from the Dashboard, so Phase 11 never prepared its UID 1000 folders.
+mkdir -p "$INSTALL_DIR/data/comfyui"/{models,output,input,user,cuda-cache}
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    id() { case "$1" in -u) printf '1001\n' ;; -g) printf '4242\n' ;; esac; }
+    stat() { printf '1001:4242\n'; }
+    _ods_rootless_ensure_helper_image() { :; }
+    _ods_rootless_resolve_target() { printf '%s/%s\n' "$1" "$2"; }
+    _ods_rootless_fix_directory() { printf 'fix %s|%s|%s|%s\n' "$2" "$3" "$4" "$5" >> "$CALLS"; }
+    docker() { printf 'docker %s\n' "$*" >> "$CALLS"; }
+    ods_prepare_comfyui_data_ownership "$INSTALL_DIR" nvidia
+) || fail "rootful ComfyUI add-back preparation failed: $(cat "$CALLS")"
+for path in models output input user cuda-cache; do
+    grep -qx "fix data/comfyui/$path|1000:4242|ods-comfyui|775" "$CALLS" \
+        || fail "rootful ComfyUI add-back did not prepare data/comfyui/$path for UID 1000: $(cat "$CALLS")"
+    grep -q "^docker run .* -v $INSTALL_DIR/data/comfyui/$path:/data .* chmod -R ug+rwX /data\$" "$CALLS" \
+        || fail "rootful ComfyUI add-back left data/comfyui/$path without the install group's write access: $(cat "$CALLS")"
+done
+pass "rootful ComfyUI add-back prepares its UID 1000 folders and keeps the owner group's write access"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 1; }
+    uname() { printf 'Linux\n'; }
+    _ods_rootless_ensure_helper_image() { printf 'helper\n' >> "$CALLS"; }
+    _ods_rootless_fix_directory() { printf 'fix %s\n' "$2" >> "$CALLS"; }
+    docker() { printf 'docker %s\n' "$*" >> "$CALLS"; }
+    # Already prepared for this owner's group.
+    id() { case "$1" in -u) printf '1001\n' ;; -g) printf '4242\n' ;; esac; }
+    stat() { printf '1000:4242\n'; }
+    ods_prepare_comfyui_data_ownership "$INSTALL_DIR" nvidia
+    # The AMD image keeps its own layout.
+    stat() { printf '1001:4242\n'; }
+    ods_prepare_comfyui_data_ownership "$INSTALL_DIR" amd
+    # An install owner that is UID 1000 already matches the container.
+    id() { case "$1" in -u) printf '1000\n' ;; -g) printf '1000\n' ;; esac; }
+    ods_prepare_comfyui_data_ownership "$INSTALL_DIR" nvidia
+) || fail "a ComfyUI add-back with nothing to prepare was refused"
+[[ ! -s "$CALLS" ]] || fail "a ComfyUI add-back with nothing to prepare ran Docker: $(cat "$CALLS")"
+pass "ComfyUI folders that match, the AMD image and a UID 1000 owner need no repair"
+
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    ods_fix_rootless_ownership() { printf '%s|%s|%s\n' "$1" "$2" "${GPU_BACKEND:-}" >> "$CALLS"; }
+    ods_prepare_comfyui_data_ownership "$INSTALL_DIR" nvidia
+)
+[[ "$(cat "$CALLS")" == "$INSTALL_DIR|comfyui|nvidia" ]] \
+    || fail "rootless ComfyUI add-back did not keep its namespace repair for the NVIDIA image: $(cat "$CALLS")"
+pass "rootless ComfyUI add-back keeps its namespace repair and passes the GPU backend"
 
 : > "$CALLS"
 (
@@ -117,8 +365,8 @@ pass "Hermes keeps UID 10000 and mode 0700"
 
 : > "$CALLS"
 cat > "$INSTALL_DIR/.env" <<'EOF'
-UID=12001
-GID=12002
+ODS_UID=12001
+ODS_GID=12002
 EOF
 (
     source "$LIB"
@@ -134,11 +382,31 @@ EOF
 grep -q '^data/privacy-shield|12001:12002$' "$CALLS" || fail "Privacy Shield ignored UID/GID override"
 grep -q '^data/n8n|12001:12002$' "$CALLS" || fail "n8n ignored UID/GID override"
 grep -q '^data/hermes|12001:12002$' "$CALLS" || fail "Hermes ignored UID/GID override"
-pass "compose UID/GID overrides are preserved"
+pass "compose ODS_UID/ODS_GID overrides are preserved"
 
 cat > "$INSTALL_DIR/.env" <<'EOF'
-UID=""
-GID=''
+UID=13001
+GID=13002
+EOF
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    _ods_rootless_ensure_helper_image() { return 0; }
+    _ods_rootless_fix_directory() {
+        printf '%s|%s\n' "$2" "$3" >> "$CALLS"
+    }
+    ODS_ROOTLESS_COMPOSE_FLAGS="-f extensions/services/n8n/compose.yaml -f extensions/services/hermes/compose.yaml"
+    ods_fix_rootless_ownership "$INSTALL_DIR"
+)
+grep -q '^data/n8n|13001:13002$' "$CALLS" || fail "n8n ignored legacy UID/GID override"
+grep -q '^data/hermes|13001:13002$' "$CALLS" || fail "Hermes ignored legacy UID/GID override"
+pass "legacy UID/GID overrides remain compatible until installer migration"
+
+cat > "$INSTALL_DIR/.env" <<'EOF'
+ODS_UID=""
+ODS_GID=''
 EOF
 : > "$CALLS"
 (
@@ -159,8 +427,8 @@ grep -q '^data/hermes|10000:10000$' "$CALLS" \
 pass "empty UID/GID overrides follow compose default semantics"
 
 cat > "$INSTALL_DIR/.env" <<'EOF'
-UID=not-a-number
-GID=12002
+ODS_UID=not-a-number
+ODS_GID=12002
 EOF
 (
     source "$LIB"

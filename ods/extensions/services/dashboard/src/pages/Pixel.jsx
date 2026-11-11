@@ -1,0 +1,2529 @@
+import ModelActivationNotice from '../components/ModelActivationNotice'
+import {modelActivationStatus} from '../lib/modelActivationStatus'
+import PortalApprovalTerminal from '../components/PortalApprovalTerminal'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import PixelConversationRecovery from '../components/PixelConversationRecovery'
+import {validSourceReview} from '../lib/pixelSourceReview'
+import { readConversations, saveConversation, createConversationWriter, SELECT_EVENT, DELETE_EVENT, deleteConversation, purgeConversationImages, isConversationDeleted } from '../lib/pixelConversations'
+import {usePixelAutoScroll} from '../lib/usePixelAutoScroll'
+import {EXAMPLE_OPEN_EVENT, EXAMPLE_REFRESH_EVENT, openExampleProject} from '../lib/exampleProjects'
+import { Link } from 'react-router-dom'
+import HelpLink from '../components/HelpLink'
+import PixelAdvice from '../components/PixelAdvice.jsx'
+import PixelMascot from '../components/PixelMascot.jsx'
+import UserAvatar from '../components/UserAvatar'
+import {useLocalProfile} from '../lib/localProfile'
+import { pixelHeaderPose, pixelReplyPose } from '../lib/pixelMascotState'
+import PixelComposerTools from '../components/PixelComposerTools'
+import PortalAgentDock from '../components/PortalAgentDock'
+import {ACTIVE_TEAMS,agentCommand,teamMetadata,teamProjectTasks,teamRequest,teamSummary,usePortalTeams} from '../lib/portalTeams'
+import PixelTextFileInput from '../components/PixelTextFileInput'
+import PortalImageAttachments, {PortalImagePicker, PortalConversationImages} from '../components/PortalImageAttachments'
+import usePortalImages from '../hooks/usePortalImages'
+import {draftImageReceipts, messageImageRefs, imageRoute} from '../lib/pixelImages'
+import PixelDraftPreview from '../components/PixelDraftPreview'
+import PixelDictation from '../components/PixelDictation'
+import PixelCommandSearch, { OPEN_PIXEL_SEARCH } from '../components/PixelCommandSearch'
+import PixelConversationImport from '../components/PixelConversationImport'
+import { appendComposerText, restoreUnsentDraft } from '../lib/pixelComposerText'
+import { ATTACH_BLOCKED, newTaskBlockedReason, publishNewTaskBlocked, sendBlockedReason } from '../lib/portalTaskState'
+import PixelSelectionActions from '../components/PixelSelectionActions'
+import PixelQuestions from '../components/PixelQuestions'
+import PortalGoalPlan from '../components/PortalGoalPlan'
+import {goalCommand,continueGoal} from '../lib/portalGoal'
+import PortalContextRing from '../components/PortalContextRing'
+import {compactCommand,CONTEXT_REQUEST_ID,CONTINUE_FAILED,historySnapshot,STOP_UNCONFIRMED,usePortalContext} from '../lib/portalContext'
+import PortalModelSelector from '../components/PortalModelSelector'
+import PortalRuntimeIdentity from '../components/PortalRuntimeIdentity'
+import PortalReadiness from '../components/PortalReadiness'
+import PortalRecovery, { PORTAL_RECOVERY_ACTIONS, portalRecoveryAction } from '../components/PortalRecovery'
+import { pixelReadinessView, PIXEL_RECOVERY_REQUIRED } from '../lib/pixelReadiness'
+import PortalAgentActivity from '../components/PortalAgentActivity'
+import PortalExtensionSetup from '../components/PortalExtensionSetup'
+import PortalExtensionProgress from '../components/PortalExtensionProgress'
+import useExtensionInstallation from '../hooks/useExtensionInstallation'
+import { useComposerFocus } from '../hooks/useComposerFocus'
+import useGithubExtensionRequest from '../hooks/useGithubExtensionRequest'
+import useExtensionProjectIntegration from '../hooks/useExtensionProjectIntegration'
+import { conversationProject } from '../lib/conversationProjects'
+import PortalStreamingText from '../components/PortalStreamingText'
+import PortalResponseActions from '../components/PortalResponseActions'
+import PortalResponseError from '../components/PortalResponseError'
+import PortalTurnUndo from '../components/PortalTurnUndo'
+import useProjectRestoreOptions from '../hooks/useProjectRestoreOptions'
+import {isProviderRateLimit, isAdmissionRejected, isBusyRefusal, busyRefusalText, portalResponseFailure} from '../lib/portalResponseFailure'
+import {publicationDisplayText} from '../lib/publicationDisplay'
+import {isQuestionAnswer, parseQuestionsFrame, questionMetadata} from '../lib/pixelQuestions'
+import PixelTurnNavigation from '../components/PixelTurnNavigation'
+import PixelSnapshotChanges from '../components/PixelSnapshotChanges'
+import PortalDeliveredArtifacts from '../components/PortalDeliveredArtifacts'
+import { deliveredArtifactDisplayText, deliveredArtifactMetadata, parseDeliveredArtifactsFrame } from '../lib/pixelDeliveredArtifacts'
+import { embedDisplayText } from '../lib/embedDisplay'
+import PortalWorkspace from '../components/PortalWorkspace'
+import { parseTaskActivity, parseTaskActivityFrame } from '../lib/pixelTaskActivity'
+import MetalMetricIcon from '../components/MetalMetricIcon'
+import PanelResizeHandle from '../components/PanelResizeHandle.jsx'
+import PixelHandoffApproval from '../components/PixelHandoffApproval.jsx'
+import PixelProviderScopes from '../components/PixelProviderScopes.jsx'
+import { usePortalIdentity } from '../contexts/PortalIdentityContext'
+import { serviceUrl } from '../lib/serviceUrls'
+import {usePixelSendKey, shouldSendMessage} from '../lib/usePixelSendKey'
+import {
+  AlertCircle,
+  CheckCircle2,
+  Code2,
+  Copy,
+  Loader2,
+  Plus,
+  PanelRightOpen,
+  Send,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  Terminal,
+  X,
+} from 'lucide-react'
+
+const MODEL_CAPABILITY_DETAIL = 'The active model is recorded as not agent-qualified. Tool-driven tasks may be unreliable; chat and experiments remain available.'
+// Fixed client copy for each reason the status may give. The server's own
+// detail text is never shown, and an unknown reason is rejected.
+const MODEL_ADVISORIES = new Map([
+  ['context-too-small', 'This model runs with less than 16K tokens of context, too small for Portal tasks. Set its context to 16K or more in Models, or switch model.'],
+  ['tools-unavailable', 'This model failed the tool-call check, so Portal tasks that use tools will likely fail. Chat still works.'],
+  ['not-profiled', 'ODS has not checked this model yet, so Portal tasks may not work. To check it, choose Check again on the running model in Models.'],
+  ['thinking-always-on', 'This model always thinks before it answers, so Portal tasks are slower and use more of its context.'],
+])
+const LEGACY_MODEL_SUPPORT = { tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL }
+// A refused send shows the generic advisory, but never replaces a more
+// specific one the status already gave.
+const keepModelAdvisory = current => current?.reason ? current : LEGACY_MODEL_SUPPORT
+
+const MARKDOWN_COMPONENTS = {
+  p: ({ children, className = '' }) => <p className={`break-words [&:not(:first-child)]:mt-3 ${className}`.trim()}>{children}</p>,
+  ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
+  // Keep the list's start number: a reply of exactly "144." is a list that
+  // starts at 144 with an empty item, and dropping it showed a bare "1.".
+  ol: ({ children, start }) => <ol start={start} className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
+  li: ({ children }) => <li className="break-words">{children}</li>,
+  strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+  em: ({ children }) => <em className="italic">{children}</em>,
+  code: ({ children, className = '' }) => <code className={`rounded bg-theme-bg/70 px-1 py-0.5 font-mono text-[13px] text-theme-text ${className}`}>{children}</code>,
+  pre: ({ children }) => <pre className="my-2 overflow-x-auto rounded border border-theme-border bg-theme-bg/70 [&>code]:block [&>code]:p-2">{children}</pre>,
+  table: ({ children }) => (
+    <div role="region" aria-label="Scrollable table" tabIndex={0} className="my-3 max-w-full overflow-x-auto rounded border border-theme-border">
+      <table className="pixel-response-table w-full border-collapse text-left text-sm">{children}</table>
+    </div>
+  ),
+  th: ({ children, style }) => <th scope="col" style={style} className="border-b border-theme-border bg-theme-bg/70 px-3 py-2 font-semibold">{children}</th>,
+  td: ({ children, style }) => <td style={style} className="border-b border-theme-border px-3 py-2 align-top [overflow-wrap:anywhere]">{children}</td>,
+  a: ({ href, children }) => {
+    const safe = typeof href === 'string' && /^https?:\/\//i.test(href)
+    // The viewer may reach ODS through a remote host or SSH forward. A local
+    // snapshot URL in a reply must use the same authenticated dashboard relay
+    // as the preview pane, including after the pane is closed or chat restored.
+    const snapshot = safe && href.match(/^http:\/\/(site-[a-f0-9]{24})\.localhost:([1-9][0-9]{0,4})\/\1\/$/)
+    const target = snapshot && Number(snapshot[2]) <= 65535
+      ? `/pixel-preview/${snapshot[1]}/`
+      : href
+    return safe
+      ? <a href={target} target="_blank" rel="noopener noreferrer" className="text-theme-accent-light underline">{children}</a>
+      : <span>{children}</span>
+  },
+}
+
+const MAX_INPUT_LEN = 16 * 1024
+const MAX_REQUEST_MESSAGES = 50
+const MAX_TOTAL_MESSAGE_BYTES = 256 * 1024
+// Visible history is independent of the model's per-request context budget.
+const MAX_STORED_MESSAGES = 2000
+const MAX_STORED_MESSAGE_BYTES = 4 * 1024 * 1024
+const CHAT_STORAGE_KEY = 'ods.pixel.chat.v1'
+const SAFE_CHAT_ID = /^[A-Za-z0-9_-]{1,128}$/
+const STOPPED_NOTICE = 'Stopped by you. Workspace changes completed before cancellation were preserved.'
+const MODEL_SWITCH_DETAIL = 'Model switch in progress; Portal will be ready when activation completes'
+const CLEAN_CONTEXT_RECOVERY_REASON = 'operations-unavailable-zero-submissions'
+const CLEAN_CONTEXT_RECOVERY_NOTICE = 'The first attempt did not reach the Operations Broker, and the host verified that no work was submitted. Retrying once with a clean context…'
+const CLEAN_CONTEXT_RECOVERY_FAILED = 'Automatic recovery was attempted once, but Portal again did not reach the Operations Broker. The host verified that no Operations work was submitted. Check any other work before continuing; this does not confirm that other tools had no effects.'
+// The last turn's answer did not arrive. Calm wording: nothing failed that the
+// owner must repair, and the composer is free again. Its work may have run on
+// and finished after the cut-off (the gateway can outlive the dashboard API,
+// and delegated work outlives both), so nothing offers to send the message
+// again in one click: that could repeat every tool action and file write.
+export const RESTART_NOTICE = 'Portal restarted before its reply arrived. Your files are saved. Ask Portal what it did before you send your message again.'
+export const NO_REPLY_NOTICE = 'Portal finished working on your last request, but its reply couldn’t be shown here. Your files are saved. Ask Portal what it did, or send your next message.'
+export const NOT_RECEIVED_NOTICE = 'Portal didn’t receive your last message. It’s back in the message box, ready to send again.'
+const CHECKING_TURN = 'Checking on your last request…'
+const TURN_STILL_RUNNING = 'Portal is still working on your last request. Its answer will appear here when it’s done. You can stop it.'
+// Work still running in this chat whose answer the page cannot receive, for
+// example after a restart cut the reply off while delegated work went on.
+const TURN_RUNNING_UNSEEN = 'Portal is still working on your last request. When it’s done, ask Portal what it did. You can stop it.'
+// Work the server found running for this chat when the page has no turn of
+// its own to follow there.
+const CHAT_STILL_RUNNING = 'Portal is still working on your last request. You can stop it, or send your next message when it’s done.'
+const TURN_UNCONFIRMED = 'Portal can’t confirm your last request has finished.'
+const CONTINUING_TURN = 'Making sure nothing is still running in this chat…'
+// A Stop of earlier work that was not acknowledged. The alert goes once that
+// turn settles: there is nothing left to stop.
+const RESTORED_STOP_UNCONFIRMED = STOP_UNCONFIRMED
+const clearRestoredStopError = current => current === RESTORED_STOP_UNCONFIRMED ? '' : current
+// A cut-off turn is checked again on a growing interval and the checks stop
+// once its state is proven. Work that is still running is checked at most
+// every 15 s so the chat frees up soon after it finishes.
+const TURN_RECHECK_MS = [1000, 2000, 4000, 8000, 15000, 30000, 60000]
+const ACTIVE_RECHECK_MAX_MS = 15000
+// A refused message is sent on its own only soon after the owner sent it.
+const HELD_SEND_MAX_MS = 2 * 60 * 1000
+const HELD_SEND_NOTE = ' Your new message will go out right after.'
+const STATUS_POLL_MS = 3000
+const OPS_STATUS_POLL_MS = 3000
+const OPS_TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'rejected'])
+const OPS_APPROVAL_RECEIPT = /^(?:Portal|Pixel) prepared the exact (ods\.extensions\.(?:install|enable|disable|remove)) plan for extension ([a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9])){0,63}), but external approval is required\. No lifecycle change was executed\. Job: (ops-[0-9]{13}-[a-f0-9]{12})\. Plan SHA-256: ([a-f0-9]{64})\.$/
+const OPS_HOST_COMMAND_APPROVAL_RECEIPT = /^(?:Portal|Pixel) prepared a protected ODS host command plan, but external approval is required\. No command was executed\. Job: (ops-[0-9]{13}-[a-f0-9]{12})\. Plan SHA-256: ([a-f0-9]{64})\.$/
+let fallbackChatSequence = 0
+
+function formatContext(value) {
+  const context = Number(value || 0)
+  if (!Number.isFinite(context) || context <= 0) return ''
+  if (context >= 1024 && context % 1024 === 0) return `${context / 1024}K context`
+  return `${context.toLocaleString()} context`
+}
+
+export function formatElapsed(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+export function parseApprovalReceipt(content) {
+  if (typeof content !== 'string') return null
+  const match = content.trim().match(OPS_APPROVAL_RECEIPT)
+  if (match) {
+    return {
+      action: match[1],
+      extensionId: match[2],
+      jobId: match[3],
+      planHash: match[4],
+    }
+  }
+  const hostCommand = content.trim().match(OPS_HOST_COMMAND_APPROVAL_RECEIPT)
+  return hostCommand ? {
+    action: 'raw-shell',
+    extensionId: 'ods-host',
+    jobId: hostCommand[1],
+    planHash: hostCommand[2],
+  } : null
+}
+
+export function isCleanContextRecoveryFrame(frame) {
+  const marker = frame?.pixel
+  return Boolean(
+    frame?.choices?.[0]?.finish_reason === 'stop'
+    && marker
+    && typeof marker === 'object'
+    && !Array.isArray(marker)
+    && Object.keys(marker).sort().join('\n') === ['reason', 'recovery', 'schemaVersion'].join('\n')
+    && marker.schemaVersion === 1
+    && marker.recovery === 'clean-context'
+    && marker.reason === CLEAN_CONTEXT_RECOVERY_REASON
+  )
+}
+
+export function parseVerifiedPreviewFrame(frame) {
+  const marker = frame?.pixel
+  const preview = marker?.preview
+  const markerKeys = marker && typeof marker === 'object' && !Array.isArray(marker)
+    ? Object.keys(marker).sort().join('\n')
+    : ''
+  const previewKeys = preview && typeof preview === 'object' && !Array.isArray(preview)
+    ? Object.keys(preview).sort().join('\n')
+    : ''
+  if (
+    frame?.choices?.[0]?.finish_reason !== 'stop'
+    || markerKeys !== ['preview', 'schemaVersion'].join('\n')
+    || marker.schemaVersion !== 1
+    || previewKeys !== [
+      'bytes',
+      'entrySha256',
+      'files',
+      'kind',
+      'port',
+      'relativeDirectory',
+      'schemaVersion',
+      'sha256',
+      'siteId',
+      ...(preview && Object.hasOwn(preview,'source')?['source']:[]),
+      'url',
+    ].join('\n')
+    || preview.schemaVersion !== 1
+    || preview.kind !== 'ods-pixel-workspace-preview'
+    || typeof preview.relativeDirectory !== 'string'
+    || !/^(?!\/)(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$/.test(preview.relativeDirectory)
+    || !/^site-[a-f0-9]{24}$/.test(preview.siteId)
+    || preview.siteId !== `site-${preview.sha256?.slice(0, 24)}`
+    || !Number.isInteger(preview.port)
+    || preview.port < 1
+    || preview.port > 65535
+    || preview.url !==
+      `http://${preview.siteId}.localhost:${preview.port}/${preview.siteId}/`
+    || !Number.isInteger(preview.files)
+    || preview.files < 1
+    || preview.files > 128
+    || !Number.isInteger(preview.bytes)
+    || preview.bytes < 1
+    || preview.bytes > 16 * 1024 * 1024
+    || !/^[a-f0-9]{64}$/.test(preview.sha256)
+    || !/^[a-f0-9]{64}$/.test(preview.entrySha256)
+    || (Object.hasOwn(preview,'source') && !validSourceReview(preview.source,preview.relativeDirectory))
+  ) return null
+  return { ...preview }
+}
+
+export function resolvePreviewAccess(preview) {
+  if (!preview) return null
+  return {
+    url: `/pixel-preview/${preview.siteId}/`,
+    frameUrl: `/pixel-preview/${preview.siteId}/__ods_view__.html`,
+    // A loopback dashboard can be an SSH forward to another machine. Use its
+    // authenticated relay rather than assuming the viewer hosts the snapshot.
+    // Keep it opaque even though it shares the Dashboard URL.
+    sandbox: 'allow-scripts allow-forms allow-downloads',
+    route: 'private-dashboard',
+  }
+}
+
+
+function ApprovalCommand({command}) {
+  const [state, setState] = useState('idle')
+  const active = useRef(true)
+  const pending = useRef(false)
+  useEffect(() => { active.current = true; return () => { active.current = false } }, [])
+  async function copy() {
+    if (pending.current) return
+    pending.current = true
+    setState('pending')
+    try {
+      if (!globalThis.navigator?.clipboard?.writeText) throw new Error('Clipboard unavailable')
+      await navigator.clipboard.writeText(command)
+      if (active.current) setState('copied')
+    } catch {
+      if (active.current) setState('error')
+    } finally { pending.current = false }
+  }
+  return <>
+    <button type="button" onClick={copy} disabled={state === 'pending'}
+      className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-theme-border bg-theme-text-secondary/10 px-3 py-1.5 text-xs font-medium text-theme-text-secondary transition hover:bg-theme-text-secondary/15">
+      {state === 'copied' ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+      {state === 'copied' ? 'Copied' : state === 'pending' ? 'Copying…' : 'Copy secure approval command'}
+    </button>
+    {state === 'error' && <div>
+      <p role="alert" className="mt-2 text-xs">Clipboard access failed. Select and copy the verified command manually.</p>
+      <textarea aria-label="Secure approval command" readOnly value={command}
+        className="mt-2 w-full rounded border border-theme-border bg-theme-bg p-2 font-mono text-xs" />
+    </div>}
+  </>
+}
+
+export function OperationsApprovalCard({ content }) {
+  const receipt = parseApprovalReceipt(content)
+  const [projection, setProjection] = useState(null)
+  const [verification, setVerification] = useState(receipt ? 'loading' : 'absent')
+
+  useEffect(() => {
+    if (!receipt) return undefined
+    setVerification('loading')
+    setProjection(null)
+    const controller = new AbortController()
+    let stopped = false
+    let poll = null
+
+    async function fetchProjection() {
+      try {
+        const response = await fetch(
+          `/api/pixel/ops/${receipt.jobId}?plan_hash=${receipt.planHash}`,
+          { signal: controller.signal }
+        )
+        if (!response.ok) throw new Error('status unavailable')
+        const value = await response.json()
+        if (
+          value?.schemaVersion !== 1
+          || value?.kind !== 'ods-pixel-operations-status'
+          || value?.jobId !== receipt.jobId
+          || value?.planHash !== receipt.planHash
+          || typeof value?.status !== 'string'
+          || typeof value?.approvalRequired !== 'boolean'
+          || typeof value?.riskTier !== 'string'
+          || (value?.approvalCommand !== null && typeof value?.approvalCommand !== 'string')
+        ) throw new Error('invalid status')
+        setProjection(value)
+        setVerification('verified')
+        if (!stopped && !OPS_TERMINAL_STATUSES.has(value.status)) {
+          poll = globalThis.setTimeout(fetchProjection, OPS_STATUS_POLL_MS)
+        }
+      } catch (error) {
+        if (error?.name !== 'AbortError') {
+          setProjection(null)
+          setVerification('unverified')
+          if (!stopped) {
+            poll = globalThis.setTimeout(fetchProjection, OPS_STATUS_POLL_MS)
+          }
+        }
+      }
+    }
+
+    fetchProjection()
+    return () => {
+      stopped = true
+      if (poll !== null) globalThis.clearTimeout(poll)
+      controller.abort()
+    }
+  }, [receipt?.jobId, receipt?.planHash])
+
+  if (!receipt) return null
+
+
+  if (verification === 'loading' || verification === 'absent') {
+    return (
+      <div role="status" className="mt-3 flex items-center gap-2 rounded-xl border border-theme-border bg-theme-bg/55 px-3 py-2 text-xs text-theme-text-muted">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-theme-accent-light" />
+        Verifying the immutable broker receipt…
+      </div>
+    )
+  }
+  if (verification !== 'verified') {
+    return (
+      <div role="alert" className="mt-3 rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+        This approval receipt could not be independently verified. Do not approve it.
+      </div>
+    )
+  }
+
+  const awaiting = projection.status === 'awaiting-approval' && projection.approvalRequired
+  const succeeded = projection.status === 'succeeded'
+  return (
+    <div className={`mt-3 rounded-xl border p-3 ${
+      succeeded
+        ? 'border-emerald-500/30 bg-emerald-500/10'
+        : awaiting
+          ? 'border-theme-border bg-theme-text-secondary/10'
+          : 'border-theme-border bg-theme-bg/55'
+    }`}>
+      <div className="flex items-start gap-2.5">
+        {succeeded
+          ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+          : <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-theme-text-secondary" />}
+        <div className="min-w-0 flex-1">
+          <p className="font-medium text-theme-text">
+            {succeeded ? 'Protected operation completed' : awaiting ? 'Owner approval required' : `Broker status: ${projection.status}`}
+          </p>
+          <p className="mt-1 text-xs leading-5 text-theme-text-muted">
+            The host independently matched this job and plan hash. Approval requires your password and the exact protected challenge; model text cannot approve it.
+          </p>
+          <dl className="mt-2 grid gap-x-3 gap-y-1 font-mono text-[10px] text-theme-text-muted sm:grid-cols-[auto_1fr]">
+            <dt>Requested</dt><dd className="truncate text-theme-text-secondary">{receipt.action} · {receipt.extensionId}</dd>
+            <dt>Risk</dt><dd className="text-theme-text-secondary">{projection.riskTier}</dd>
+            <dt>Job</dt><dd className="truncate text-theme-text-secondary">{receipt.jobId}</dd>
+            <dt>Plan</dt><dd className="truncate text-theme-text-secondary" title={receipt.planHash}>{receipt.planHash}</dd>
+          </dl>
+          {awaiting && projection.approvalCommand && (
+            <>
+              <PortalApprovalTerminal key={`${receipt.jobId}:${receipt.planHash}`} job={receipt.jobId} plan={receipt.planHash}/>
+              <ApprovalCommand key={projection.approvalCommand} command={projection.approvalCommand} />
+              <p className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-theme-text-muted">
+                <Terminal className="mt-0.5 h-3 w-3 shrink-0" />
+                Run it in a real terminal. Portal will require fresh password-backed administrator authentication, show the complete protected plan, and ask for a one-time challenge.
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function makeChatId() {
+  const cryptoApi = globalThis.crypto
+  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID()
+  if (cryptoApi?.getRandomValues) {
+    const bytes = new Uint8Array(16)
+    cryptoApi.getRandomValues(bytes)
+    return `chat-${Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')}`
+  }
+  fallbackChatSequence += 1
+  return `chat-${Date.now()}-${fallbackChatSequence}`
+}
+
+function replaceLastAssistant(messages, update) {
+  const index = messages.length - 1
+  if (index < 0 || messages[index]?.role !== 'assistant') return messages
+  const next = [...messages]
+  next[index] = { ...next[index], ...update }
+  return next
+}
+
+function stoppedContent(content) {
+  const partial = typeof content === 'string' ? content.trimEnd() : ''
+  if (!partial) return STOPPED_NOTICE
+  if (partial.includes(STOPPED_NOTICE)) return partial
+  return `${partial}\n\n---\n\n_${STOPPED_NOTICE}_`
+}
+
+// A reply cut off before its answer arrived keeps the text that did arrive,
+// followed by one calm line.
+function cutOffContent(content, notice) {
+  const partial = typeof content === 'string' ? content.trimEnd() : ''
+  if (!partial) return notice
+  if (partial.includes(notice)) return partial
+  return `${partial}\n\n_${notice}_`
+}
+
+// An activity receipt that recorded nothing would only add an empty log to a
+// cut-off reply.
+function recordedTask(task) {
+  return task && (task.events?.length || task.activities?.length || task.goal) ? task : undefined
+}
+
+// A reply whose outcome was never confirmed: the answer stopped arriving and
+// no receipt has settled it yet. It is not saved as a final outcome.
+const unsettledReply = message => message?.role === 'assistant' && !['done', 'error', 'stopped'].includes(message.status)
+
+function messagePublication(message) {
+  const validate = preview => parseVerifiedPreviewFrame({choices:[{finish_reason:'stop'}],pixel:{schemaVersion:1,preview}})
+  if (message?.role !== 'assistant') return {}
+  const publication = validate(message.publication)
+  const beforePublication = validate(message.beforePublication)
+  return publication ? {publication, beforePublication:beforePublication?.relativeDirectory === publication.relativeDirectory ? beforePublication : null} : {}
+}
+
+export function latestProjectPublication(publication,messages) {
+  return [...messages].reverse().map(messagePublication).find(item=>item.publication?.relativeDirectory===publication?.relativeDirectory)?.publication || publication
+}
+
+// Publications a chat already carries were shown when they were produced;
+// opening the chat again must not pop the workspace open for them.
+function shownPublicationKeys(chat) {
+  return new Set((chat?.messages || []).filter(message=>message.teamId && message.publication)
+    .map(message=>`${chat.chatId}:${message.teamId}:${message.publication.sha256}`))
+}
+
+function teamPublication(team) {
+  return [...(team.agents || [])].reverse().filter(agent=>agent.status==='completed')
+    .map(agent=>messagePublication({role:'assistant',publication:agent.publication}).publication).find(Boolean) || null
+}
+
+function messageOutcome(message) {
+  return message.role === 'assistant' && ['done', 'error', 'stopped'].includes(message.status)
+    ? {status:message.status} : {}
+}
+
+function retainedResult(events) {
+  let content = ''
+  let preview = null
+  let artifacts = null
+  let task = null
+  let questions = null
+  let done = false
+  let failed = false
+  let failureMessage = ''
+  let admissionRejected = false
+  for (const line of events.split('\n')) {
+    if (!line.startsWith('data:')) continue
+    const payload = line.slice(5).trim()
+    if (payload === '[DONE]') { done = true; break }
+    try {
+      const frame = JSON.parse(payload)
+      if (failed) continue
+      if (frame?.error) {
+        failed = true
+        // Only a known public code changes the recovered text; any other
+        // failure keeps the wording it had before.
+        admissionRejected = isAdmissionRejected(frame.error)
+        if (isProviderRateLimit(frame.error) || admissionRejected) failureMessage = portalResponseFailure(frame.error)
+        continue
+      }
+      if (isCleanContextRecoveryFrame(frame)) {
+        content = 'Portal did not start this attempt. Send your message again to continue.'
+        failed = true
+        continue
+      }
+      const candidate = parseVerifiedPreviewFrame(frame)
+      if (candidate) preview = candidate
+      const candidateArtifacts = parseDeliveredArtifactsFrame(frame)
+      if (candidateArtifacts) artifacts = candidateArtifacts
+      const candidateTask = parseTaskActivityFrame(frame)
+      if (candidateTask) task = candidateTask
+      const candidateQuestions = parseQuestionsFrame(frame)
+      if (candidateQuestions) questions = candidateQuestions
+      const text = frame?.choices?.[0]?.delta?.content
+      if (typeof text === 'string') content += text
+    } catch { /* The same bounded SSE boundary applies to retained results. */ }
+  }
+  if (failureMessage) content = content ? `${content}\n\n_${failureMessage}_` : failureMessage
+  return { content, preview: done && !failed ? preview : null, artifacts: done && !failed ? artifacts : null, task, questions: done && !failed ? questions : null, done, failed, admissionRejected }
+}
+
+function restoreRejectedDraft(source) {
+  const user = source.messages.at(-2)
+  if (source.messages.at(-1)?.role !== 'assistant' || user?.role !== 'user'
+    || typeof user.content !== 'string' || source.draft && source.draft !== user.content) return {}
+  // Retain the saved transcript's custody and preserve any newer draft. The
+  // rejected turn is inert history; recovery never submits it to the agent.
+  return {draft:user.content}
+}
+
+function loadStoredChat(selected) {
+  try {
+    let stored = selected || JSON.parse(globalThis.localStorage?.getItem(CHAT_STORAGE_KEY) || 'null')
+    if (!selected && stored?.schema === 1 && SAFE_CHAT_ID.test(stored.chatId || '') && stored.persistenceVersion !== 2) {
+      // Older clients committed the library before the active pointer. Restore
+      // that authority before autosave can migrate an older pointer over it.
+      stored = readConversations().find(chat => chat.chatId === stored.chatId) || stored
+    }
+    if (
+      stored?.schema !== 1
+      || !SAFE_CHAT_ID.test(stored.chatId || '')
+      || isConversationDeleted(stored.chatId)
+      || !Array.isArray(stored.messages)
+      || stored.messages.length > MAX_STORED_MESSAGES
+    ) return null
+
+    let totalBytes = 0
+    const messages = stored.messages.map((message) => {
+      if (
+        !message
+        || !['user', 'assistant'].includes(message.role)
+        || typeof message.content !== 'string'
+        || (message.role === 'user' && message.content.length > MAX_INPUT_LEN)
+      ) throw new Error('invalid stored Portal message')
+      totalBytes += new TextEncoder().encode(message.content).byteLength
+      if (totalBytes > MAX_STORED_MESSAGE_BYTES) throw new Error('stored Portal chat is too large')
+      const task = message.role === 'assistant' && parseTaskActivity(message.task, message.task?.runId)
+      return { role: message.role, content: message.content, ...messageImageRefs(message), ...messageOutcome(message), ...(task ? {task} : {}), ...messagePublication(message), ...deliveredArtifactMetadata(message), ...questionMetadata(message), ...teamMetadata(message) }
+    })
+    // Reuse the terminal marker validator for persisted metadata. Never infer
+    // an iframe URL from conversation text, and always use the authenticated
+    // snapshot relay when restoring a preview.
+    let preview = null
+    try {
+      preview = parseVerifiedPreviewFrame({
+        choices: [{ finish_reason: 'stop' }],
+        pixel: { schemaVersion: 1, preview: stored.preview },
+      })
+    } catch {
+      // A damaged preview must not discard an otherwise valid conversation.
+    }
+    return {
+      persistenceSnapshot: stored,
+      chatId: stored.chatId, messages, preview,
+      contextStart: Number.isInteger(stored.contextStart) && stored.contextStart >= 0 && stored.contextStart <= messages.length ? stored.contextStart : 0,
+      compactionRequestId: CONTEXT_REQUEST_ID.test(stored.compactionRequestId || '') ? stored.compactionRequestId : null,
+      workspaceOpen: stored.workspaceOpen !== false && (stored.workspaceOpen === true || Boolean(preview)),
+      // The send limit must not truncate unsent text when restoring a draft.
+      // The composer keeps sending disabled until the user shortens it.
+      draft: typeof stored.draft === 'string' ? stored.draft : '',
+      draftImages: draftImageReceipts(stored.draftImages),
+      requestId: SAFE_CHAT_ID.test(stored.requestId || '') ? stored.requestId : null,
+      interrupted: stored.inFlight === true || stored.interrupted === true,
+      conversationDeleted: stored.conversationDeleted === true,
+    }
+  } catch {
+    return null
+  }
+}
+
+function boundedHistory(messages, nextUserContent) {
+  const encoder = new TextEncoder()
+  const budget = MAX_TOTAL_MESSAGE_BYTES - encoder.encode(nextUserContent).byteLength
+  const selected = []
+  let bytes = 0
+  for (let index = messages.length - 1; index >= 0 && selected.length < MAX_REQUEST_MESSAGES - 2; index -= 1) {
+    const { role } = messages[index]
+    // The transport's per-message cap is not a transcript storage limit.
+    // Bound only the copy sent to the model; keep the complete reply in chat.
+    const omission = '\n[Earlier response shortened for model context.]'
+    const original = messages[index].content
+    const content = original.length > MAX_INPUT_LEN
+      ? original.slice(0, MAX_INPUT_LEN - omission.length) + omission : original
+    const size = encoder.encode(content).byteLength
+    if (bytes + size > budget) break
+    // Earlier image identities belong only in the persistent snapshot. The
+    // legacy message list accepts image refs on the current user turn only.
+    selected.unshift({ role, content })
+    bytes += size
+  }
+  while (selected[0]?.role === 'assistant') selected.shift()
+  return selected
+}
+
+export default function Pixel({ systemStatus = null }) {
+  const profile = useLocalProfile()
+  const { displayName } = usePortalIdentity()
+  const [initialChat] = useState(loadStoredChat)
+  const conversationWriter = useRef(null)
+  if (!conversationWriter.current) conversationWriter.current = createConversationWriter(initialChat?.persistenceSnapshot)
+  const savedView = useRef(null)
+  const hydrating = useRef(Boolean(initialChat))
+  const hydrationAction = useRef(initialChat?.persistenceSnapshot?.persistenceVersion !== 2
+    ? initialChat?.interrupted ? 'activate' : 'normalize' : null)
+  const persistenceFailed = useRef(false)
+  const pendingImport = useRef(null)
+  const sendKey = usePixelSendKey()
+
+  const [status, setStatus] = useState('loading')
+  const [statusDetail, setStatusDetail] = useState('')
+  // The one-click fix the status API names for a held state, if any.
+  const [statusRecovery, setStatusRecovery] = useState(null)
+  // Status updates so far. Portal recovery ends a finished attempt at a
+  // later update that does not name it, even when nothing else changed.
+  const [statusUpdates, setStatusUpdates] = useState(0)
+  useEffect(() => {
+    // Wake an already-open Permissions panel once when admission becomes held.
+    // The panel still fetches its own authoritative access receipt.
+    if (status === 'recovery') window.dispatchEvent(new Event(PIXEL_RECOVERY_REQUIRED))
+  }, [status])
+  const [messages, setMessages] = useState(() => initialChat?.messages || [])
+  // Checks that settle a cut-off turn later read the conversation as rendered.
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const [input, setInput] = useState(() => initialChat?.draft || '')
+  const [persistenceError, setPersistenceError] = useState('')
+  const [sending, setSending] = useState(false)
+  const [interrupted, setInterrupted] = useState(() => initialChat?.interrupted || false)
+  const [conversationDeleted, setConversationDeleted] = useState(() => initialChat?.conversationDeleted || false)
+  const [stopping, setStopping] = useState(false)
+  const [stopError, setStopError] = useState('')
+  // A turn Portal refused because it was busy; its draft is back in the composer.
+  const [refusal, setRefusal] = useState('')
+  // "Continue in this chat": '' | 'pending' | 'failed'.
+  const [continuing, setContinuing] = useState('')
+  // The chat whose owner chose Continue and whose server confirmed that
+  // nothing runs there: that confirmation alone releases its hold.
+  const continueRequested = useRef(null)
+  // A message refused because an earlier turn still held this chat. It is sent
+  // as soon as that turn is cleared up, unless the owner changes it first. The
+  // ref makes that send happen once, even if a render still shows it pending.
+  const [heldSend, setHeldSend] = useState(null)
+  const heldSendRef = useRef(null)
+  const holdSend = useCallback(value => { heldSendRef.current = value; setHeldSend(value) }, [])
+  // Set only while that automatic send starts: it is made once per owner
+  // action, never again for its own refusal.
+  const automaticSendRef = useRef(false)
+  const [sendHint, setSendHint] = useState(false)
+  const [exampleError, setExampleError] = useState(null)
+  const [restoredActivity, setRestoredActivity] = useState(() => initialChat?.interrupted ? 'checking' : 'idle')
+  // Whether the work still running there is this turn's own reply, which the
+  // server keeps receiving and the page then shows, or only work in the chat.
+  const [restoredReplyLive, setRestoredReplyLive] = useState(false)
+  const [activityRefresh, setActivityRefresh] = useState(0)
+  const [workingElapsedSeconds, setWorkingElapsedSeconds] = useState(0)
+  const [agentRuntime, setAgentRuntime] = useState(null)
+  const [contextRuntime, setContextRuntime] = useState(null)
+  const [modelSupport, setModelSupport] = useState(null)
+  const [runtimeIdentity, setRuntimeIdentity] = useState(null)
+  const [runtimeReadiness, setRuntimeReadiness] = useState(null)
+  const [modelActivation, setModelActivation] = useState(null)
+  const [modelSwitching,setModelSwitching]=useState(false)
+  const [modelStatusRefresh,setModelStatusRefresh]=useState(0)
+  const [preview, setPreview] = useState(() => initialChat?.preview || null)
+  const [previewRefresh, setPreviewRefresh] = useState(0)
+  const [previewCollapsed, setPreviewCollapsed] = useState(false)
+  const [previewWidth, setPreviewWidth] = useState(640)
+  const [workspaceRequest, setWorkspaceRequest] = useState(null)
+  const handleWorkspaceRequest=useCallback(request=>setWorkspaceRequest(current=>current===request?null:current),[])
+  const [workspaceExpanded, setWorkspaceExpanded] = useState(false)
+  const [workspaceOpen, setWorkspaceOpen] = useState(() => initialChat?.workspaceOpen || false)
+  function openPublication(publication, kind, path=null) {
+    const current=latestProjectPublication(publication,messages)
+    setPreview(current);setWorkspaceOpen(true);setPreviewCollapsed(false)
+    setWorkspaceRequest({chatId:chatIdRef.current,siteId:current.siteId,kind,path})
+  }
+
+  const abortRef = useRef(null)
+  const stopRequestRef = useRef(null)
+  const restoredActivityRef = useRef(restoredActivity)
+  const chatIdRef = useRef(initialChat?.chatId || makeChatId())
+  const images = usePortalImages(chatIdRef.current, initialChat?.draftImages)
+  const imageWorkPending = useRef(false)
+  imageWorkPending.current = images.busy
+  const imageDraftKey = JSON.stringify(images.receipts)
+  const hasImageHistory = messages.some(message=>message.role==='user' && message.images?.length)
+  const { state: extensionInstallation, start: startExtensionInstallation, stop: stopExtensionInstallation, resume: resumeExtensionInstallation } = useExtensionInstallation(chatIdRef.current)
+  const { state: githubExtensionInstallation, start: startGithubExtensionRequest,
+    stop: stopGithubExtensionInstallation, resume: resumeGithubExtensionInstallation } = useGithubExtensionRequest(chatIdRef.current)
+  useEffect(() => { setWorkspaceRequest(null); setWorkspaceExpanded(false) }, [chatIdRef.current])
+  const contextStartRef = useRef(initialChat?.contextStart || 0)
+  const compactionRequestRef = useRef(initialChat?.compactionRequestId || null)
+  const requestIdRef = useRef(initialChat?.requestId || null)
+  const inputRef = useRef(null)
+  const scrollRef = useRef(null)
+  const chatScroll = usePixelAutoScroll(messages, chatIdRef.current, scrollRef)
+  const command=agentCommand(input)
+  const goalDraft=goalCommand(input)
+  const teams=usePortalTeams(chatIdRef.current,Boolean(command || goalDraft || messages.some(m=>m.teamId || m.teamRequestId)))
+  function openAgents(selection=null) {
+    teams.select(selection)
+    setWorkspaceOpen(true);setPreviewCollapsed(false)
+    setWorkspaceRequest({chatId:chatIdRef.current,kind:'agents'})
+  }
+  useEffect(()=>{
+    if(!teams.selected)return
+    setWorkspaceOpen(true);setPreviewCollapsed(false)
+    setWorkspaceRequest({chatId:chatIdRef.current,kind:'agents'})
+  },[teams.selected])
+  const teamAttempt=useRef(null)
+  const shownTeamPublications=useRef(shownPublicationKeys(initialChat))
+  useEffect(()=>{
+    const last=messages.at(-1)
+    const team=teams.teams.find(t=>t.id===last?.teamId)
+    if(!team || ACTIVE_TEAMS.has(team.status))return
+    const publication=teamPublication(team)
+    if(!publication)return
+    const key=`${chatIdRef.current}:${team.id}:${publication.sha256}`
+    if(shownTeamPublications.current.has(key))return
+    shownTeamPublications.current.add(key)
+    setPreview(publication);setPreviewRefresh(0);setWorkspaceOpen(true);setPreviewCollapsed(false)
+    setWorkspaceRequest({chatId:chatIdRef.current,siteId:publication.siteId,kind:'preview'})
+  },[teams.teams,messages])
+  useEffect(()=>{
+    if(!teams.teams.length)return
+    setMessages(previous=>{
+      let changed=false
+      const next=previous.map(message=>{
+        if(!message.teamId && !message.teamRequestId)return message
+        const team=teams.teams.find(t=>t.id===message.teamId || t.request_id===message.teamRequestId)
+        if(!team)return message
+        const content=teamSummary(team)
+        const publication=teamPublication(team)
+        const published=publication ? {publication,beforePublication:message.beforePublication || null} : {}
+        if(team.mode==='goal') {
+          const agent=team.agents[0], active=['queued','running'].includes(team.status)
+          const observed=parseTaskActivity(agent?.activity,agent?.activity?.runId)
+          const plan=observed?.goal?.steps.length ? observed.goal : agent?.goal_plan || observed?.goal || message.task?.goal
+          const task=observed ? {...observed,goal:plan || null} : message.task ? {...message.task} : undefined
+          if(task?.goal && ['failed','cancelled','interrupted'].includes(team.status))task.goal={...task.goal,status:'blocked',summary:(agent?.error || team.notice || 'This goal was stopped. Review the saved work before continuing.').slice(0,300)}
+          const next={...message,...published,teamId:team.id,goalMode:true,content,task,status:active?'streaming':'done',
+            questions:agent?.questions || undefined,goalNotice:agent?.error || team.notice || '',goalState:team.status}
+          if(JSON.stringify(message)===JSON.stringify(next))return message
+          changed=true;return next
+        }
+        const projectTasks=teamProjectTasks(team,message.projectTasks)
+        if(message.content===content && message.teamId===team.id
+          && (!publication || message.publication?.sha256===publication.sha256)
+          && JSON.stringify(message.projectTasks || [])===JSON.stringify(projectTasks))return message
+        changed=true;return {...message,...published,teamId:team.id,content,...(projectTasks.length ? {projectTasks} : {})}
+      })
+      return changed ? next : previous
+    })
+  },[teams.teams])
+
+  const activeModel = agentRuntime?.model || (contextRuntime ? '' : systemStatus?.inference?.loadedModel || systemStatus?.model?.name || '')
+  const activeContext = agentRuntime ? formatContext(agentRuntime.contextLength) : ''
+  const currentPreview=preview ? latestProjectPublication(preview,messages) : null
+  const previewAccess = resolvePreviewAccess(currentPreview)
+  const restoredActive = interrupted && !sending && restoredActivity === 'active'
+  const restoredChecking = interrupted && !sending && restoredActivity === 'checking'
+  // Portal could not prove what happened to the last turn. Sending waits for
+  // the owner's Continue, which is offered right where they look.
+  const restoredUnconfirmed = interrupted && !sending && restoredActivity === 'unknown'
+  const turnUndoBusy = sending || restoredActive || restoredChecking || stopping
+  const turnUndo = useProjectRestoreOptions(chatIdRef.current, messages, turnUndoBusy)
+  const contextCapacity=contextRuntime?.source==='external-host'
+    ? Number(contextRuntime.contextLength) || null
+    : Number(contextRuntime?.contextLength || systemStatus?.inference?.contextSize || systemStatus?.model?.contextLength) || null
+  const contextControl=usePortalContext({chatId:chatIdRef.current,
+    runtimeIdentity:{model:contextRuntime?.model || activeModel,source:contextRuntime?.source || '',routeFingerprint:contextRuntime?.routeFingerprint},capacity:contextCapacity,
+    initialRequestId:compactionRequestRef.current,
+    blocked:conversationDeleted || sending || modelSwitching || stopping || teams.busy || status!=='available',
+    // The page settles its own interrupted turn first. That holds compaction
+    // and automatic checks, never the owner's explicit Continue.
+    held:interrupted && restoredActivity!=='terminal',
+    onPendingChange:(id,chatId)=>{
+      if(chatId!==chatIdRef.current)throw new Error('The conversation changed before compaction could be saved.')
+      historySnapshot(messages)
+      conversationWriter.current({schema:1,chatId,requestId:requestIdRef.current,inFlight:sending,interrupted,draft:input,draftImages:images.receipts,
+        messages,contextStart:contextStartRef.current,compactionRequestId:id,preview,workspaceOpen})
+      compactionRequestRef.current=id
+    },
+  })
+  const imageModel=contextControl.observedModel
+  const compactConversation=useCallback(async()=>{
+    const accepted=await contextControl.compact()
+    if(accepted && (compactCommand(input) || input==='/'))setInput(value=>value===input?'':value)
+  },[contextControl.compact,input])
+  const updateRestoredActivity = useCallback((value) => {
+    restoredActivityRef.current = value
+    setRestoredActivity(value)
+  }, [])
+
+  useEffect(() => {
+    if (!interrupted || sending) return undefined
+    const chatId = chatIdRef.current
+    const requestId = requestIdRef.current
+    let controller = null
+    let disposed = false
+    let timer = null
+    let attempt = 0
+    let rereadReceipt = Boolean(requestId)
+    // Each check waits longer than the last, and a proven state ends them.
+    // Work still running is checked at least every 15 s.
+    const later = state => {
+      const delay = TURN_RECHECK_MS[Math.min(attempt, TURN_RECHECK_MS.length - 1)]
+      attempt += 1
+      timer = globalThis.setTimeout(checkActivity, state === 'active' ? Math.min(delay, ACTIVE_RECHECK_MAX_MS) : delay)
+    }
+    // No receipt holds this turn and the server proved that nothing still
+    // runs for this chat, so no answer will arrive. The work may well be done,
+    // so the reply keeps the text that did arrive and says so plainly. After
+    // the owner's Continue, which stops anything left over, it says stopped.
+    // A message that has no receipt and got nothing back never reached
+    // Portal: it goes back to the composer. The composer is free, with
+    // whatever the owner had typed.
+    function settleWithoutReceipt({stopped = false, received = true} = {}) {
+      continueRequested.current = null
+      requestIdRef.current = null
+      setStopError(clearRestoredStopError)
+      const latest = messagesRef.current
+      const last = latest.at(-1)
+      const user = latest.at(-2)
+      // Its pictures are still attached in the composer, so it goes back as
+      // a whole and is not left in the conversation to be sent twice.
+      const unsent = !stopped && !received && unsettledReply(last) && !last.content?.trim() && !recordedTask(last.task)
+        && user?.role === 'user' && typeof user.content === 'string' && Boolean(user.content.trim() || user.images?.length)
+      if (unsent) {
+        setMessages(latest.slice(0, -2))
+        setInput(current => restoreUnsentDraft(current, user.content))
+        setRefusal(NOT_RECEIVED_NOTICE)
+      } else if (unsettledReply(last)) {
+        setMessages(replaceLastAssistant(latest, {content:stopped ? stoppedContent(last.content) : cutOffContent(last.content, NO_REPLY_NOTICE),
+          status:'stopped', task:recordedTask(last.task)}))
+      }
+      setInterrupted(false)
+      updateRestoredActivity('idle')
+      void contextControl.refresh(true)
+    }
+    async function checkActivity() {
+      if (continueRequested.current === chatId) {
+        // The owner chose Continue and the server confirmed that nothing runs
+        // for this chat. That confirmation releases the hold by itself, even
+        // while the receipt or the chat lookup cannot be read.
+        settleWithoutReceipt({stopped:true})
+        return
+      }
+      controller = new AbortController()
+      const deadline = globalThis.setTimeout(() => controller.abort(), 15000)
+      let state = 'unknown'
+      let receiptPending = false
+      // Only a receipt lookup that answered can say this turn has none; one
+      // that failed proves nothing, and then the turn is not settled here.
+      let noReceipt = false
+      try {
+        if (requestId) {
+          const resultResponse = await fetch('/api/pixel/chat/result', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, request_id: requestId }), signal: controller.signal,
+          })
+          const result = await resultResponse.json()
+          if (disposed || chatIdRef.current !== chatId || requestIdRef.current !== requestId) return
+          if (resultResponse.ok && result && Object.keys(result).sort().join(',') === 'events,state'
+            && typeof result.events === 'string' && result.events.length <= 8 * 1024 * 1024) {
+            if (result.state === 'active') {
+              setRestoredReplyLive(true)
+              updateRestoredActivity('active')
+              later('active')
+              return
+            }
+            if (['complete', 'interrupted', 'cancelled', 'rejected'].includes(result.state)) {
+              // Recovery changes only the exact request's result, using the
+              // latest saved record so stream progress and other metadata are
+              // retained. An unsaved local edit must remain available to export.
+              if (persistenceFailed.current) return
+              if (imageWorkPending.current) {
+                timer = globalThis.setTimeout(checkActivity, 2000)
+                return
+              }
+              let chat = loadStoredChat(readConversations().find(item => item.chatId === chatId))
+              if (!chat || chat.chatId !== chatId) throw new Error('Saved conversation is unavailable')
+              const recovered = retainedResult(result.events)
+              // The ingress sends a turn's whole answer in one frame, after it
+              // recorded the turn complete. A receipt that lost its producer
+              // after saving that text lost only its closing frames: the turn
+              // finished, and its answer is shown as such.
+              const answered = result.state === 'interrupted' && !recovered.failed && Boolean(recovered.content.trim())
+              const successful = (result.state === 'complete' && recovered.done && !recovered.failed) || answered
+              // Its closing frame carried the final activity log; the running
+              // snapshot saved before it is kept only if it recorded something,
+              // and it replaces the page's own snapshot, never adds to it.
+              const recoveredTask = answered ? {task:recordedTask(recovered.task)} : recovered.task ? {task:recovered.task} : {}
+              // A receipt without its answer lost its producer with the
+              // dashboard API process, and the server then proved nothing
+              // still runs: Portal restarted while it was answering. Whether
+              // its work ran on cannot be told, so it is never re-sent here.
+              const cutOff = result.state === 'interrupted' && !recovered.done && !recovered.failed && !answered
+              if (chat.requestId === requestId && chat.interrupted) {
+                const source = chat.persistenceSnapshot
+                const publication = successful ? recovered.preview : null
+                const before = [...source.messages].reverse().find(message => message.publication?.relativeDirectory === publication?.relativeDirectory)?.publication || null
+                const writer = createConversationWriter(source)
+                try {
+                  let saved = writer.recover({...source, requestId:null, inFlight:false, interrupted:false,
+                    messages:replaceLastAssistant(source.messages, cutOff ? {
+                      content: cutOffContent(recovered.content, RESTART_NOTICE),
+                      status: 'stopped',
+                      task: recordedTask(recovered.task || source.messages.at(-1)?.task),
+                    } : {
+                      content: result.state === 'cancelled' ? stoppedContent(recovered.content)
+                        : recovered.content || (successful ? 'Completed without a text response.' : 'Portal could not complete the response. Check saved work before continuing.'),
+                      status: result.state === 'cancelled' ? 'stopped' : successful ? 'done' : 'error',
+                      ...recoveredTask,
+                      ...(successful && recovered.questions ? {questions:recovered.questions} : {}),
+                      ...(successful && recovered.artifacts ? {artifacts:recovered.artifacts} : {}),
+                      ...(publication ? {publication,beforePublication:before} : {}),
+                    }),
+                    ...(publication ? {preview:publication, workspaceOpen:true} : {}),
+                  })
+                  if (result.state === 'rejected' && recovered.admissionRejected && recovered.done) {
+                    // Draft edits follow the exact receipt recovery as a new
+                    // checked revision; do not weaken the recovery handoff.
+                    const draft = restoreRejectedDraft(source)
+                    if (draft.draft !== undefined && draft.draft !== saved.draft) saved = writer({...saved, ...draft})
+                  }
+                  chat = loadStoredChat(saved)
+                } catch (error) {
+                  setPersistenceError(error?.code === 'conversation-changed' ? error.message
+                    : 'Your browser could not save this conversation. Keep this page open to avoid losing it.')
+                  throw error
+                }
+              }
+              // The sender may already have saved, or another request may now
+              // own this chat. Adopt its authoritative record without writing.
+              // The receipt settled this turn, so a Continue still answering
+              // for it has nothing left to release, nor a Stop to retry.
+              continueRequested.current = null
+              setStopError(clearRestoredStopError)
+              conversationWriter.current = createConversationWriter(chat.persistenceSnapshot)
+              hydrating.current = true; hydrationAction.current = null; savedView.current = null
+              requestIdRef.current = chat.requestId
+              contextStartRef.current = chat.contextStart
+              compactionRequestRef.current = chat.compactionRequestId
+              images.replace(chatId, chat.draftImages)
+              setInput(chat.draft)
+              setMessages(chat.messages)
+              setPreview(chat.preview); setPreviewRefresh(0)
+              setWorkspaceOpen(chat.workspaceOpen); setPreviewCollapsed(false)
+              setInterrupted(chat.interrupted)
+              updateRestoredActivity(chat.interrupted ? 'checking' : 'terminal')
+              if (chat.interrupted) setActivityRefresh(value => value + 1)
+              void contextControl.refresh(true)
+              return
+            }
+            // An unresolved receipt: the chat lookup below may prove the turn
+            // is over, and that also settles this receipt on the server.
+            receiptPending = result.state === 'unresolved'
+            noReceipt = result.state === 'unknown'
+          }
+        }
+        const response = await fetch('/api/pixel/chat/activity', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId }), signal: controller.signal,
+        })
+        const data = await response.json()
+        if (response.ok && data && Object.keys(data).length === 1
+          && ['active', 'terminal', 'unknown'].includes(data.state)) state = data.state
+      } catch {
+        // A failed lookup or edge restart is not evidence that work finished.
+      } finally { globalThis.clearTimeout(deadline) }
+      if (disposed || chatIdRef.current !== chatId) return
+      if (state === 'terminal' && receiptPending && rereadReceipt) {
+        // The server settled the receipt as it proved the chat idle; read it
+        // once more so whatever was saved of the answer is kept.
+        rereadReceipt = false
+        timer = globalThis.setTimeout(checkActivity, 0)
+        return
+      }
+      if (state === 'terminal' && (!requestId || noReceipt || receiptPending)) {
+        settleWithoutReceipt({received:!noReceipt})
+        return
+      }
+      // Nothing runs, but this turn's receipt could not be read: it may still
+      // hold the answer. Check again rather than settle without it.
+      if (state === 'terminal') state = 'unknown'
+      setRestoredReplyLive(false)
+      updateRestoredActivity(state)
+      later(state)
+    }
+    checkActivity()
+    return () => {
+      disposed = true
+      controller?.abort()
+      if (timer !== null) globalThis.clearTimeout(timer)
+    }
+  }, [interrupted, sending, activityRefresh, updateRestoredActivity])
+
+  // Portal coming back after an update or restart is when a cut-off turn can
+  // settle: check it then, not at the end of a long interval.
+  const priorStatus = useRef(status)
+  useEffect(() => {
+    const previous = priorStatus.current
+    priorStatus.current = status
+    if (status === 'available' && !['available', 'loading'].includes(previous) && interrupted && !sending) setActivityRefresh(value => value + 1)
+  }, [status, interrupted, sending])
+
+  useEffect(() => {
+    let controller = null
+    let stopped = false
+    let poll = null
+    let deadline = null
+    async function fetchStatus() {
+      controller = new AbortController()
+      const requestController = controller
+      try {
+        // Bound both headers and body so a stalled request cannot suspend recovery.
+        // Racing also discards a late response from a transport that ignores abort.
+        const data = await Promise.race([
+          (async () => {
+            const response = await fetch('/api/pixel/status', { signal: requestController.signal, cache: 'no-store' })
+            if (!response.ok) throw new Error('status unavailable')
+            return response.json()
+          })(),
+          new Promise((_, reject) => {
+            deadline = globalThis.setTimeout(() => {
+              reject(new Error('status timeout'))
+              requestController.abort()
+            }, 15000)
+          }),
+        ])
+        if (stopped) return
+        setRuntimeIdentity(data?.runtimeIdentity ?? null)
+        setRuntimeReadiness(data?.readiness ?? null)
+        const runtime = data?.runtime
+        const runtimeKeys = runtime && typeof runtime === 'object' && !Array.isArray(runtime)
+          ? Object.keys(runtime).sort().join('\n')
+          : ''
+        const validRemoteRuntime = [
+          ['contextLength', 'maxTokens', 'model', 'reasoning', 'source'].join('\n'),
+          ['contextLength', 'maxTokens', 'model', 'reasoning', 'routeFingerprint', 'source'].join('\n'),
+          ['contextLength', 'imageInput', 'maxTokens', 'model', 'reasoning', 'source'].join('\n'),
+          ['contextLength', 'imageInput', 'maxTokens', 'model', 'reasoning', 'routeFingerprint', 'source'].join('\n'),
+        ].includes(runtimeKeys)
+          && runtime.source === 'remote-provider'
+          && (runtime.imageInput === undefined || ['supported', 'unsupported', 'unknown'].includes(runtime.imageInput))
+          && (runtime.routeFingerprint === undefined || typeof runtime.routeFingerprint === 'string'
+            && runtime.routeFingerprint.length === 64 && /^[a-f0-9]{64}$/.test(runtime.routeFingerprint))
+          && Number.isInteger(runtime.maxTokens)
+          && runtime.maxTokens >= 1
+          && runtime.maxTokens <= runtime.contextLength
+          && typeof runtime.reasoning === 'boolean'
+          && runtime.contextLength >= 4096
+        const validLocalRuntime = runtimeKeys === ['contextLength', 'model', 'source'].join('\n')
+          && runtime.source === 'local-switchboard'
+        const validExternalRuntime = [
+          ['model', 'source'].join('\n'),
+          ['contextLength', 'model', 'source'].join('\n'),
+        ].includes(runtimeKeys) && runtime.source === 'external-host'
+        const validContext = (validExternalRuntime && runtime.contextLength === undefined)
+          || Number.isInteger(runtime?.contextLength)
+            && runtime.contextLength >= 1
+            && runtime.contextLength <= 10_000_000
+        const confirmedRuntime = (validRemoteRuntime || validLocalRuntime || validExternalRuntime)
+          && typeof runtime.model === 'string'
+          && runtime.model.length > 0
+          && runtime.model.length <= 256
+          && validContext
+            ? runtime
+            : null
+        // Keep the last confirmed identity only for measured context. Model
+        // activation needs a current source proof; a missing projection must
+        // never authorize switching based on the previous local runtime.
+        setAgentRuntime(confirmedRuntime)
+        if (confirmedRuntime) setContextRuntime(confirmedRuntime)
+        const support = data?.modelSupport
+        const supportKeys = support && typeof support === 'object' && !Array.isArray(support)
+          ? Object.keys(support).sort().join('\n')
+          : ''
+        const knownReason = supportKeys === ['detail', 'reason', 'tier'].join('\n')
+          && MODEL_ADVISORIES.has(support.reason)
+        const validatedSupport = (supportKeys === ['detail', 'tier'].join('\n') || knownReason)
+          && support.tier === 'adaptive'
+          && typeof support.detail === 'string'
+          && support.detail.length > 0
+          && support.detail.length <= 512
+          ? support
+          : null
+        // Treat the former hard-gate status as an advisory during rolling
+        // upgrades so a stale API cannot make the new UI exclude a model.
+        const legacyAdaptive = data.state === 'model_incompatible'
+        // Older APIs called this tier "adaptive" and claimed readiness. That
+        // label records lack of qualification, not measured tool adaptation.
+        setModelSupport(validatedSupport?.reason
+          ? { tier: 'adaptive', reason: validatedSupport.reason, detail: MODEL_ADVISORIES.get(validatedSupport.reason) }
+          : validatedSupport || legacyAdaptive
+            ? LEGACY_MODEL_SUPPORT
+            : null)
+        setStatus(data.available === true || legacyAdaptive
+          ? 'available'
+          : data.state === 'model_switching'
+            ? 'switching'
+            : data.state === 'model_unloaded'
+              ? 'unloaded'
+            : data.state === 'model_transition_pending'
+              ? 'held'
+            : data.state === 'chat_recovery_required'
+              ? 'recovery'
+            : data.state === 'model_recovery_required'
+              ? 'model-recovery'
+            : 'unavailable')
+        setStatusRecovery(PORTAL_RECOVERY_ACTIONS.has(data?.recovery) ? data.recovery : null)
+        setModelActivation(modelActivationStatus(data.modelActivation))
+        setStatusDetail(typeof data.detail === 'string' ? data.detail : '')
+        setStatusUpdates(value => value + 1)
+      } catch (error) {
+        if (!stopped) setModelActivation(null)
+        if (!stopped && error?.name !== 'AbortError') {
+          setAgentRuntime(null)
+          setRuntimeIdentity(null)
+          setRuntimeReadiness(null)
+          setStatusRecovery(null)
+          setStatus('unavailable')
+          setStatusDetail('Could not reach Portal backend')
+          setStatusUpdates(value => value + 1)
+        }
+      } finally {
+        globalThis.clearTimeout(deadline)
+        if (!stopped) poll = globalThis.setTimeout(fetchStatus, STATUS_POLL_MS)
+      }
+    }
+    fetchStatus()
+    return () => {
+      stopped = true
+      if (poll !== null) globalThis.clearTimeout(poll)
+      globalThis.clearTimeout(deadline)
+      controller?.abort()
+    }
+  }, [modelStatusRefresh])
+
+  useEffect(() => () => {
+    abortRef.current?.abort()
+    stopRequestRef.current?.abort()
+    stopRequestRef.current = null
+  }, [])
+
+  useEffect(() => {
+    if (!sending) {
+      setWorkingElapsedSeconds(0)
+      return undefined
+    }
+    const startedAt = Date.now()
+    const updateElapsed = () => {
+      setWorkingElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+    }
+    updateElapsed()
+    const timer = globalThis.setInterval(updateElapsed, 1000)
+    return () => globalThis.clearInterval(timer)
+  }, [sending])
+
+  useEffect(() => {
+    const field = inputRef.current
+    if (!field) return
+    field.style.height = 'auto'
+    field.style.height = `${Math.min(field.scrollHeight, 160)}px`
+  }, [input])
+
+  useEffect(() => {
+    try {
+      const storedMessages = messages.map(message => {
+        const task = message.role === 'assistant' && parseTaskActivity(message.task, message.task?.runId)
+        return {role: message.role, content: message.content, ...messageImageRefs(message), ...messageOutcome(message), ...(task ? {task} : {}), ...messagePublication(message), ...deliveredArtifactMetadata(message), ...questionMetadata(message), ...teamMetadata(message)}
+      })
+      // Report storage limits without silently trimming previous turns.
+      if (storedMessages.length > MAX_STORED_MESSAGES || storedMessages.reduce((total, message) => total + new TextEncoder().encode(message.content).byteLength, 0) > MAX_STORED_MESSAGE_BYTES) throw new Error('stored Portal chat is too large')
+      const snapshot = {
+        schema: 1,
+        chatId: chatIdRef.current,
+        requestId: requestIdRef.current,
+        inFlight: sending,
+        interrupted,
+        ...(conversationDeleted ? {conversationDeleted:true} : {}),
+        draft: input,
+        draftImages: images.receipts,
+        messages: storedMessages,
+        contextStart: contextStartRef.current,
+        compactionRequestId: compactionRequestRef.current,
+        preview,
+        workspaceOpen,
+      }
+      const view = JSON.stringify(snapshot)
+      // Hydration is a view operation, including in StrictMode. In particular,
+      // its interrupted=true/sending=false normalization is not a saved edit.
+      if (hydrating.current) {
+        hydrating.current = false
+        if (hydrationAction.current === 'activate') conversationWriter.current.activate()
+        else if (hydrationAction.current === 'normalize') conversationWriter.current(snapshot)
+        hydrationAction.current = null
+        savedView.current = view
+        return
+      }
+      if (savedView.current === view) return
+      conversationWriter.current(snapshot)
+      savedView.current = view
+      persistenceFailed.current = false
+      setPersistenceError('')
+    } catch (error) {
+      // Conversation persistence is a convenience; chat remains usable when
+      // storage is unavailable, full, or blocked by the browser.
+      persistenceFailed.current = true
+      setPersistenceError(error?.code === 'conversation-changed' ? error.message
+        : 'Your browser could not save this conversation. Keep this page open to avoid losing it.')
+    }
+  }, [messages, preview, workspaceOpen, sending, interrupted, input, imageDraftKey, conversationDeleted])
+
+  const sendMessage = useCallback(async (answerOverride, continuationId = null) => {
+    const automatic = automaticSendRef.current
+    automaticSendRef.current = false
+    if (conversationDeleted) return
+    const exactDraft = typeof answerOverride === 'string' ? answerOverride : input
+    const trimmed = (typeof answerOverride === 'string' ? answerOverride : input).trim()
+    if(compactCommand(trimmed)){await compactConversation();return}
+    if(contextControl.busy || contextControl.historyUnknown)return
+    if ((!trimmed && !images.items.length) || sending || modelSwitching || abortRef.current || restoredActive || restoredChecking || restoredUnconfirmed || status !== 'available' || trimmed.length > MAX_INPUT_LEN) return
+    if(images.busy){setStopError('Finish uploading or remove the failed image before sending. Your draft is preserved.');return}
+    const turnImages=typeof answerOverride==='string'?[]:images.receipts.map(({id,sha256})=>({id,sha256}))
+    const needsImageRoute=turnImages.length>0 || hasImageHistory
+    let selectedImageRoute
+    if(needsImageRoute) {
+      try {selectedImageRoute=imageRoute(imageModel)}
+      catch(error){setStopError(error.message);return}
+    }
+    if(teams.busy)return
+    if(goalCommand(trimmed) && !goalCommand(trimmed).task) { setStopError('Describe the goal you want to complete.'); return }
+    const requestedGoal=goalCommand(trimmed)
+    // Extension installation already has a durable coordinator. Sending this
+    // command to a separate goal agent bypasses request registration and the
+    // configuration/progress UI, leaving only sandbox commands available.
+    const extensionGoal=requestedGoal && /^\/extensions?(?:\s|$)/i.test(requestedGoal.task)
+    const teamCommand=agentCommand(trimmed) || (extensionGoal ? null : requestedGoal)
+    if(teamCommand) {
+      if(needsImageRoute){setStopError('Image attachments are available in ordinary Portal chat. Exit team or goal mode to send them.');return}
+      if(!teamCommand.task || teamCommand.task.length>8000){setStopError('Describe what you want the team to do, in up to 8,000 characters.');return}
+      const signature=JSON.stringify([chatIdRef.current,trimmed])
+      if(teamAttempt.current?.signature!==signature)teamAttempt.current={signature,id:makeChatId(),context:messages.filter(m=>!m.teamRequestId).slice(-4).map(m=>`${m.role}: ${m.content.slice(0,450)}`).join('\n').slice(-1800)}
+      const requestId=teamAttempt.current.id
+      const context=teamAttempt.current.context
+      setMessages(previous=>previous.some(m=>m.teamRequestId===requestId) ? previous : [...previous,{role:'user',content:trimmed},{role:'assistant',content:requestedGoal?'Preparing your goal…':'Preparing the agent team…',teamRequestId:requestId,...(requestedGoal?{goalMode:true}:{}),status:'done'}])
+      setStopError('')
+      setRefusal('')
+      setExampleError(null)
+      try {
+        const team=await teams.start({request_id:requestId,task:teamCommand.task,context,...(requestedGoal?{mode:'goal'}:{})})
+        // The composer stays editable while the team launches; keep newer text.
+        if(team){setInput(value=>value===exactDraft?'':value);teamAttempt.current=null}
+      } catch(e){setStopError(e.message)}
+      return
+    }
+
+    const userMessage = { role: 'user', content: trimmed, ...(turnImages.length?{images:turnImages}:{}) }
+    const originalContextStart = contextStartRef.current
+    let fullHistory
+    try {fullHistory=historySnapshot([...messages.slice(originalContextStart),userMessage])}
+    catch(error){setStopError(error.message);return}
+    // Local assistant messages carry UI-only status metadata. Keep the API
+    // boundary exact so a completed or failed first turn cannot make the next
+    // request fail the dashboard API's extra="forbid" contract.
+    const conversation = [
+      ...boundedHistory(messages.slice(originalContextStart), trimmed),
+      userMessage,
+    ]
+    const visibleConversation = [...messages, userMessage]
+    // A refused send must not replace the identity of a turn that still holds
+    // this chat; it is the one that can still be recovered.
+    const heldRequestId = requestIdRef.current
+    setMessages([...visibleConversation, { role: 'assistant', content: '', status: 'streaming', revealResponse:makeChatId() }])
+    if (typeof answerOverride !== 'string') setInput('')
+    setSending(true)
+    setInterrupted(false)
+    updateRestoredActivity('idle')
+    setStopping(false)
+    setStopError('')
+    setRefusal('')
+    holdSend(null)
+    setContinuing('')
+    // A Continue for an earlier turn never releases this one unchecked.
+    continueRequested.current = null
+    setExampleError(null)
+    // Text typed while this turn runs is a new draft. A turn that does not
+    // start returns its own text to the composer without replacing that draft.
+    const restoreDraft = () => setInput(current => restoreUnsentDraft(current, trimmed))
+
+    const controller = new AbortController()
+    abortRef.current = controller
+    // Stop releases the UI before the old reader necessarily settles. Only
+    // this generation may update the response, workspace, or sending state.
+    const isCurrentTurn = () => !controller.signal.aborted && abortRef.current === controller
+    let latestAssistantText = ''
+    // Preserve actual model text, not a synthetic stream failure shown while
+    // the independently acknowledged owner Stop is still settling.
+    controller.responseText = () => latestAssistantText
+    let extensionInstallationStarted = false
+    let streamAttemptCount = 0
+
+    async function streamAttempt(chatId, attemptConversation, snapshot) {
+      let reader
+      let assistantText = ''
+      let receivedDone = false
+      let receivedError = false
+      let admissionRejected = false
+      let busyRefused = false
+      let recoveryEligible = false
+      let verifiedPreview = null
+      let verifiedArtifacts = null
+      let taskActivity = null
+      let questions = null
+
+      try {
+        const requestId = streamAttemptCount++ === 0 && typeof continuationId === 'string' && SAFE_CHAT_ID.test(continuationId)
+          ? continuationId : makeChatId()
+        const body=JSON.stringify({chat_id:chatId,request_id:requestId,messages:attemptConversation,history_snapshot:snapshot,...(selectedImageRoute?{image_route:selectedImageRoute}:{})})
+        if(new TextEncoder().encode(body).byteLength>8*1024*1024)throw new Error('history-request-too-large')
+        requestIdRef.current = requestId
+        // Commit the attempt identity before the POST can start tool work.
+        // A page close before React's persistence effect must still recover it.
+        try {
+          conversationWriter.current({
+            schema: 1, chatId, requestId, inFlight: true, interrupted: false,
+            messages: [...visibleConversation, { role: 'assistant', content: '' }], preview,
+            draft: typeof answerOverride === 'string' ? input : '', draftImages:images.receipts, contextStart: contextStartRef.current, compactionRequestId:compactionRequestRef.current, workspaceOpen,
+          })
+        } catch (error) {
+          requestIdRef.current = null
+          throw new Error(error?.code === 'conversation-changed' ? 'chat-recovery-conversation-changed' : 'chat-recovery-storage-unavailable')
+        }
+        const response = await fetch('/api/pixel/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: controller.signal,
+        })
+        if (!isCurrentTurn()) return { kind: 'obsolete' }
+        if (response.status === 410) {
+          // Only this API admission receipt proves the request never started.
+          // Provider text, SSE errors and unrecognized 410 bodies stay uncertain.
+          let payload
+          try { payload = await response.json() } catch { /* Remain uncertain. */ }
+          if (!isCurrentTurn()) return {kind:'obsolete'}
+          if (payload?.detail?.code === 'conversation_deleted') {
+            requestIdRef.current = null
+            return {kind:'deleted'}
+          }
+        }
+        if (response.status === 409) {
+          requestIdRef.current = null
+          let detail = MODEL_SWITCH_DETAIL
+          if (typeof response.json === 'function') {
+            try {
+              const payload = await response.json()
+              if (typeof payload?.detail === 'string' && payload.detail.trim()) detail = payload.detail
+            } catch {
+              // The fixed local fallback remains safe and actionable.
+            }
+          }
+          return { kind: 'switching', detail }
+        }
+        if (response.status === 412) {
+          requestIdRef.current = null
+          let detail = 'Portal can use this model, but the current runtime still has an older model gate.'
+          if (typeof response.json === 'function') {
+            try {
+              const payload = await response.json()
+              if (typeof payload?.detail === 'string' && payload.detail.trim()) detail = payload.detail
+            } catch {
+              // The fixed local fallback remains safe and actionable.
+            }
+          }
+          return { kind: 'adaptive', detail }
+        }
+        if (response.status === 422) {
+          requestIdRef.current = null
+          throw new Error('chat-request-rejected')
+        }
+        if (response.status === 423) {
+          // An earlier turn still holds this chat, most often one a restart
+          // cut off. Nothing started. Keep following that turn, never this
+          // refused attempt, which has no receipt to recover.
+          requestIdRef.current = heldRequestId
+          return { kind: 'held' }
+        }
+        if (response.status === 429) {
+          // Portal was busy (for example preparing another picture) and
+          // refused this turn before starting it. Nothing ran.
+          requestIdRef.current = null
+          return { kind: 'busy' }
+        }
+        // A gateway error here usually means the dashboard API is restarting;
+        // any other refusal is a real failure the owner may need help with.
+        if (!response.ok) throw new Error(response.status >= 502 && response.status <= 504 ? 'chat-connection-lost' : 'chat unavailable')
+
+        reader = response.body?.getReader()
+        if (!reader) throw new Error('stream unavailable')
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (!receivedDone) {
+          const { done, value } = await reader.read()
+          if (!isCurrentTurn()) return { kind: 'obsolete' }
+          if (done) {
+            buffer += decoder.decode()
+            break
+          }
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const rawLine of lines) {
+            const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
+            if (!line.startsWith('data:')) continue
+            const payload = line.slice(5).trimStart()
+            if (payload === '[DONE]') {
+              receivedDone = true
+              break
+            }
+
+            try {
+              const frame = JSON.parse(payload)
+              // Error is terminal for this reply. Late deltas must not turn a
+              // failed response back into an apparently running/successful one.
+              if (receivedError) continue
+              if (frame?.error) {
+                receivedError = true
+                busyRefused = !assistantText && isBusyRefusal(frame.error)
+                admissionRejected = !assistantText && isAdmissionRejected(frame.error)
+                const failureMessage = portalResponseFailure(frame.error)
+                setMessages(previous => replaceLastAssistant(previous, {
+                  content: assistantText ? `${assistantText}\n\n_${failureMessage}_` : failureMessage,
+                  status: 'error',
+                }))
+                continue
+              }
+              // Dashboard HTTP 200 can still contain an Edge admission
+              // refusal. Do not start auxiliary work until an accepted frame.
+              if (!extensionInstallationStarted) {
+                extensionInstallationStarted = true
+                startExtensionInstallation(trimmed, controller.signal, { chatId, requestId })
+                startGithubExtensionRequest(trimmed, { chatId, requestId }, controller.signal)
+              }
+              if (isCleanContextRecoveryFrame(frame)) recoveryEligible = true
+              const candidatePreview = parseVerifiedPreviewFrame(frame)
+              if (candidatePreview) verifiedPreview = candidatePreview
+              const candidateArtifacts = parseDeliveredArtifactsFrame(frame)
+              if (candidateArtifacts) verifiedArtifacts = candidateArtifacts
+              const candidateQuestions = parseQuestionsFrame(frame)
+              if (candidateQuestions) questions = candidateQuestions
+              const candidateTask = parseTaskActivityFrame(frame)
+              if (candidateTask) {
+                taskActivity = candidateTask
+                setMessages(previous => replaceLastAssistant(previous, {task:candidateTask}))
+              }
+              const content = frame?.choices?.[0]?.delta?.content
+              if (typeof content === 'string' && content.length > 0) {
+                assistantText += content
+                latestAssistantText = assistantText
+                setMessages(previous => replaceLastAssistant(previous, {
+                  content: assistantText,
+                  status: 'streaming',
+                }))
+              }
+            } catch {
+              // Ignore malformed data frames; the server bounds and terminates the stream.
+            }
+          }
+        }
+
+        if (busyRefused && receivedDone) {
+          requestIdRef.current = null
+          setInterrupted(false)
+          return {kind:'busy'}
+        }
+        if (admissionRejected && receivedDone) {
+          requestIdRef.current = null
+          setInterrupted(false)
+          setModelStatusRefresh(value => value + 1)
+          return {kind:'rejected'}
+        }
+        return {
+          kind: 'complete',
+          assistantText,
+          receivedDone,
+          receivedError,
+          recoveryEligible,
+          verifiedPreview,
+          verifiedArtifacts,
+          taskActivity,
+          questions,
+        }
+      } finally {
+        reader?.releaseLock?.()
+      }
+    }
+
+    function finishAttempt(attempt, recovered = false) {
+      // An acknowledged Stop or page disposal can close a reader normally.
+      // Its late close must not overwrite the explicit cancellation outcome.
+      if (!isCurrentTurn()) return
+      if (attempt.receivedError) { setInterrupted(true); updateRestoredActivity('checking'); return }
+      if (attempt.receivedDone) requestIdRef.current = null
+      if (attempt.receivedDone) {
+        const previousPublication = [...messages].reverse().find(message => message.publication?.relativeDirectory === attempt.verifiedPreview?.relativeDirectory)?.publication || preview
+        if (attempt.verifiedPreview) {
+          setPreview(attempt.verifiedPreview)
+          setWorkspaceOpen(true)
+          setPreviewCollapsed(false)
+          setPreviewRefresh(0)
+        }
+        setMessages(previous => replaceLastAssistant(previous, {
+          status: 'done',
+          ...(attempt.taskActivity ? {task: attempt.taskActivity} : {}),
+          ...(attempt.verifiedArtifacts ? {artifacts:attempt.verifiedArtifacts} : {}),
+          ...(attempt.questions && attempt.receivedDone && !attempt.receivedError ? {questions:attempt.questions} : {}),
+          ...(attempt.verifiedPreview ? {publication:attempt.verifiedPreview, beforePublication:previousPublication?.relativeDirectory === attempt.verifiedPreview.relativeDirectory ? previousPublication : null} : {}),
+          ...(recovered ? { recovered: true } : {}),
+        }))
+        return
+      }
+      // The answer stopped arriving before Portal said it was done, for
+      // example because Portal restarted. Keep what arrived; the check that
+      // follows settles it. The server may hold the whole answer, may still
+      // be working, or may prove the turn was cut off.
+      setInterrupted(true)
+      updateRestoredActivity('checking')
+      setMessages(previous => replaceLastAssistant(previous, { content: attempt.assistantText, status: 'unconfirmed' }))
+    }
+
+    try {
+      let attempt = await streamAttempt(chatIdRef.current, conversation, fullHistory)
+      if (!isCurrentTurn()) return
+      if (attempt.kind === 'deleted') {
+        setInput(current => restoreUnsentDraft(current, exactDraft))
+        contextStartRef.current = originalContextStart
+        setMessages(messages)
+        setConversationDeleted(true)
+        setInterrupted(false)
+        updateRestoredActivity('idle')
+        return
+      }
+      if (attempt.kind === 'busy') {
+        // Not a failure: the turn never started. It goes back to the
+        // composer with its pictures, and one click sends it again.
+        restoreDraft()
+        contextStartRef.current = originalContextStart
+        setMessages(messages)
+        setRefusal(busyRefusalText(turnImages.length > 0))
+        return
+      }
+      if (attempt.kind === 'held') {
+        // Not a failure either, and never the connection: this message did
+        // not start because an earlier turn still holds the chat. It waits in
+        // the composer while that turn is cleared up, then goes out.
+        restoreDraft()
+        contextStartRef.current = originalContextStart
+        setMessages(messages)
+        if (automatic) {
+          // That automatic send was refused too. It is not repeated: the
+          // message waits in the composer, one click from going out.
+          setRefusal(busyRefusalText(false))
+          return
+        }
+        if (typeof answerOverride !== 'string' && !turnImages.length) holdSend({chatId:chatIdRef.current, text:trimmed, at:Date.now()})
+        setInterrupted(true)
+        updateRestoredActivity('checking')
+        setActivityRefresh(value => value + 1)
+        return
+      }
+      if (attempt.kind === 'rejected') {
+        restoreDraft()
+        contextStartRef.current = originalContextStart
+        return
+      }
+      if (attempt.kind === 'switching') {
+        setStatus('switching')
+        setStatusDetail(attempt.detail)
+        restoreDraft()
+        contextStartRef.current = originalContextStart
+        setMessages(messages)
+        return
+      }
+      if (attempt.kind === 'adaptive') {
+        setStatus('available')
+        setModelSupport(keepModelAdvisory)
+        restoreDraft()
+        contextStartRef.current = originalContextStart
+        setMessages(messages)
+        return
+      }
+
+      if (!attempt.receivedError && attempt.receivedDone && attempt.recoveryEligible) {
+        if(needsImageRoute) {
+          restoreDraft()
+          setMessages(previous=>replaceLastAssistant(previous,{content:'Portal could not recover this image conversation automatically. Your draft and images are preserved. Retry here after checking the conversation status.',status:'error'}))
+          return
+        }
+        const retryChatId = makeChatId()
+        chatIdRef.current = retryChatId
+        contextStartRef.current = originalContextStart
+        latestAssistantText = ''
+        setMessages([
+          ...visibleConversation,
+          {
+            role: 'assistant',
+            content: CLEAN_CONTEXT_RECOVERY_NOTICE,
+            status: 'recovering',
+            revealResponse:makeChatId(),
+          },
+        ])
+
+        // The new session hydrates earlier messages as inert history. Only the
+        // current user message remains the active task in the legacy request.
+        attempt = await streamAttempt(retryChatId, [userMessage], fullHistory)
+        if (!isCurrentTurn()) return
+        if (attempt.kind === 'deleted') {
+          setInput(current => restoreUnsentDraft(current, exactDraft))
+          contextStartRef.current = originalContextStart
+          setMessages(messages)
+          setConversationDeleted(true)
+          setInterrupted(false)
+          updateRestoredActivity('idle')
+          return
+        }
+        if (attempt.kind === 'busy' || attempt.kind === 'held') {
+          if (attempt.kind === 'held') requestIdRef.current = null
+          contextStartRef.current = originalContextStart
+          setMessages(messages)
+          restoreDraft()
+          setRefusal(busyRefusalText(false))
+          return
+        }
+        if (attempt.kind === 'rejected') {
+          restoreDraft()
+          contextStartRef.current = originalContextStart
+          return
+        }
+        if (attempt.kind === 'switching') {
+          contextStartRef.current = originalContextStart
+          setMessages(messages)
+          restoreDraft()
+          setStatus('switching')
+          setStatusDetail(`${attempt.detail}. The clean-context request is preserved.`)
+          return
+        }
+        if (attempt.kind === 'adaptive') {
+          contextStartRef.current = originalContextStart
+          setMessages(messages)
+          restoreDraft()
+          setStatus('available')
+          setModelSupport(keepModelAdvisory)
+          return
+        }
+        if (!attempt.receivedError && attempt.receivedDone && attempt.recoveryEligible) {
+          setMessages(previous => replaceLastAssistant(previous, {
+            content: CLEAN_CONTEXT_RECOVERY_FAILED,
+            status: 'error',
+          }))
+          return
+        }
+        finishAttempt(attempt, true)
+        return
+      }
+
+      if(turnImages.length) {
+        if(attempt.receivedDone && !attempt.receivedError)images.clear()
+        else restoreDraft()
+      }
+      finishAttempt(attempt)
+    } catch (error) {
+      if (isCurrentTurn() && error?.name !== 'AbortError') {
+        const conversationChanged = error?.message === 'chat-recovery-conversation-changed'
+        const storageFailed = conversationChanged || error?.message === 'chat-recovery-storage-unavailable'
+        const historyTooLarge=error?.message==='history-request-too-large'
+        const requestRejected=error?.message==='chat-request-rejected'
+        const refused=error?.message==='chat unavailable'
+        // A lost connection is not yet a failure: the turn may have started,
+        // finished or been cut off by a restart. Keep what arrived and let
+        // the check that follows settle it.
+        const uncertain=!storageFailed && !historyTooLarge && !requestRejected && !refused
+        // A refusal may still have saved a receipt that explains it; check.
+        const recover=!storageFailed && !historyTooLarge && !requestRejected
+        setInterrupted(recover)
+        if (recover) updateRestoredActivity('checking')
+        if (!uncertain || turnImages.length) restoreDraft()
+        setMessages(previous => replaceLastAssistant(previous, uncertain ? {content:latestAssistantText, status:'unconfirmed'} : {
+          content: requestRejected?'Portal rejected the request format (HTTP 422). No task was started. Your draft is preserved. Refresh Portal before retrying.':historyTooLarge?'The encoded conversation exceeds the 8 MB request limit. No task was started. Export this conversation before starting a new chat.':conversationChanged ? 'This conversation changed in another tab. No task was started. Download a recovery copy, then reload to read the saved version.' : storageFailed ? 'Could not save the request for recovery. No task was started. Check browser storage and try again.' : 'Portal could not start this message. Your draft is kept; try sending it again.',
+          status: 'error',
+        }))
+      }
+    } finally {
+      // The stream may close as soon as the agent aborts while the Stop
+      // endpoint is still draining managed jobs. Keep this turn's identity
+      // until that bounded acknowledgement settles. A normal DONE already
+      // clears requestIdRef, so its successful answer still wins the race.
+      if (isCurrentTurn() && stopRequestRef.current?.settled) await stopRequestRef.current.settled
+      if (isCurrentTurn()) {
+        setSending(false)
+        setStopping(false)
+        setStopError('')
+        abortRef.current = null
+        void contextControl.refresh(true)
+      }
+    }
+  }, [input, messages, preview, workspaceOpen, sending, modelSwitching, status, restoredActive, restoredChecking, restoredUnconfirmed, updateRestoredActivity, teams.busy, teams.start,compactConversation,contextControl.busy,contextControl.historyUnknown,contextControl.refresh,startExtensionInstallation,startGithubExtensionRequest,images,imageModel,hasImageHistory,conversationDeleted])
+
+  const stopStreaming = useCallback(async () => {
+    const controller = abortRef.current
+    const chatId = chatIdRef.current
+    const requestId = requestIdRef.current
+    const restored = !controller && interrupted
+      && ['active', 'unknown'].includes(restoredActivityRef.current)
+    if ((!controller && !restored) || stopping || stopRequestRef.current) return
+
+    // Bound the acknowledgement independently of the live chat stream.
+    // A deadline is uncertainty, never permission to claim the task stopped.
+    const stopRequest = new AbortController()
+    let settleStop
+    stopRequest.settled = new Promise(resolve => { settleStop = resolve })
+    stopRequestRef.current = stopRequest
+    const timeout = setTimeout(() => stopRequest.abort(), 30000)
+    setStopping(true)
+    setStopError('')
+    try {
+      const response = await fetch('/api/pixel/chat/cancel', {
+        method: 'POST',
+        signal: stopRequest.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, ...(requestId ? { request_id: requestId } : {}) }),
+      })
+      let payload = null
+      if (typeof response?.json === 'function') {
+        try {
+          payload = await response.json()
+        } catch {
+          // The exact acknowledgement check below fails closed.
+        }
+      }
+      if (stopRequest.signal.aborted || !response?.ok || !payload || Object.keys(payload).length !== 1 || payload.aborted !== true) {
+        throw new Error('cancellation was not acknowledged')
+      }
+
+      // A normal terminal response may win the cancellation race. Do not
+      // rewrite that completed answer as owner-stopped.
+      if (stopRequestRef.current !== stopRequest || chatIdRef.current !== chatId || requestIdRef.current !== requestId || abortRef.current !== controller
+        || (restored && !['active', 'unknown'].includes(restoredActivityRef.current))) return
+      if (restored && requestId) {
+        // The observer's partial transcript can predate the sender's latest
+        // save. Settle the acknowledged request through retained-result
+        // recovery, which preserves that work and grants an exact handoff.
+        updateRestoredActivity('checking')
+        setActivityRefresh(value => value + 1)
+        return
+      }
+      controller?.abort()
+      abortRef.current = null
+      requestIdRef.current = null
+      // The live stream's own reply is the one stopped, whatever its last
+      // frame said. Without one, only a reply still unresolved is: a held
+      // chat's Stop ends older work, and its last reply may be finished.
+      setMessages(previous => controller || unsettledReply(previous.at(-1)) ? replaceLastAssistant(previous, {
+        content: stoppedContent(controller?.responseText?.() ?? previous.at(-1)?.content),
+        status: 'stopped',
+      }) : previous)
+      setSending(false)
+      setInterrupted(false)
+      updateRestoredActivity('terminal')
+    } catch {
+      // Keep the live stream attached and Stop retryable. Claiming success
+      // without an exact acknowledgement could leave tools or inference active.
+      if (stopRequestRef.current === stopRequest && chatIdRef.current === chatId && abortRef.current === controller) {
+        setStopError(restored
+          ? RESTORED_STOP_UNCONFIRMED
+          : 'Stop was not confirmed. Portal is still connected; retry Stop.')
+        if (restored) setActivityRefresh(value => value + 1)
+      }
+    } finally {
+      clearTimeout(timeout)
+      if (stopRequestRef.current === stopRequest) {
+        stopRequestRef.current = null
+        setStopping(false)
+      }
+      settleStop()
+    }
+  }, [stopping, interrupted, updateRestoredActivity])
+
+  // "Continue in this chat" is the one action offered when Portal cannot prove
+  // what happened to the last turn. It asks the server to stop anything left
+  // over in this chat and releases the hold only after the server confirms
+  // that nothing is running there.
+  const continueChat = useCallback(async () => {
+    if (!interrupted) { void contextControl.resolveInterrupted(); return }
+    if (continuing === 'pending' || sending || stopping) return
+    const chatId = chatIdRef.current
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30000)
+    setContinuing('pending')
+    try {
+      const response = await fetch('/api/pixel/chat/cancel', {
+        method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId }),
+      })
+      const payload = await response.json()
+      if (chatIdRef.current !== chatId) return
+      if (!response.ok || !payload || Object.keys(payload).length !== 1 || payload.aborted !== true) throw new Error('continue unconfirmed')
+      continueRequested.current = chatId
+      setContinuing('')
+      // The next check settles the turn at once and frees the composer.
+      setActivityRefresh(value => value + 1)
+    } catch {
+      if (chatIdRef.current === chatId) setContinuing('failed')
+    } finally {
+      clearTimeout(timeout)
+    }
+  }, [interrupted, continuing, sending, stopping, contextControl.resolveInterrupted, updateRestoredActivity])
+
+  // Settle, then send: the message a held chat refused goes out once the
+  // earlier turn is cleared up, while the composer still holds it unchanged.
+  useEffect(() => {
+    if (!heldSend || heldSendRef.current !== heldSend || interrupted || sending || stopping || status !== 'available'
+      || contextControl.historyUnknown || contextControl.busy) return
+    holdSend(null)
+    if (heldSend.chatId !== chatIdRef.current || Date.now() - heldSend.at > HELD_SEND_MAX_MS || input.trim() !== heldSend.text) return
+    automaticSendRef.current = true
+    void sendMessage()
+  }, [heldSend, interrupted, sending, stopping, status, contextControl.historyUnknown, contextControl.busy, input, sendMessage, holdSend])
+
+  // One live task streams into this page; see portalTaskState for why a new
+  // task waits for it. Every New task control shows this reason, never nothing.
+  const newTaskBlocked = newTaskBlockedReason({running:sending || restoredActive, stopping, checking:restoredChecking,
+    launching:teams.launching, compacting:contextControl.busy})
+  useEffect(() => { publishNewTaskBlocked(newTaskBlocked) }, [newTaskBlocked])
+  useEffect(() => () => publishNewTaskBlocked(''), [])
+
+  const startNewChat = useCallback((preserveDraft = false) => {
+    if (newTaskBlocked) { setStopError(newTaskBlocked); return }
+    setRefusal('')
+    holdSend(null)
+    setContinuing('')
+    continueRequested.current = null
+    setSendHint(false)
+    chatIdRef.current = makeChatId()
+    images.replace(chatIdRef.current)
+    requestIdRef.current = null
+    contextStartRef.current = 0
+    compactionRequestRef.current = null
+    setMessages([])
+    setPreview(null)
+    setWorkspaceOpen(false)
+    setPreviewRefresh(0)
+    setInput(preserveDraft === true ? input : '')
+    setConversationDeleted(false)
+    setInterrupted(false)
+    // A failed example open belongs to the task the owner just left.
+    setExampleError(null)
+    updateRestoredActivity('idle')
+    inputRef.current?.focus?.()
+  }, [newTaskBlocked, updateRestoredActivity, images.replace, input, holdSend])
+
+  useEffect(() => {
+    const remove = async event => {
+      const {chatId, complete} = event.detail
+      if(chatId===chatIdRef.current && teams.busy){complete('Stop the agent team before deleting this conversation.');return}
+      if (sending || restoredActive || restoredChecking || stopping || contextControl.busy) {
+        complete('Stop the current task before deleting a conversation.')
+        return
+      }
+      try {
+        const stored=readConversations().find(item=>item.chatId===chatId)
+        if(stored?.messages?.some(message=>message.teamId || message.teamRequestId)) {
+          const result=await teamRequest('list',{chat_id:chatId})
+          if(!Array.isArray(result.teams))throw new Error('Could not verify the team status before deleting this conversation.')
+          if(result.teams.some(team=>ACTIVE_TEAMS.has(team.status))){complete('Stop the agent team before deleting this conversation.');return}
+        }
+        await purgeConversationImages(chatId)
+        deleteConversation(chatId)
+        if (chatId === chatIdRef.current) startNewChat()
+        complete('')
+      } catch (error) { complete(error.message || 'Could not delete this conversation.') }
+    }
+    window.addEventListener(DELETE_EVENT, remove)
+    return () => window.removeEventListener(DELETE_EVENT, remove)
+  }, [sending, restoredActive, restoredChecking, stopping, startNewChat, teams.busy,contextControl.busy])
+
+  // Inserting only edits the draft, which stays editable while Portal works.
+  const insertComposerText = useCallback((text, { replace = false } = {}) => {
+    if (conversationDeleted) return
+    setInput(value => {
+      if (replace) return text
+      const mode=agentCommand(text)?'agents':goalCommand(text)?'goal':null
+      const task=(agentCommand(value) || goalCommand(value))?.task ?? (value==='/'?'':value)
+      return mode ? `/${mode} ${task}` : appendComposerText(value, text)
+    })
+    inputRef.current?.focus?.()
+  }, [conversationDeleted])
+
+  useEffect(() => {
+    window.addEventListener('ods:pixel-new-task', startNewChat)
+    return () => window.removeEventListener('ods:pixel-new-task', startNewChat)
+  }, [startNewChat])
+
+  // The sidebar's example list may have been checked before Portal was ready.
+  useEffect(() => {
+    if (status === 'available') window.dispatchEvent(new Event(EXAMPLE_REFRESH_EVENT))
+  }, [status])
+
+  // A shipped example project opens from the sidebar like a saved preview:
+  // the host publishes the owner's existing folder, this page checks the
+  // receipt exactly like one from a model run, and a new task shows it in
+  // the Workspace panel. No model runs and no message is sent.
+  const exampleOpen = useRef(null)
+  const exampleState = useRef(null)
+  exampleState.current = {busy: sending || restoredActive || restoredChecking || stopping || teams.launching || contextControl.busy, startNewChat}
+  useEffect(() => {
+    const busyText = 'Stop the current task before opening another project.'
+    const open = async event => {
+      const name = event.detail?.name
+      if (typeof name !== 'string') return
+      if (exampleState.current.busy) { setStopError(busyText); return }
+      exampleOpen.current?.abort()
+      const controller = exampleOpen.current = new AbortController()
+      const chatId = chatIdRef.current
+      setExampleError(null)
+      try {
+        const receipt = await openExampleProject(name, controller.signal)
+        const published = parseVerifiedPreviewFrame({choices:[{finish_reason:'stop'}], pixel:{schemaVersion:1, preview:receipt}})
+        if (!published || published.relativeDirectory !== `Playground/${name}`) throw Object.assign(new Error('Invalid example receipt'), {code:'unavailable'})
+        // The owner moved on (another click, chat or task) while it published.
+        if (controller.signal.aborted || chatIdRef.current !== chatId) return
+        if (exampleState.current.busy) { setStopError(busyText); return }
+        // Like switching conversations: an unsent draft stays with the
+        // conversation the owner left.
+        exampleState.current.startNewChat()
+        setPreview(published); setPreviewRefresh(0); setWorkspaceOpen(true); setPreviewCollapsed(false); setWorkspaceExpanded(false)
+      } catch (error) {
+        if (controller.signal.aborted) return
+        // The sidebar's list is stale in both cases: check it again.
+        if (error?.code === 'missing' || error?.code === 'not-playable') window.dispatchEvent(new Event(EXAMPLE_REFRESH_EVENT))
+        // A folder that is gone or changed is the owner's own doing: no help
+        // link. A preview that failed is a real failure.
+        setExampleError(error?.code === 'missing'
+          ? {text: `${name} is no longer in your Portal workspace, so it cannot open. If you renamed or moved it, ask Portal to open it by its new folder name.`}
+          : error?.code === 'not-playable'
+            ? {text: `Portal could not open ${name}: the Playground/${name} folder is still there, but its index.html is missing or ODS no longer recognizes it as the example it added. To check it, ask Portal: "Open Playground/${name}".`}
+            : error?.code === 'not-previewable'
+              ? {text: `Portal could not open ${name}: some files in Playground/${name} cannot be previewed. To fix them, ask Portal: "In ${name}, fix the preview".`, help: true}
+              : {text: `Portal could not open ${name}: its preview was not published. Check that Portal is ready, then click the project again.`, help: true})
+      } finally {
+        if (exampleOpen.current === controller) exampleOpen.current = null
+      }
+    }
+    window.addEventListener(EXAMPLE_OPEN_EVENT, open)
+    return () => { window.removeEventListener(EXAMPLE_OPEN_EVENT, open); exampleOpen.current?.abort() }
+  }, [])
+
+  useEffect(() => {
+    const select = event => {
+      if (sending || restoredActive || restoredChecking || stopping || teams.launching || contextControl.busy) {
+        setStopError('Stop the current task before switching conversations.')
+        return
+      }
+      const chat = loadStoredChat(readConversations().find(item => item.chatId === event.detail))
+      if (!chat || chat.chatId === chatIdRef.current) return
+      conversationWriter.current = createConversationWriter(chat.persistenceSnapshot)
+      hydrating.current = true; savedView.current = null; persistenceFailed.current = false
+      hydrationAction.current = chat.interrupted || chat.persistenceSnapshot.recoverySource ? 'activate' : 'normalize'
+      chatIdRef.current = chat.chatId
+      images.replace(chat.chatId,chat.draftImages)
+      shownTeamPublications.current = shownPublicationKeys(chat)
+      requestIdRef.current = chat.requestId
+      contextStartRef.current = chat.contextStart
+      compactionRequestRef.current = chat.compactionRequestId
+      setMessages(chat.messages)
+      setPreview(chat.preview)
+      setWorkspaceOpen(chat.workspaceOpen)
+      setPreviewRefresh(0)
+      setInput(chat.draft)
+      setStopError('')
+      setRefusal('')
+      holdSend(null)
+      setContinuing('')
+      continueRequested.current = null
+      setSendHint(false)
+      setExampleError(null)
+      setInterrupted(chat.interrupted)
+      setConversationDeleted(chat.conversationDeleted)
+      updateRestoredActivity(chat.interrupted ? 'checking' : 'idle')
+      // Two interrupted chats have identical flags; the ref-only identity
+      // change must still dispose the previous poll and check the new chat.
+      setActivityRefresh(value => value + 1)
+    }
+    window.addEventListener(SELECT_EVENT, select)
+    return () => window.removeEventListener(SELECT_EVENT, select)
+  }, [sending, restoredActive, restoredChecking, stopping, updateRestoredActivity, teams.launching,contextControl.busy,images.replace,holdSend])
+
+  const inputOver = input.length > MAX_INPUT_LEN
+  const inputEmpty = !(command?.task ?? goalDraft?.task ?? input).trim() && !images.items.length
+  const isDisabled = conversationDeleted || sending || modelSwitching || restoredActive || restoredChecking || stopping || teams.busy || contextControl.busy || contextControl.historyUnknown || status !== 'available'
+  // Typing never waits for Portal: while it works on this chat the draft stays
+  // editable and is saved with the chat. Only sending waits, and says why.
+  const composerLocked = conversationDeleted || modelSwitching || status !== 'available'
+  const sendBlocked = sendBlockedReason({deleted:conversationDeleted, stopping, running:sending || restoredActive || teams.busy,
+    held:restoredUnconfirmed || (contextControl.historyUnknown && !contextControl.historyChecking && !contextControl.historyActive),
+    waiting:restoredChecking || contextControl.busy || contextControl.historyUnknown || modelSwitching, ready:status === 'available'})
+  useEffect(() => { if (!sendBlocked) setSendHint(false) }, [sendBlocked])
+  const composerVisible = !(workspaceExpanded && workspaceOpen && !previewCollapsed)
+  const typeIntoComposer = useCallback((character, start, end) => setInput(value => {
+    const agent = agentCommand(value)
+    const goal = goalCommand(value)
+    const text = (agent || goal)?.task ?? value
+    const from = Math.max(0, Math.min(start ?? text.length, text.length))
+    const to = Math.max(from, Math.min(end ?? from, text.length))
+    const next = text.slice(0, from) + character + text.slice(to)
+    return agent ? `/agents ${next}` : goal ? `/goal ${next}` : next
+  }), [])
+  const prepareComposerSend = useComposerFocus({ inputRef, disabled: composerLocked, visible: composerVisible, onType: typeIntoComposer })
+  const sendFromComposer = () => {
+    prepareComposerSend()
+    if (sendBlocked) {
+      // Enter while Portal works is never a silent no-op: the draft stays.
+      if (!inputEmpty) setSendHint(true)
+      return
+    }
+    void sendMessage()
+  }
+  // Pictures cannot join a turn while one is in flight (its own pictures are
+  // still attached). A drop or paste then says so instead of doing nothing,
+  // and a dropped file never replaces the page.
+  const hasFiles = transfer => Array.from(transfer?.types || []).includes('Files')
+  const dropFiles = event => {
+    const files = Array.from(event.dataTransfer?.files || [])
+    if (!files.length) return
+    event.preventDefault()
+    if (isDisabled) { setStopError(ATTACH_BLOCKED); return }
+    images.choose(files)
+  }
+  const integrationCommand = [...messages].reverse().find(message => message.role === 'user')?.content
+  const {recovery: integrationRecovery, resume: resumeProjectIntegration} = useExtensionProjectIntegration({
+    chatId: chatIdRef.current,
+    installation: githubExtensionInstallation?.command === integrationCommand ? githubExtensionInstallation : extensionInstallation,
+    command: integrationCommand,
+    project: conversationProject({messages, preview})?.path,
+    idle: !isDisabled && !interrupted && !input.trim() && !abortRef.current && messages.at(-1)?.status === 'done',
+    sendMessage,
+  })
+  const workingElapsed = formatElapsed(workingElapsedSeconds)
+  const readinessView = pixelReadinessView(runtimeReadiness, status === 'available')
+  const statusLabel = contextControl.busy ? (contextControl.phase==='unknown'?'Checking context':'Compacting') : stopping
+    ? 'Stopping'
+    : teams.busy
+      ? (teams.teams[0]?.mode==='goal' ? 'Goal active' : 'Agent team')
+    : sending
+      ? 'Working'
+    : restoredActive
+      ? 'Working in this chat'
+    : restoredChecking
+      ? 'Checking last request'
+    : status === 'available'
+      ? (readinessView.attention ? 'Needs attention' : 'Available')
+      : status === 'switching'
+        ? 'Switching model...'
+      : status === 'unloaded'
+        ? 'Model unloaded'
+      : status === 'held'
+        ? 'Model transition pending'
+      : status === 'recovery'
+        ? 'Recovery required'
+      : status === 'model-recovery'
+        ? 'Model switch stopped'
+      : status === 'loading'
+        ? 'Connecting...'
+        : 'Degraded'
+  // One calm line beside the composer while the last turn is settled. Its one
+  // action, Continue in this chat, stops whatever is left over, so it appears
+  // only after a check found that Portal cannot tell: never while a check runs
+  // or while work is still running.
+  const turnHold = sending ? null : interrupted ? (
+    continuing === 'pending' ? {text:CONTINUING_TURN, busy:true}
+      : restoredActive ? {text:restoredReplyLive ? TURN_STILL_RUNNING : TURN_RUNNING_UNSEEN}
+      : restoredUnconfirmed ? {text:continuing === 'failed' ? CONTINUE_FAILED : TURN_UNCONFIRMED,
+        failed:continuing === 'failed', action:continueChat, disabled:stopping}
+      : {text:CHECKING_TURN, busy:true}
+  ) : contextControl.historyUnknown ? (
+    contextControl.resolving ? {text:contextControl.recoveryNotice || CONTINUING_TURN, busy:true}
+      // Here the page follows no turn of its own, so Stop sits in this line.
+      : contextControl.historyActive ? {text:contextControl.recoveryFailed ? STOP_UNCONFIRMED : CHAT_STILL_RUNNING,
+        busy:!contextControl.recoveryFailed, failed:contextControl.recoveryFailed,
+        action:contextControl.stopHistory, label:'Stop', disabled:!contextControl.canStop}
+      : contextControl.recoveryFailed ? {text:CONTINUE_FAILED, failed:true, action:continueChat, disabled:!contextControl.canResolve}
+      : contextControl.historyChecking ? {text:CHECKING_TURN, busy:true}
+      : {text:TURN_UNCONFIRMED, action:continueChat, disabled:!contextControl.canResolve}
+  ) : null
+  const heldNote = heldSend?.chatId === chatIdRef.current && turnHold ? HELD_SEND_NOTE : ''
+
+  // Native Windows Core has local model chat but no Pixel host runtime. The
+  // status API distinguishes that deliberate selection from a temporary
+  // Portal outage; give it a working first action without hiding recoverable
+  // Portal conversations on other installations.
+  if (status === 'unavailable' && statusDetail === 'Portal is not enabled') {
+    const chatService = (systemStatus?.services || []).find(service =>
+      service?.id === 'open-webui' && service?.status === 'healthy')
+    const chatHref = chatService ? serviceUrl(chatService) : null
+    return <div className="pixel-chat flex flex-col items-center justify-center px-6 text-theme-text">
+      <div className="max-w-lg rounded-2xl border border-theme-border bg-theme-card p-8 text-center">
+        <h1 className="text-2xl font-semibold">Local chat</h1>
+        <p className="mt-3 text-theme-text-muted">Chat with your local model in Open WebUI. Portal's owner agent is not enabled in this installation.</p>
+        {chatHref
+          ? <a className="mt-6 inline-flex rounded-xl bg-theme-accent px-5 py-3 font-medium text-zinc-950" href={chatHref}>Open local chat</a>
+          : <p className="mt-6 text-sm text-theme-text-muted" role="status">Local chat is not ready yet. Check service status in the Dashboard.</p>}
+        <p className="mt-5"><Link className="text-sm text-theme-accent-light underline" to="/dashboard">View Dashboard</Link></p>
+      </div>
+    </div>
+  }
+
+  return (
+    <div className="pixel-chat flex flex-col overflow-hidden text-theme-text">
+      <div className={`pixel-chat-preview-layout flex min-h-0 flex-1 flex-col lg:flex-row ${!composerVisible ? 'is-workspace-expanded' : ''}`}>
+        <div className="pixel-chat-column flex min-h-0 min-w-0 flex-1 flex-col" onDragOver={event=>{if(hasFiles(event.dataTransfer))event.preventDefault()}} onDrop={dropFiles}>
+      {persistenceError && <PixelConversationRecovery error={persistenceError} chatId={chatIdRef.current} messages={messages} draft={input}/>}
+      <header className="pixel-chat-header">
+        <div className="pixel-chat-identity">
+        <div className="flex h-9 w-9 items-center justify-center text-theme-accent-light">
+          <PixelMascot interactive activityKey={input} name={displayName} state={pixelHeaderPose({sending, stopping, restoredActive, restoredChecking, interrupted, restoredActivity, status, task:messages.at(-1)?.task})} />
+        </div>
+        <div className="min-w-0">
+          <h1 className="text-base font-semibold leading-tight truncate max-w-[40vw]" title={displayName}>{displayName}</h1>
+          <p className="text-[11px] text-theme-text-muted">Your local ODS owner agent</p>
+        </div>
+        <PortalAgentDock controller={teams} onOpen={openAgents}/>
+        </div>
+
+        <div className="pixel-chat-header-actions">
+          <button type="button" aria-label="Search Portal" title="Search conversations · Ctrl+K" className="pixel-metal-control p-2" onClick={() => window.dispatchEvent(new Event(OPEN_PIXEL_SEARCH))}><Search size={16}/></button>
+          <details className="pixel-chat-options"><summary aria-label="Chat options">•••</summary><div className="pixel-chat-options-menu">
+            <PixelConversationImport key={chatIdRef.current} disabled={sending || restoredActive || restoredChecking || stopping || contextControl.busy} onImport={record => {
+              if (sending || restoredActive || restoredChecking || stopping || contextControl.busy) throw new Error('Active task')
+              if (pendingImport.current?.record !== record) pendingImport.current = {record, chatId:makeChatId()}
+              const imported = {...record, chatId:pendingImport.current.chatId}
+              saveConversation(imported)
+              pendingImport.current = null
+              window.dispatchEvent(new CustomEvent(SELECT_EVENT, {detail:imported.chatId}))
+            }}/>
+            <label className="block p-2 text-xs">Send shortcut<select className="mt-1 block w-full rounded border border-theme-border bg-theme-bg p-2" aria-label="Send shortcut" value={sendKey.mode} onChange={event => sendKey.change(event.target.value)}><option value="enter">Enter to send</option><option value="mod-enter">Ctrl/⌘+Enter to send</option></select></label>
+            {sendKey.error && <p role="alert" className="p-2 text-xs">{sendKey.error}</p>}
+
+            <PixelTurnNavigation messages={messages} onNavigate={index => {
+              const row = scrollRef.current?.parentElement?.querySelector(`[data-pixel-message-index="${index}"]`)
+              row?.scrollIntoView?.({block:'start', behavior:'auto'})
+              row?.focus?.({preventScroll:true})
+            }}/>
+            <PixelHandoffApproval label="Approvals" />
+            <details className="pixel-chat-options-advanced"><summary>Advanced tools</summary><div>
+              <PortalRuntimeIdentity identity={runtimeIdentity} runtime={agentRuntime} />
+              <PixelAdvice canInsert={!sending && !contextControl.busy} onInsert={text => setInput(current => current ? `${current}\n\n${text}` : text)} />
+              <PixelProviderScopes chatId={chatIdRef.current} sending={sending} />
+            </div></details>
+          </div></details>
+          <button type="button" aria-label="Workspace" aria-expanded={workspaceOpen} onClick={() => { setWorkspaceOpen(value => !value); setPreviewCollapsed(false) }} className="inline-flex items-center gap-1.5 bg-transparent px-2.5 py-1.5 text-xs text-theme-text-secondary hover:text-theme-text">
+            <PanelRightOpen size={14}/><span>Workspace</span>
+          </button>
+          {messages.length > 0 && (
+            <button
+              type="button"
+              onClick={startNewChat}
+              aria-disabled={newTaskBlocked ? 'true' : undefined}
+              className="inline-flex items-center gap-1.5 rounded-none border-0 bg-transparent px-2.5 py-1.5 text-xs font-medium text-theme-text-secondary transition hover:text-theme-text aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+              title={newTaskBlocked || 'Start a new chat'}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">New chat</span>
+            </button>
+          )}
+          <span
+            aria-live="polite"
+            title={modelSupport?.detail || undefined}
+            className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${
+            sending
+              ? 'text-theme-accent-light'
+              : 'text-theme-text-secondary'
+          }`}
+          >
+            {sending || status === 'loading' || status === 'switching' ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+            )}
+            {statusLabel}
+            {sending && <span className="font-mono text-[10px] opacity-80">{workingElapsed}</span>}
+          </span>
+        </div>
+      </header>
+      {/* The Verify hint comes and goes with each reply and is a separate
+          problem from what this alert reports (changed runtime files, say), so
+          it never hides the alert. Restore Sandbox explains the same unfinished
+          change the alert would name, so it stands in for it. */}
+      {status === 'available' && portalRecoveryAction(status, statusRecovery) !== 'restore-sandbox' && <PortalReadiness readiness={runtimeReadiness} />}
+      <ModelActivationNotice value={modelActivation} pending={status === 'switching'} available={status === 'available'} portal onRefresh={()=>setModelStatusRefresh(value=>value+1)}/>
+      {status === 'held' && <p role="status" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">{statusDetail}</p>}
+      <PortalRecovery status={status} action={statusRecovery} detail={statusDetail} update={statusUpdates} onSettled={()=>setModelStatusRefresh(value=>value+1)}/>
+      {status === 'available' && modelSupport && (
+        <p role="status" aria-label="Model capability" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">
+          {modelSupport.detail}
+          {/* An advisory informs; it never disables sending. */}
+          {modelSupport.reason && <>
+            {' '}<Link className="text-theme-accent-light underline" to="/models">Switch model</Link>
+            {' '}<HelpLink />
+          </>}
+        </p>
+      )}
+      <div role="region" aria-label="Conversation messages" tabIndex={-1} onScroll={chatScroll.onScroll} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5 sm:px-6">
+        {conversationDeleted && <div role="status" className="mx-auto w-full max-w-5xl rounded-xl border border-theme-border px-4 py-3 text-sm">
+          This conversation is being deleted or was deleted. No task was started. Your draft and saved history are preserved.
+          <button type="button" className="ml-2 underline" disabled={sending || restoredActive || restoredChecking || stopping || teams.busy || contextControl.busy}
+            onClick={() => startNewChat(true)}>New chat with draft</button>
+          {(images.items.length > 0 || hasImageHistory) && <p>Attachments will not be copied. Reattach the original files in the new chat.</p>}
+        </div>}
+        {status === 'loading' && messages.length === 0 && (
+          <div className="flex h-full flex-col items-center justify-center text-theme-text-muted">
+            <Loader2 className="mb-3 h-8 w-8 animate-spin" />
+            <p>Connecting to {displayName}...</p>
+          </div>
+        )}
+        {status === 'unavailable' && messages.length === 0 && (
+          <div className="pixel-welcome mx-auto text-theme-text-muted">
+            <PixelMascot className="pixel-welcome-character" />
+            <h2>What do you want to work on?</h2>
+            <p className="pixel-welcome-description">Start a private task, explore an idea, or create something new.</p>
+            <div className="pixel-offline-notice" role="status">
+            <p className="font-medium text-theme-text">{displayName} is currently unavailable</p>
+            {statusDetail && <p className="mt-1 text-sm">{statusDetail}</p>}
+            <p className="mt-4 text-xs">Your other ODS applications remain available while the agent reconnects.</p>
+            </div>
+          </div>
+        )}
+        {status === 'available' && messages.length === 0 && (
+          <div className="pixel-welcome mx-auto text-theme-text-muted">
+            <div>
+              <PixelMascot interactive activityKey={input} name={displayName} className="pixel-welcome-character" />
+              <h2>What do you want to work on?</h2>
+              <p className="pixel-welcome-description">Start a private task, explore an idea, or create something new.</p>
+            </div>
+
+
+          </div>
+        )}
+        {messages.map((message, index) => {
+          if (isQuestionAnswer(messages,index)) return null
+          const publicationContent=message.role==='assistant' ? publicationDisplayText(message.content,message.publication) : message.content
+          const displayedContent=message.role==='assistant' && message.status==='done'
+            ? deliveredArtifactDisplayText(publicationContent,message.artifacts) : publicationContent
+          // Embeds Portal can't display are left out; a reply of only embeds gets
+          // a note unless a preview card or delivered files show, or the chat
+          // already shows each preview it names. Copy keeps the reply's own text.
+          const shownContent=message.role==='assistant'
+            ? embedDisplayText(displayedContent,{streaming:message.status==='streaming',
+              shown:Boolean(message.publication || deliveredArtifactMetadata(message).artifacts),
+              shownSite:siteId=>siteId===preview?.siteId || messages.some(item=>item.publication?.siteId===siteId)}) : displayedContent
+          return (
+          <div key={index} data-pixel-message-index={index} tabIndex={-1} data-pixel-response={message.role === 'assistant' ? '' : undefined} className={`mx-auto flex min-w-0 w-full max-w-5xl ${message.role === 'user' ? 'justify-end gap-2' : 'justify-start'}`}>
+            {message.role === 'assistant' && <PixelMascot state={pixelReplyPose(message, sending && index === messages.length - 1)} settled={message.status !== 'streaming'} className="pixel-reply-character" />}
+            <div className={`min-w-0 max-w-[min(85%,48rem)] text-sm leading-6 [overflow-wrap:anywhere] ${message.publication ? 'portal-publication-response' : ''} ${message.role === 'user' ? 'rounded-[14px] px-3.5 py-2' : 'rounded-2xl px-4 py-3'} ${
+              message.role === 'user'
+                ? 'bg-theme-card text-theme-text'
+                : message.status === 'error'
+                  ? 'bg-transparent text-theme-text-secondary'
+                  : message.status === 'stopped'
+                    ? 'pixel-stopped-response bg-transparent text-theme-text-secondary'
+                  : 'bg-transparent text-theme-text-secondary'
+            }`}>
+              {message.status === 'stopped' && (
+                <div role="status" className="mb-2 inline-flex items-center gap-2 text-xs font-medium text-theme-text-muted">
+                  <Square className="h-3 w-3" />
+                  Response stopped
+                </div>
+              )}
+              {message.recovered && (
+                <div role="status" className="mb-2 inline-flex items-center gap-1.5 text-xs font-medium text-emerald-300">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Recovered with a clean context
+                </div>
+              )}
+              {message.role === 'assistant' && <PortalGoalPlan task={message.task} active={message.status==='streaming'} disabled={isDisabled || sending || restoredActive || restoredChecking} onResume={index===messages.length-1 && !message.questions ? ()=>sendMessage(continueGoal(messages,index)) : undefined}/>}
+              {message.role === 'assistant' && <PortalAgentActivity task={message.task} active={message.status === 'streaming'} status={message.status}/> }
+              {message.role === 'assistant' && index === messages.length - 1 && messages[index - 1]?.role === 'user' &&
+                <PortalExtensionProgress key={`extension-progress/${chatIdRef.current}/${index}`}
+                  command={githubExtensionInstallation?.command || messages[index - 1].content} active={message.status === 'streaming'}
+                  installation={githubExtensionInstallation || extensionInstallation}
+                  onRecheckInstallation={githubExtensionInstallation ? resumeGithubExtensionInstallation : resumeExtensionInstallation}
+                  onRecheckGithubObservation={githubExtensionInstallation ? resumeGithubExtensionInstallation : undefined}
+                  onStopInstallation={githubExtensionInstallation ? stopGithubExtensionInstallation : stopExtensionInstallation}
+                  projectPath={conversationProject({messages, preview})?.path}/>}
+              {message.role === 'assistant' && index === messages.length - 1 && integrationRecovery &&
+                <section className="portal-extension-progress" aria-label="Project integration recovery">
+                  <p role="status">{integrationRecovery.error || `Integration of @${integrationRecovery.target} into ${integrationRecovery.project} is pending.`}</p>
+                  <button type="button" disabled={isDisabled || Boolean(input.trim()) || integrationRecovery.checking}
+                    onClick={resumeProjectIntegration}>{integrationRecovery.checking ? 'Checking readiness…' : 'Continue integration'}</button>
+                </section>}
+              {message.role === 'assistant' && message.status === 'done' && index === messages.length - 1 &&
+                messages[index - 1]?.role === 'user' && <PortalExtensionSetup key={`${chatIdRef.current}/${index}`}
+                  command={githubExtensionInstallation?.command || messages[index - 1].content} disabled={isDisabled || sending || restoredActive || restoredChecking}
+                  installation={githubExtensionInstallation}
+                  onConfigured={() => githubExtensionInstallation
+                    ? resumeGithubExtensionInstallation() : sendMessage(messages[index - 1].content)}/>}
+              {message.role==='user' && <PortalConversationImages chatId={chatIdRef.current} images={message.images}/>}
+              {message.role === 'assistant' && message.status === 'done' && <PortalDeliveredArtifacts key={`delivered-files/${chatIdRef.current}/${index}`} artifacts={message.artifacts} />}
+              {message.role === 'assistant' && message.content ? (
+                <>
+                  {message.publication && <PixelSnapshotChanges preview={message.publication} before={message.beforePublication} variant="summary" onPreview={()=>openPublication(message.publication,'preview')} onReview={path=>openPublication(message.publication,'review',path)}/>}
+                  {!message.questions && (shownContent || message.status==='streaming') && (message.status==='error' ? <PortalResponseError content={shownContent}/> : <PortalStreamingText key={message.revealResponse || chatIdRef.current} active={message.status==='streaming'} animate={Boolean(message.revealResponse) || message.status==='streaming'} instant={['stopped','recovering','unconfirmed'].includes(message.status)} onReveal={chatScroll.onContentResize} components={MARKDOWN_COMPONENTS} artifacts={message.role==='assistant' && message.status==='done' ? message.artifacts : null}>{shownContent}</PortalStreamingText>)}
+                  <OperationsApprovalCard content={message.content} />
+                  {!message.questions && message.status!=='streaming' && <PortalResponseActions content={displayedContent}/>}
+                </>
+              ) : (
+                <span className="break-words whitespace-pre-wrap">{message.content}</span>
+              )}
+              {message.role === 'assistant' && message.questions && <PixelQuestions questions={message.questions} answers={message.questionDraft} answered={index<messages.length-1} disabled={message.goalMode ? message.goalState!=='waiting' : isDisabled || sending || restoredActive || restoredChecking} onChange={questionDraft=>setMessages(previous=>previous.map((item,i)=>i===index?{...item,questionDraft}:item))} onSubmit={answer=>message.goalMode ? teams.answer(message.teamId,'0',message.questionDraft) : sendMessage(message.task?.goal ? continueGoal(messages,index,answer) : answer)}/>}
+              {message.role === 'assistant' && message.status !== 'streaming' && <PortalTurnUndo key={`turn-undo/${chatIdRef.current}/${message.task?.runId}`} chatId={chatIdRef.current} entries={turnUndo.forRun(message.task?.runId)} busy={turnUndoBusy} onChanged={turnUndo.refresh}/>}
+              {message.goalMode && message.goalNotice && <p role="status" className="mt-3 text-xs text-theme-text-secondary">{message.goalNotice}</p>}
+              {message.teamId && !(message.goalMode && ACTIVE_TEAMS.has(message.goalState)) && <button type="button" onClick={()=>openAgents({teamId:message.teamId,agentId:'0'})} className={message.goalMode?"mt-3 border-0 bg-transparent px-0 py-2 text-xs hover:underline":"mt-3 rounded-lg border border-theme-border px-3 py-2 text-xs hover:bg-theme-border/30"}>{message.goalMode?'View goal history':'View agents and conversations'}</button>}
+
+            </div>
+            {message.role === 'user' && <UserAvatar profile={profile} className="pixel-user-character"/>}
+          </div>
+        )})}
+        <div ref={scrollRef} />
+      </div>
+
+      <div className="pixel-composer px-4 py-3 sm:px-6">
+        {chatScroll.showLatest && <div className="mb-2 text-center"><button type="button" onClick={chatScroll.jumpToLatest} className="portal-jump-latest">Jump to latest</button></div>}
+        <div className={`portal-glass-composer mx-auto max-w-5xl ${messages.length===0 ? 'portal-neon-prompt' : ''}`}>
+          <PortalImageAttachments attachments={images} chatId={chatIdRef.current} disabled={isDisabled} hasHistory={hasImageHistory} model={imageModel} onRefresh={()=>void contextControl.refresh(true)}/>
+          {command && <div className="mb-2 flex flex-wrap items-center gap-2 rounded-xl bg-theme-card/70 px-3 py-2 text-xs text-theme-text-secondary" role="group" aria-label="Agent team mode"><span className="font-medium text-theme-text">Agent team</span><span>Describe your task. Portal will choose the team.</span><button type="button" disabled={isDisabled} onClick={()=>setInput(command.task)} className="ml-auto whitespace-nowrap rounded px-2 py-1 hover:bg-theme-border/30">Exit team mode</button></div>}
+          {goalDraft && <div className="portal-goal-mode" role="group" aria-label="Goal mode"><span>Goal</span><small>Describe the outcome. Portal will plan, work and check its progress.</small><button type="button" disabled={isDisabled} onClick={()=>setInput(goalDraft.task)}>Exit goal mode</button></div>}
+          {teams.error && <p role="alert" className="text-xs text-theme-text-secondary">{teams.error}</p>}
+          <div className="pixel-composer-row">
+          <textarea
+            ref={inputRef}
+            value={command ? command.task : goalDraft ? goalDraft.task : input}
+            onChange={(event) => setInput(command ? `/agents ${event.target.value}` : goalDraft ? `/goal ${event.target.value}` : event.target.value)}
+            onPaste={event=>{
+              const files=Array.from(event.clipboardData?.items || []).filter(item=>item.kind==='file').map(item=>item.getAsFile()).filter(Boolean)
+              if(!files.length)return
+              // Pasted text still lands; only the picture waits, and says so.
+              if(isDisabled){setStopError(ATTACH_BLOCKED);return}
+              event.preventDefault();images.choose(files)
+            }}
+            onKeyDown={(event) => {
+              if (shouldSendMessage(event, sendKey.mode)) {
+                event.preventDefault()
+                sendFromComposer()
+              }
+            }}
+            placeholder={modelSwitching ? 'Switching model…' : status === 'available'
+              ? `Message ${displayName}...`
+              : status === 'switching'
+                ? 'Waiting for model switch...'
+                : status === 'unloaded'
+                  ? 'Messages are held until the model is resumed'
+                : status === 'held'
+                  ? 'Messages are held during a model transition'
+                : status === 'recovery'
+                  ? 'Messages are held until Portal recovery'
+                : `${displayName} is unavailable`}
+            disabled={composerLocked}
+            rows={1}
+            className={`pixel-composer-input min-h-11 flex-1 resize-none rounded-xl border bg-theme-card px-4 py-2.5 text-sm text-theme-text outline-none transition placeholder:text-theme-text-muted/70 disabled:opacity-50 ${
+              inputOver ? 'border-red-400' : 'border-theme-border'
+            }`}
+          />
+          <div className="pixel-composer-actions">
+          <PixelDictation disabled={isDisabled} conversationId={chatIdRef.current} input={input} limit={MAX_INPUT_LEN} onInsert={insertComposerText}/>
+          {teams.busy && teams.teams[0] ? <button type="button" onClick={()=>teams.teams[0].mode==='goal'?teams.stop(teams.teams[0].id):openAgents({teamId:teams.teams[0].id,agentId:'0'})} title={teams.teams[0].mode==='goal'?'Stop goal':'View active agent team'} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border-0 text-theme-text"><Square size={16}/></button> : sending || restoredActive ? (
+            <button
+              onClick={stopStreaming}
+              disabled={stopping}
+              className="inline-flex h-11 w-11 items-center justify-center rounded-xl border-0 bg-theme-surface text-theme-text transition hover:bg-theme-surface-hover disabled:cursor-wait disabled:opacity-70"
+              title={stopping ? 'Stopping' : 'Stop'}
+            >
+              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+            </button>
+          ) : (
+            <button
+              onClick={sendFromComposer}
+              disabled={isDisabled || restoredUnconfirmed || inputOver || inputEmpty || images.busy}
+              className="inline-flex h-11 w-11 items-center justify-center rounded-xl bg-theme-accent text-white transition hover:bg-theme-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+              title="Send"
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          )}
+          </div>
+          </div>
+          {stopError && <p role="alert" className="mt-1.5 px-1 text-xs text-theme-text-secondary">{stopError}</p>}
+          {sendHint && sendBlocked && <p role="status" className="mt-1.5 px-1 text-xs text-theme-text-secondary">{sendBlocked}</p>}
+          {refusal && !inputEmpty && <div className="portal-context-status" role="status" aria-label="Message not started">
+            <span>{refusal}</span>
+            <button type="button" onClick={sendFromComposer}>Send again</button>
+          </div>}
+          {exampleError && <p role="alert" className="mt-1.5 px-1 text-xs text-theme-text-secondary">{exampleError.text}{exampleError.help && <> <HelpLink /></>}</p>}
+          {turnHold && <div className="portal-context-status" role="status" aria-label="Last message">
+            {turnHold.busy && <Loader2 size={13} className="animate-spin" aria-hidden="true"/>}
+            <span>{turnHold.text}{heldNote}</span>
+            {turnHold.action && <button type="button" className="portal-context-action" disabled={turnHold.disabled} onClick={()=>void turnHold.action()}>{turnHold.label || 'Continue in this chat'}</button>}
+            {turnHold.failed && <HelpLink />}
+          </div>}
+          {contextControl.notice && <div className="portal-context-status" role={contextControl.phase==='failed'?'alert':'status'}>
+            {contextControl.busy && contextControl.phase!=='unknown' && <Loader2 size={13} className="animate-spin" aria-hidden="true"/>}
+            <span>{contextControl.notice}</span>
+            {['unknown','unavailable'].includes(contextControl.phase) && <button type="button" onClick={compactConversation}>Retry request</button>}
+          </div>}
+          <div className="pixel-composer-secondary">
+            <PixelComposerTools input={input} disabled={isDisabled} onInsert={insertComposerText} onCompact={compactConversation}>
+              <PixelTextFileInput key={`file-input-${chatIdRef.current}`} conversationId={chatIdRef.current} input={input} disabled={isDisabled} limit={MAX_INPUT_LEN} onInsert={insertComposerText}/>
+              <PortalImagePicker disabled={isDisabled} onChoose={images.choose}/>
+              <PixelDraftPreview key={`draft-preview-${chatIdRef.current}`} input={command?.task ?? goalDraft?.task ?? input}/>
+            </PixelComposerTools>
+            <div className="pixel-composer-limits">
+              <PortalModelSelector activeModel={activeModel} runtimeSource={agentRuntime?.source} availability={status} displayScope={chatIdRef.current} runtimeFingerprint={agentRuntime?.routeFingerprint} runtimeObservation={agentRuntime} busy={sending || restoredActive || restoredChecking || stopping || teams.busy || contextControl.busy || status!=='available'} onSwitchingChange={setModelSwitching} onSettled={()=>setModelStatusRefresh(value=>value+1)}/>
+              <PortalContextRing capacityLabel={activeContext} context={contextControl.context} capacity={contextControl.observedCapacity || agentRuntime?.contextLength} pending={sending || restoredActive || contextControl.busy} onRefresh={()=>void contextControl.refresh()}/>
+            </div>
+          </div>
+          <div className="mt-1.5 flex items-center justify-between gap-3 px-1 text-[10px] text-theme-text-muted/70">
+            <span>{stopping ? 'Waiting for exact cancellation acknowledgement' : restoredActive ? 'Stop ends only the work in this chat.' : sending ? `${displayName} is using the active ODS model and tools · ${workingElapsed} elapsed` : sendKey.mode === 'mod-enter' ? 'Ctrl/⌘+Enter to send • Enter for a new line' : 'Enter to send • Shift+Enter for a new line'}</span>
+          </div>
+        </div>
+        {inputOver && (
+          <p className="mx-auto mt-1 max-w-5xl px-1 text-xs text-red-400">
+            Message too long (max {MAX_INPUT_LEN.toLocaleString()} characters)
+          </p>
+        )}
+      </div>
+        </div>
+
+        <PixelCommandSearch onInsert={insertComposerText} onNewTask={startNewChat}/>
+        <PixelSelectionActions disabled={isDisabled} conversationId={chatIdRef.current} onInsert={insertComposerText}/>
+        {workspaceOpen && (
+          <aside aria-label="Preview panel" style={{'--preview-width':`${previewWidth}px`}} className={`pixel-preview-panel ${previewCollapsed ? 'is-collapsed' : ''} flex shrink-0 flex-col border-theme-border bg-theme-bg`}>
+            {!previewCollapsed && <PanelResizeHandle width={previewWidth} onResize={setPreviewWidth} label="Resize preview panel" container=".pixel-chat-preview-layout" minimum={240} />}
+            <PortalWorkspace key={chatIdRef.current} preview={currentPreview} access={previewAccess}
+              task={[...messages].reverse().find(message=>message.role==='assistant')?.task} working={sending || restoredActive}
+              agents={teams} renderApproval={content=><OperationsApprovalCard content={content}/>}
+              before={[...messages].reverse().find(message=>message.publication?.siteId===currentPreview?.siteId)?.beforePublication || null}
+              title={`Interactive ${displayName} preview`} request={workspaceRequest?.chatId===chatIdRef.current?workspaceRequest:null} onRequestHandled={handleWorkspaceRequest} refresh={previewRefresh}
+              onRefresh={()=>setPreviewRefresh(value=>value+1)}
+              collapsed={previewCollapsed} onCollapse={()=>setPreviewCollapsed(value=>!value)}
+              expanded={workspaceExpanded} onExpand={()=>setWorkspaceExpanded(value=>!value)}
+              onClose={()=>{setWorkspaceOpen(false);setWorkspaceExpanded(false)}}
+              onPublish={isDisabled?undefined:()=>{setWorkspaceExpanded(false);insertComposerText('Publish the site you created in this conversation to the ODS preview. Inspect the existing files, preserve the project, and use pixel_ods_workspace_preview for the folder that contains index.html.')}}/>
+
+          </aside>
+        )}
+      </div>
+    </div>
+  )
+}

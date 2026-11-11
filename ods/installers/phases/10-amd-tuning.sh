@@ -7,7 +7,7 @@
 #
 # Expects: GPU_BACKEND, DRY_RUN, INSTALL_DIR, LOG_FILE, PKG_MANAGER,
 #           ai(), ai_ok(), ai_warn(), log()
-# Provides: System tuning applied (sysctl, modprobe, timers, tuned)
+# Provides: System tuning applied (sysctl, modprobe, tuned)
 #
 # Modder notes:
 #   Add new AMD-specific tuning parameters or kernel options here.
@@ -16,7 +16,6 @@
 ods_progress 70 "amd-tuning" "Tuning AMD GPU settings"
 if [[ "$GPU_BACKEND" == "amd" ]] && $DRY_RUN; then
     log "[DRY RUN] Would apply AMD APU system tuning:"
-    log "[DRY RUN]   - Install systemd user timers (session cleanup, memory shepherd)"
     log "[DRY RUN]   - Apply sysctl tuning (swappiness=10, vfs_cache_pressure=50)"
     log "[DRY RUN]   - Install amdgpu modprobe options"
     log "[DRY RUN]   - Install GTT memory optimization"
@@ -24,30 +23,35 @@ if [[ "$GPU_BACKEND" == "amd" ]] && $DRY_RUN; then
 elif [[ "$GPU_BACKEND" == "amd" ]] && ! $DRY_RUN; then
     ai "Applying system tuning for AMD APU..."
 
+    _phase10_privileged() {
+        ods_sudo_available || return 1
+        ods_sudo "$@"
+    }
+
     # Ensure user is in render and video groups for ROCm GPU access
     # Without these, containers can't access /dev/kfd and /dev/dri
     if ! groups "$USER" 2>/dev/null | grep -qw render || ! groups "$USER" 2>/dev/null | grep -qw video; then
-        if [[ "${INTERACTIVE:-true}" == "true" ]]; then
-            sudo usermod -aG render,video "$USER" && \
-                ai_ok "Added $USER to render and video groups (needed for GPU access)" || \
-                ai_warn "Could not add $USER to render/video groups. Run: sudo usermod -aG render,video $USER"
-        else
-            sudo -n usermod -aG render,video "$USER" 2>/dev/null && \
-                ai_ok "Added $USER to render and video groups (needed for GPU access)" || \
-                ai_warn "Could not add $USER to render/video groups. Run: sudo usermod -aG render,video $USER"
-        fi
+        _phase10_privileged usermod -aG render,video "$USER" 2>/dev/null && \
+            ai_ok "Added $USER to render and video groups (needed for GPU access)" || \
+            ai_warn "Could not add $USER to render/video groups. Run: sudo usermod -aG render,video $USER"
     fi
 
-    # Verify GPU compute devices exist — containers need /dev/kfd and /dev/dri
+    # Verify GPU devices. The default Vulkan llama-server needs only /dev/dri.
+    # /dev/kfd is the ROCm compute device: the ROCm llama-server image
+    # (AMD_INFERENCE_BACKEND=rocm) and ComfyUI's AMD image need it.
     if [[ ! -e /dev/kfd ]]; then
         ai "ROCm compute device /dev/kfd not found. Loading kernel module..."
-        sudo -n modprobe amdkfd 2>/dev/null || true
+        # A failed modprobe is reported by the /dev/kfd check right below.
+        _phase10_privileged modprobe amdkfd 2>/dev/null || true
         if [[ -e /dev/kfd ]]; then
             ai_ok "/dev/kfd loaded successfully"
-        else
+        elif [[ "${AMD_INFERENCE_BACKEND:-vulkan}" == "rocm" ]]; then
             ai_warn "/dev/kfd still not available after modprobe."
-            ai_warn "GPU containers (llama-server, comfyui) will fail without it."
-            ai_warn "Fix: reboot, or run: sudo modprobe amdkfd"
+            ai_warn "The ROCm llama-server (AMD_INFERENCE_BACKEND=rocm) and ComfyUI will fail without it."
+            ai_warn "Fix: reboot, or run: sudo modprobe amdkfd. The Vulkan image (AMD_INFERENCE_BACKEND=vulkan) does not need it."
+        else
+            ai_warn "/dev/kfd still not available after modprobe. The Vulkan llama-server does not need it; ComfyUI on AMD does."
+            ai_warn "Fix for ComfyUI: reboot, or run: sudo modprobe amdkfd"
         fi
     fi
 
@@ -57,53 +61,62 @@ elif [[ "$GPU_BACKEND" == "amd" ]] && ! $DRY_RUN; then
     elif [[ ! -e /dev/dri/renderD128 ]]; then
         ai_warn "/dev/dri exists but renderD128 is missing. GPU compute may not work."
         ai_warn "Check: ls -la /dev/dri/ — you need at least card0/card1 and renderD128."
-    else
+    elif [[ -e /dev/kfd ]]; then
         ai_ok "GPU devices verified (/dev/kfd, /dev/dri/renderD128)"
+    else
+        ai_ok "GPU render node verified (/dev/dri/renderD128)"
     fi
 
-    # Management scripts and Memory Shepherd already copied by rsync/cp block above
-    [[ -d "$INSTALL_DIR/memory-shepherd" ]] && ai_ok "Memory Shepherd installed"
-
-    # ── Install systemd user timers (session cleanup, session manager, memory shepherd) ──
-    ai "Installing maintenance timers..."
-    SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$SYSTEMD_USER_DIR"
-
-    # Ensure scripts are executable
-    chmod +x "$INSTALL_DIR/scripts/session-cleanup.sh" \
-             "$INSTALL_DIR/memory-shepherd/memory-shepherd.sh" 2>/dev/null || true
-
-    # Copy user-level systemd units/timers. Skip root/system units and units
-    # rendered with path substitutions (__INSTALL_DIR__ etc.) elsewhere.
-    if [[ -d "$INSTALL_DIR/scripts/systemd" ]]; then
-        for _unit in "$INSTALL_DIR/scripts/systemd"/*.service "$INSTALL_DIR/scripts/systemd"/*.timer; do
-            [[ -f "$_unit" ]] || continue
-            case "$(basename "$_unit")" in
-                ods-host-agent.service|ods-ap-mode.service) continue ;;
-            esac
-            cp "$_unit" "$SYSTEMD_USER_DIR/" 2>/dev/null || true
-        done
+    # This phase no longer installs user maintenance timers. They served only
+    # the removed legacy OpenClaw extension: its session-cleanup timer pruned
+    # that agent's sessions, and the memory-shepherd timers reset its
+    # workspace files. Memory Shepherd itself stays available under
+    # memory-shepherd/ (its install.sh schedules it for other agents).
+    #
+    # Retire the session-cleanup units an earlier install copied into the user
+    # scope; their script and unit files are no longer shipped. A unit is
+    # removed only while it still carries the shipped definition, because an
+    # owner may have reused the name. Existing memory-shepherd timers are left
+    # as configured, and data/openclaw stays.
+    _phase10_user_units="$HOME/.config/systemd/user"
+    _phase10_cleanup_timer="$_phase10_user_units/openclaw-session-cleanup.timer"
+    _phase10_cleanup_service="$_phase10_user_units/openclaw-session-cleanup.service"
+    _phase10_retired=false
+    if [[ -f "$_phase10_cleanup_timer" && ! -L "$_phase10_cleanup_timer" ]] \
+        && grep -qx 'Description=OpenClaw Session Cleanup Timer' "$_phase10_cleanup_timer"; then
+        # A user manager that is not running cannot stop the timer, but
+        # deleting the unit and its enablement link keeps it from starting.
+        ods_systemctl_user disable --now openclaw-session-cleanup.timer >> "$LOG_FILE" 2>&1 \
+            || log "Could not stop openclaw-session-cleanup.timer (non-fatal); removing its unit files"
+        rm -f "$_phase10_cleanup_timer" \
+            "$_phase10_user_units/timers.target.wants/openclaw-session-cleanup.timer"
+        _phase10_retired=true
     fi
+    if [[ -f "$_phase10_cleanup_service" && ! -L "$_phase10_cleanup_service" ]] \
+        && grep -qx 'Description=OpenClaw Session Cleanup' "$_phase10_cleanup_service" \
+        && grep -Eqx 'ExecStart=%h/(ods|dream-server)/scripts/session-cleanup\.sh' "$_phase10_cleanup_service"; then
+        rm -f "$_phase10_cleanup_service"
+        _phase10_retired=true
+    fi
+    if [[ "$_phase10_retired" == true ]]; then
+        ods_systemctl_user daemon-reload >> "$LOG_FILE" 2>&1 \
+            || log "Could not reload the user systemd manager (non-fatal)"
+        ai_ok "Retired the legacy OpenClaw session-cleanup timer"
+    fi
+    unset _phase10_user_units _phase10_cleanup_timer _phase10_cleanup_service _phase10_retired
 
-    # Create archive directories for memory shepherd
-    mkdir -p "$INSTALL_DIR/data/memory-archives/ods-agent"/{memory,agents,tools}
-
-    # Reload and enable all timers
-    systemctl --user daemon-reload 2>/dev/null || true
-    for timer in openclaw-session-cleanup memory-shepherd-workspace memory-shepherd-memory; do
-        systemctl --user enable --now "${timer}.timer" >> "$LOG_FILE" 2>&1 || true
-    done
-    ai_ok "Maintenance timers enabled (session cleanup, memory shepherd)"
-
-    # Enable lingering so user timers survive logout
+    # Keep the user manager running after logout: phase 11 starts the
+    # background full-model download as a transient user unit (systemd-run
+    # --user), which would otherwise stop when the installing session ends.
+    # Each attempt's error output is dropped because the next step covers it.
     loginctl enable-linger "$(whoami)" 2>/dev/null || \
-        sudo -n loginctl enable-linger "$(whoami)" 2>/dev/null || \
-        ai_warn "Could not enable linger. Timers may stop after logout. Run: loginctl enable-linger $(whoami)"
+        _phase10_privileged loginctl enable-linger "$(whoami)" 2>/dev/null || \
+        ai_warn "Could not enable linger. The background model download may stop after logout. Run: loginctl enable-linger $(whoami)"
 
     # Install sysctl tuning (vm.swappiness, vfs_cache_pressure)
     if [[ -f "$INSTALL_DIR/config/system-tuning/99-ods.conf" ]]; then
-        if sudo -n cp "$INSTALL_DIR/config/system-tuning/99-ods.conf" /etc/sysctl.d/ 2>/dev/null; then
-            sudo -n sysctl --system > /dev/null 2>&1 || true
+        if _phase10_privileged cp "$INSTALL_DIR/config/system-tuning/99-ods.conf" /etc/sysctl.d/ 2>/dev/null; then
+            _phase10_privileged sysctl --system > /dev/null 2>&1 || true
             ai_ok "sysctl tuning applied (swappiness=10, vfs_cache_pressure=50)"
         else
             ai_warn "Could not install sysctl tuning (needs sudo). Copy manually:"
@@ -113,7 +126,7 @@ elif [[ "$GPU_BACKEND" == "amd" ]] && ! $DRY_RUN; then
 
     # Install amdgpu modprobe options
     if [[ -f "$INSTALL_DIR/config/system-tuning/amdgpu.conf" ]]; then
-        if sudo -n cp "$INSTALL_DIR/config/system-tuning/amdgpu.conf" /etc/modprobe.d/ 2>/dev/null; then
+        if _phase10_privileged cp "$INSTALL_DIR/config/system-tuning/amdgpu.conf" /etc/modprobe.d/ 2>/dev/null; then
             ai_ok "amdgpu modprobe tuning installed (ppfeaturemask, gpu_recovery)"
         else
             ai_warn "Could not install amdgpu modprobe config (needs sudo). Copy manually:"
@@ -157,7 +170,11 @@ elif [[ "$GPU_BACKEND" == "amd" ]] && ! $DRY_RUN; then
         # page_pool_size = pages_limit / 2
         page_pool_size=$(( pages_limit / 2 ))
 
-        cat > /tmp/ods-gtt-tuning.conf << GTT_EOF
+        _gtt_tmp=$(mktemp "${TMPDIR:-/tmp}/ods-gtt-tuning.XXXXXX") || _gtt_tmp=""
+        if [[ -z "$_gtt_tmp" ]]; then
+            ai_warn "Could not create a secure temporary file — skipping GTT tuning"
+        else
+            cat > "$_gtt_tmp" << GTT_EOF
 # /etc/modprobe.d/amdgpu_llm_optimized.conf — GTT memory for LLM inference
 # Generated by ODS installer for ${total_ram_mb}MB total RAM
 # GTT = ${gtt_pct}% of RAM (~${gtt_size}MB), leaving ~$((total_ram_mb - gtt_size))MB for OS/Docker
@@ -165,17 +182,17 @@ options amdgpu gttsize=${gtt_size}
 options ttm pages_limit=${pages_limit}
 options ttm page_pool_size=${page_pool_size}
 GTT_EOF
-        if sudo -n cp /tmp/ods-gtt-tuning.conf /etc/modprobe.d/amdgpu_llm_optimized.conf 2>/dev/null; then
-            # Rebuild initramfs so the new modprobe config takes effect on next boot
-            sudo -n update-initramfs -u >> "$LOG_FILE" 2>&1 || \
-                sudo -n dracut --force >> "$LOG_FILE" 2>&1 || true
-            ai_ok "GTT memory tuning installed (gttsize=${gtt_size}MB of ${total_ram_mb}MB, ${gtt_pct}%)"
-            _amd_needs_reboot=true
-        else
-            ai_warn "Could not install GTT memory config (needs sudo). Copy manually:"
-            ai "  sudo cp /tmp/ods-gtt-tuning.conf /etc/modprobe.d/amdgpu_llm_optimized.conf"
+            if _phase10_privileged cp "$_gtt_tmp" /etc/modprobe.d/amdgpu_llm_optimized.conf 2>/dev/null; then
+                # Rebuild initramfs so the new modprobe config takes effect on next boot.
+                _phase10_privileged update-initramfs -u >> "$LOG_FILE" 2>&1 || \
+                    _phase10_privileged dracut --force >> "$LOG_FILE" 2>&1 || true
+                ai_ok "GTT memory tuning installed (gttsize=${gtt_size}MB of ${total_ram_mb}MB, ${gtt_pct}%)"
+                _amd_needs_reboot=true
+            else
+                ai_warn "Could not install GTT memory config (needs sudo)."
+            fi
+            rm -f "$_gtt_tmp"
         fi
-        rm -f /tmp/ods-gtt-tuning.conf
     else
         ai_warn "Could not detect total RAM — skipping GTT tuning"
     fi
@@ -201,8 +218,8 @@ GTT_EOF
             if [[ -n "$current_cmdline" ]] && ! echo "$current_cmdline" | grep -q 'amd_iommu=off'; then
                 # Replace iommu=pt if present, otherwise append amd_iommu=off
                 if echo "$current_cmdline" | grep -q 'iommu=pt'; then
-                    if sudo -n sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/iommu=pt/amd_iommu=off/' /etc/default/grub 2>/dev/null; then
-                        sudo -n update-grub >> "$LOG_FILE" 2>&1 || true
+                    if _phase10_privileged sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/iommu=pt/amd_iommu=off/' /etc/default/grub 2>/dev/null; then
+                        _phase10_privileged update-grub >> "$LOG_FILE" 2>&1 || true
                         ai_ok "GRUB: replaced iommu=pt with amd_iommu=off (~6% GPU bandwidth improvement)"
                         _amd_needs_reboot=true
                     else
@@ -210,8 +227,8 @@ GTT_EOF
                         ai "  sudo sed -i 's/iommu=pt/amd_iommu=off/' /etc/default/grub && sudo update-grub"
                     fi
                 else
-                    if sudo -n sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 amd_iommu=off"/' /etc/default/grub 2>/dev/null; then
-                        sudo -n update-grub >> "$LOG_FILE" 2>&1 || true
+                    if _phase10_privileged sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 amd_iommu=off"/' /etc/default/grub 2>/dev/null; then
+                        _phase10_privileged update-grub >> "$LOG_FILE" 2>&1 || true
                         ai_ok "GRUB: added amd_iommu=off (~6% GPU bandwidth improvement)"
                         _amd_needs_reboot=true
                     else
@@ -242,8 +259,8 @@ GTT_EOF
     # Enable tuned with accelerator-performance profile for CPU governor optimization
     if command -v tuned-adm &>/dev/null; then
         if ! systemctl is-active --quiet tuned 2>/dev/null; then
-            if sudo -n systemctl enable --now tuned 2>/dev/null; then
-                sudo -n tuned-adm profile accelerator-performance 2>/dev/null && \
+            if _phase10_privileged systemctl enable --now tuned 2>/dev/null; then
+                _phase10_privileged tuned-adm profile accelerator-performance 2>/dev/null && \
                     ai_ok "tuned profile set to accelerator-performance (5-8% pp improvement)" || \
                     ai_warn "tuned started but could not set profile. Run: sudo tuned-adm profile accelerator-performance"
             else
@@ -253,7 +270,7 @@ GTT_EOF
         else
             active_profile=$(tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: \(.*\)/\1/p' || true)
             if [[ "$active_profile" != "accelerator-performance" ]]; then
-                sudo -n tuned-adm profile accelerator-performance 2>/dev/null && \
+                _phase10_privileged tuned-adm profile accelerator-performance 2>/dev/null && \
                     ai_ok "tuned profile changed to accelerator-performance" || \
                     ai_warn "tuned running but wrong profile. Run: sudo tuned-adm profile accelerator-performance"
             else
@@ -263,25 +280,22 @@ GTT_EOF
     else
         # Auto-install tuned for 5-8% prompt processing improvement
         ai "Installing tuned for CPU governor optimization..."
-        _inst_cmd="sudo -n apt install -y"
+        _inst_cmd=(apt install -y)
         case "$PKG_MANAGER" in
-            dnf)    _inst_cmd="sudo -n dnf install -y" ;;
-            pacman) _inst_cmd="sudo -n pacman -S --noconfirm" ;;
-            zypper) _inst_cmd="sudo -n zypper install -y" ;;
+            dnf)    _inst_cmd=(dnf install -y) ;;
+            pacman) _inst_cmd=(pacman -S --noconfirm) ;;
+            zypper) _inst_cmd=(zypper install -y) ;;
         esac
-        if $_inst_cmd tuned >> "$LOG_FILE" 2>&1; then
-            sudo -n systemctl enable --now tuned >> "$LOG_FILE" 2>&1 && \
-                sudo -n tuned-adm profile accelerator-performance 2>/dev/null && \
+        if _phase10_privileged "${_inst_cmd[@]}" tuned </dev/null >> "$LOG_FILE" 2>&1; then
+            _phase10_privileged systemctl enable --now tuned >> "$LOG_FILE" 2>&1 && \
+                _phase10_privileged tuned-adm profile accelerator-performance 2>/dev/null && \
                 ai_ok "tuned installed and set to accelerator-performance (5-8% pp improvement)" || \
                 ai_warn "tuned installed but could not set profile. Run: sudo tuned-adm profile accelerator-performance"
         else
             ai_warn "Could not auto-install tuned (needs sudo). Install manually:"
-            ai "  ${_inst_cmd//-n /} tuned && sudo systemctl enable --now tuned && sudo tuned-adm profile accelerator-performance"
+            ai "  sudo ${_inst_cmd[*]} tuned && sudo systemctl enable --now tuned && sudo tuned-adm profile accelerator-performance"
         fi
     fi
-
-    # LiteLLM config already copied by rsync/cp block above
-    [[ -f "$INSTALL_DIR/config/litellm/strix-halo-config.yaml" ]] && ai_ok "LiteLLM Strix Halo routing config installed"
 
     # Reboot notice if kernel-level changes were made
     if [[ "${_amd_needs_reboot:-}" == "true" ]]; then

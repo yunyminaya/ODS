@@ -26,17 +26,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi import FastAPI, Depends, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # --- Local modules ---
+from pixel_edge_read_client import edge_read_client_lifespan
+from env_values import parse_env_value, quote_env_value
 from config import (
     SERVICES, DATA_DIR, INSTALL_DIR, SIDEBAR_ICONS, MANIFEST_ERRORS, ALWAYS_ON_SERVICES,
     AGENT_HOST, AGENT_PORT, AGENT_URL, ODS_AGENT_KEY,
     _detect_container_default_gateway, _running_inside_container,
     _read_env_from_file,
+    get_env_file_read_error,
+    normalize_ods_mode, read_live_env_value, LLM_BACKEND,
 )
 from models import (
     GPUInfo, ServiceStatus, DiskUsage, ModelInfo, BootstrapStatus,
@@ -45,32 +51,49 @@ from models import (
 from security import verify_api_key
 from gpu import get_gpu_info
 from helpers import (
-    get_all_services, get_cached_services, set_services_cache,
+    get_all_services, get_cached_services, get_services_cache_revision, set_services_cache,
     get_disk_usage, dir_size_gb, get_model_info, get_bootstrap_status,
     get_uptime, get_cpu_metrics, get_ram_metrics,
-    get_llama_metrics, get_loaded_model, get_llama_context_size,
-    _get_httpx_client,
+    get_llama_metrics, get_cached_llama_metrics, get_loaded_model, get_llama_context_size,
+    _get_httpx_client, shutdown_service_health_client, shutdown_llm_client,
 )
 from context_policy import HERMES_MIN_CONTEXT, HERMES_TARGET_CONTEXT
 from host_agent_client import (
+    AgentClientError,
     AgentHTTPError,
     AgentProtocolError,
     AgentUnavailable,
     request_json as request_agent_json,
+    async_request_json as async_request_agent_json,
     shutdown_clients as shutdown_agent_clients,
 )
+from runtime_projection import active_runtime_projection, awaiting_runtime_readback
+from cloud_telemetry import get_cloud_throughput
 from agent_monitor import collect_metrics
 from routers import (
     workflows, features, setup, updates, agents, privacy, extensions,
     gpu as gpu_router, resources, voice, models as models_router, model_state as model_state_router,
     model_routes as model_routes_router, remote_provider_status, templates,
     auth as auth_router,
+    dashboard_session,
     magic_link,
     oauth_passthrough,
     talk,
     tailscale,
     usage,
     node,
+    pixel,
+    pixel_teams,
+    pixel_providers,
+    pixel_settings,
+    portal_identity,
+    pixel_advice,
+    pixel_handoff,
+    pixel_scopes,
+    pixel_advice_runtime,
+    pixel_sharing,
+    pixel_model_failure,
+    opencode_app,
 )
 from settings import (
     _ENV_ASSIGNMENT_RE, _ENV_COMMENTED_ASSIGNMENT_RE, _SETTINGS_APPLY_ALLOWED_SERVICES, _parse_env_text, _read_env_map_from_path,
@@ -135,6 +158,18 @@ _host_agent_probe_state: dict[str, Optional[str]] = {
 logger = logging.getLogger(__name__)
 
 
+def _public_manifest_errors() -> list[dict[str, str]]:
+    """Manifest load errors without exception text; config.py logs the detail."""
+    return [
+        {
+            "file": Path(entry["file"]).parent.name,
+            "error": ("Unsupported schema_version" if entry["error"] == "Unsupported schema_version"
+                      else "manifest could not be loaded"),
+        }
+        for entry in MANIFEST_ERRORS
+    ]
+
+
 def _resolve_install_root() -> Path:
     host_root = Path("/ods")
     if host_root.exists():
@@ -149,7 +184,7 @@ def _read_installed_version() -> str:
         try:
             for line in env_file.read_text().splitlines():
                 if line.startswith("ODS_VERSION="):
-                    env_version = line.split("=", 1)[1].strip().strip("\"'")
+                    env_version = parse_env_value(line.split("=", 1)[1])
                     if env_version:
                         return env_version
         except OSError:
@@ -263,6 +298,14 @@ def _readiness_check(
     return payload
 
 
+def _bootstrap_activity(phase: Optional[str]) -> str:
+    return {
+        "starting": "being prepared",
+        "verifying": "being verified",
+        "swapping": "being activated",
+    }.get(phase, "still downloading")
+
+
 def _build_readiness_payload(
     *,
     service_statuses: list[ServiceStatus],
@@ -277,12 +320,21 @@ def _build_readiness_payload(
 
     llama_healthy = _service_is_healthy(service_statuses, "llama-server")
     chat_ready = bool(llama_healthy and loaded_model and context_size)
+    # LLM_BACKEND=vllm: the row probes vllm-server (config.py). A cold start
+    # loads the model and compiles kernels for up to 15 minutes; a restart
+    # would only start that over, so none is suggested while it starts.
+    engine = "vllm-server" if LLM_BACKEND == "vllm" else "llama-server"
+    llm_row = _service_by_id(service_statuses, "llama-server")
+    engine_starting = engine == "vllm-server" and bool(llm_row and llm_row.startup_pending)
     if chat_ready:
         chat_detail = f"{loaded_model} loaded with {context_size} context"
     elif bootstrap_info.active:
-        chat_detail = "Full model is still downloading; bootstrap mode may be limited"
+        chat_detail = f"Full model is {_bootstrap_activity(bootstrap_info.phase)}; bootstrap mode may be limited"
+    elif engine_starting:
+        chat_detail = ("The vLLM engine is starting: a first start loads the model and compiles "
+                       "kernels, which can take 15 minutes")
     elif not llama_healthy:
-        chat_detail = "llama-server is not healthy"
+        chat_detail = f"{engine} is not healthy"
     elif not loaded_model:
         chat_detail = "No loaded model reported by the inference server"
     else:
@@ -294,19 +346,34 @@ def _build_readiness_payload(
         ready=chat_ready,
         status="ready" if chat_ready else "blocked",
         detail=chat_detail,
-        repair="ods restart llama-server" if not chat_ready and not bootstrap_info.active else None,
+        repair=(f"ods restart {engine}"
+                if not chat_ready and not bootstrap_info.active and not engine_starting else None),
     ))
 
-    webui_ready = _service_is_healthy(service_statuses, "open-webui")
-    checks.append(_readiness_check(
-        check_id="open-webui",
-        name="Open WebUI",
-        required=True,
-        ready=webui_ready,
-        status="ready" if webui_ready else "blocked",
-        detail="Open WebUI is reachable" if webui_ready else "Open WebUI is not healthy",
-        repair="ods restart open-webui" if not webui_ready else None,
-    ))
+    webui = _service_by_id(service_statuses, "open-webui")
+    if webui is not None and webui.status == "not_deployed":
+        # The install switched Open WebUI off (ENABLE_OPEN_WEBUI; Portal is
+        # the chat app on fresh Pixel installs): nothing waits for it, and
+        # restarting a service the install leaves out repairs nothing.
+        checks.append(_readiness_check(
+            check_id="open-webui",
+            name="Open WebUI",
+            required=False,
+            ready=False,
+            status="disabled",
+            detail="Open WebUI is switched off in this install",
+        ))
+    else:
+        webui_ready = _service_is_healthy(service_statuses, "open-webui")
+        checks.append(_readiness_check(
+            check_id="open-webui",
+            name="Open WebUI",
+            required=True,
+            ready=webui_ready,
+            status="ready" if webui_ready else "blocked",
+            detail="Open WebUI is reachable" if webui_ready else "Open WebUI is not healthy",
+            repair="ods restart open-webui" if not webui_ready else None,
+        ))
 
     checks.append(_readiness_check(
         check_id="dashboard-api",
@@ -476,7 +543,7 @@ def _infer_gpu_count(gpu_info) -> int:
     if observed_count > 1:
         return observed_count
     gpu_count_env = os.environ.get("GPU_COUNT", "")
-    if gpu_count_env.isdigit():
+    if gpu_count_env.isdigit() and int(gpu_count_env) > 0:
         return int(gpu_count_env)
     if " × " in gpu_info.name:
         try:
@@ -506,7 +573,10 @@ def _serialize_gpu(gpu_info) -> Optional[dict]:
         "memoryType": gpu_info.memory_type,
         "backend": gpu_info.gpu_backend,
         "gpu_count": gpu_count,
-        "memoryLabel": "VRAM Partition" if gpu_info.memory_type == "unified" else "VRAM",
+        "memoryLabel": (
+            "Unified Memory" if gpu_info.gpu_backend == "apple"
+            else "VRAM Partition" if gpu_info.memory_type == "unified" else "VRAM"
+        ),
     }
     if gpu_info.power_w is not None:
         gpu_data["powerDraw"] = gpu_info.power_w
@@ -542,7 +612,7 @@ def _build_model_readiness_payload(
     if not meets_hermes_minimum:
         issues.append(f"Context is below Hermes minimum ({HERMES_MIN_CONTEXT}).")
     if bootstrap_info.active:
-        issues.append("Full model is still downloading; bootstrap model is serving first-run traffic.")
+        issues.append(f"Full model is {_bootstrap_activity(bootstrap_info.phase)}; bootstrap model is serving first-run traffic.")
 
     if ready and bootstrap_info.active:
         status = "bootstrap"
@@ -563,6 +633,7 @@ def _build_model_readiness_payload(
         } if model_info else None,
         "bootstrap": {
             "active": bootstrap_info.active,
+            "phase": bootstrap_info.phase,
             "model": bootstrap_info.model_name,
             "percent": bootstrap_info.percent,
             "downloadedGb": bootstrap_info.downloaded_gb,
@@ -799,6 +870,7 @@ def _build_env_sections(schema_keys: list[str]) -> list[dict[str, Any]]:
 def _render_env_from_values(values: dict[str, str]) -> str:
     example_path = _resolve_template_path(".env.example")
     seen: set[str] = set()
+    assigned: set[str] = set()
     output_lines: list[str] = []
 
     if example_path.exists():
@@ -815,15 +887,28 @@ def _render_env_from_values(values: dict[str, str]) -> str:
 
         if assignment:
             key = assignment.group(1)
-            output_lines.append(f"{key}={values.get(key, '')}")
             seen.add(key)
+            if key in assigned:
+                output_lines.append(f"# {line}")
+                continue
+            output_lines.append(f"{key}={quote_env_value(values.get(key, ''))}")
+            assigned.add(key)
             continue
 
         if commented_assignment:
             key = commented_assignment.group(1)
+            # Only the first occurrence of a key becomes the assignment.
+            # .env.example repeats some keys as alternatives (VIDEO_GID,
+            # LLAMA_CPU_LIMIT, WHISPER_ACCELERATION, ...) and a prose comment
+            # can look like "# ODS_MODE=cloud and ..."; rewriting every match
+            # produced duplicate assignments that validate-env.sh rejects.
+            if key in assigned:
+                output_lines.append(line)
+                continue
             seen.add(key)
             if key in values:
-                output_lines.append(f"{key}={values[key]}")
+                output_lines.append(f"{key}={quote_env_value(values[key])}")
+                assigned.add(key)
             else:
                 output_lines.append(line)
             continue
@@ -839,7 +924,7 @@ def _render_env_from_values(values: dict[str, str]) -> str:
             "# Values below were preserved because they are not part of .env.example.",
         ])
         for key, value in extras:
-            output_lines.append(f"{key}={value}")
+            output_lines.append(f"{key}={quote_env_value(value)}")
 
     return "\n".join(output_lines).rstrip() + "\n"
 
@@ -859,11 +944,17 @@ def _active_settings_apply_services() -> set[str]:
     return active
 
 
-def _call_agent_core_recreate(service_ids: list[str]) -> dict[str, Any]:
+def _call_agent_core_recreate(
+    service_ids: list[str],
+    expected_env_revision: Optional[str] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"service_ids": service_ids}
+    if expected_env_revision is not None:
+        payload["expected_env_revision"] = expected_env_revision
     return request_agent_json(
         "POST",
         "/v1/core/recreate",
-        payload={"service_ids": service_ids},
+        payload=payload,
         timeout=180,
     )
 
@@ -1031,30 +1122,44 @@ def _prepare_env_save(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    background_tasks = [
-        asyncio.create_task(collect_metrics()),
-        asyncio.create_task(_poll_service_health()),
-        asyncio.create_task(gpu_router.poll_gpu_history()),
-    ]
-    try:
-        yield
-    finally:
-        for task in background_tasks:
-            task.cancel()
-        await asyncio.gather(*background_tasks, return_exceptions=True)
-        # Close any open Hermes WebSockets in the ODS Talk connection pool
-        # so a graceful uvicorn shutdown doesn't leak FDs into stale state.
+    async with edge_read_client_lifespan():
+        # Reuse the internal connection across status polls instead of starting a
+        # fresh DNS/TCP lookup on every sample while the host is busy.
+        app.state.cloud_telemetry_client = httpx.AsyncClient(
+            timeout=3, follow_redirects=False, trust_env=False,
+            limits=httpx.Limits(max_connections=2, max_keepalive_connections=1),
+        )
+        background_tasks = [
+            asyncio.create_task(collect_metrics()),
+            asyncio.create_task(_poll_service_health()),
+            asyncio.create_task(gpu_router.poll_gpu_history()),
+        ]
         try:
-            import hermes_bridge
-            await hermes_bridge.shutdown_pool()
-        except Exception:
-            logger.debug("hermes_bridge.shutdown_pool raised at app shutdown", exc_info=True)
-        await shutdown_agent_clients()
+            yield
+        finally:
+            await app.state.cloud_telemetry_client.aclose()
+            for task in background_tasks:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+            # Close any open Hermes WebSockets in the ODS Talk connection pool
+            # so a graceful uvicorn shutdown doesn't leak FDs into stale state.
+            try:
+                import hermes_bridge
+                await hermes_bridge.shutdown_pool()
+            except Exception:
+                logger.debug("hermes_bridge.shutdown_pool raised at app shutdown", exc_info=True)
+            try:
+                await shutdown_agent_clients()
+            finally:
+                try:
+                    await shutdown_service_health_client()
+                finally:
+                    await shutdown_llm_client()
 
 
 app = FastAPI(
     title="ODS Dashboard API",
-    version="2.6.0",
+    version="3.0.0",
     description="System status API for ODS Dashboard",
     lifespan=_lifespan,
 )
@@ -1088,6 +1193,70 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
 
+# --- CSRF ---
+#
+# CORS is not a CSRF defence. It governs whether a page may *read* a response,
+# not whether the request runs. A cross-site form POST is a "simple request",
+# so the browser sends it without a preflight, the endpoint executes, and the
+# attacker page simply never sees the reply.
+#
+# That matters here more than in a typical API because the dashboard container
+# supplies the credential itself: nginx.conf sets
+# `proxy_set_header Authorization "Bearer ${DASHBOARD_API_KEY}"` on every
+# /api/ request, and verify_api_key reads only that header. No cookie and no
+# prior session are involved, so a page on any origin the owner happens to
+# visit can drive state-changing routes on the loopback dashboard.
+#
+# The check is Origin against Host rather than a fixed allowlist, because the
+# dashboard is reached at several legitimate origins — localhost:3001, a LAN
+# IP, and dashboard.<device>.local through ods-proxy. Both nginx and Caddy
+# preserve the browser's Host, so "Origin names the same host:port as Host"
+# identifies a same-origin request in every one of those shapes without
+# enumerating them.
+#
+# Requests with no Origin header are left alone: that is ods-cli, the host
+# agent, and every other non-browser caller. Browsers attach Origin to all
+# cross-site POSTs, which is the case being defended against.
+
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _origin_matches_host(origin: str, host_header: str | None) -> bool:
+    """True when Origin names the same host:port as the Host header."""
+    if not host_header:
+        return False
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if not parsed.hostname:
+        return False
+    return parsed.netloc == host_header
+
+
+@app.middleware("http")
+async def enforce_same_origin_for_state_changes(request: Request, call_next):
+    """Reject cross-site state-changing requests before the route runs."""
+    if request.method in _STATE_CHANGING_METHODS:
+        origin = request.headers.get("origin")
+        # Sec-Fetch-Site is set by the browser and cannot be forged by page
+        # script, so it stands on its own when present.
+        cross_site = request.headers.get("sec-fetch-site") == "cross-site"
+        if origin is not None or cross_site:
+            same_origin = origin is not None and (
+                _origin_matches_host(origin, request.headers.get("host"))
+            )
+            if cross_site or not same_origin:
+                logger.warning(
+                    "Blocked cross-origin %s %s (origin=%r)",
+                    request.method, request.url.path, origin,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Cross-origin state-changing request rejected."},
+                )
+    return await call_next(request)
+
 # --- Include Routers ---
 
 app.include_router(workflows.router)
@@ -1107,12 +1276,27 @@ app.include_router(remote_provider_status.router)
 app.include_router(models_router.router)
 app.include_router(templates.router)
 app.include_router(auth_router.router)
+app.include_router(dashboard_session.router)
 app.include_router(magic_link.router)
 app.include_router(oauth_passthrough.router)
 app.include_router(talk.router)
 app.include_router(tailscale.router)
 app.include_router(usage.router)
 app.include_router(node.router)
+from routers import pixel_approval_terminal
+app.include_router(pixel_approval_terminal.router)
+app.include_router(pixel.router)
+app.include_router(pixel_teams.router)
+app.include_router(pixel_providers.router)
+app.include_router(pixel_settings.router)
+app.include_router(portal_identity.router)
+app.include_router(pixel_advice.router)
+app.include_router(pixel_handoff.router)
+app.include_router(pixel_scopes.router)
+app.include_router(pixel_advice_runtime.router)
+app.include_router(pixel_sharing.router)
+app.include_router(pixel_model_failure.router)
+app.include_router(opencode_app.router)
 
 
 # ================================================================
@@ -1340,19 +1524,35 @@ async def api_status(api_key: str = Depends(verify_api_key)):
         return await _build_api_status()
     except (asyncio.TimeoutError, OSError):
         logger.exception("/api/status handler failed — returning safe fallback")
-        return {
+        last_inference = get_cached_llama_metrics()
+        cloud_mode = normalize_ods_mode(read_live_env_value("ODS_MODE")) == "cloud"
+        if cloud_mode:
+            last_inference = {}
+        fallback = {
             "gpu": None, "services": [], "model": None,
             "bootstrap": None, "uptime": 0,
-            "version": app.version, "tier": "Unknown",
-            "cpu": {"percent": 0, "temp_c": None},
-            "ram": {"used_gb": 0, "total_gb": 0, "percent": 0},
+            "version": app.version, "tier": "Cloud" if cloud_mode else "Unknown",
+            "inferenceMode": "cloud" if cloud_mode else "local",
+            "inferenceSource": "cloud-mode" if cloud_mode else "unknown",
+            "cpu": {"percent": None, "temp_c": None, "scope": "unknown", "source": "unavailable"},
+            "ram": {"used_gb": None, "total_gb": None, "percent": None, "scope": "unknown", "source": "unavailable"},
             "disk": {"used_gb": 0, "total_gb": 0, "percent": 0},
             "system": {"uptime": 0, "hostname": os.environ.get("HOSTNAME", "ods")},
-            "inference": {"tokensPerSecond": 0, "lifetimeTokens": 0,
-                          "tokenCountMode": "unavailable",
-                          "loadedModel": None, "contextSize": None},
-            "manifest_errors": MANIFEST_ERRORS,
+            "inference": {"tokensPerSecond": last_inference.get("tokens_per_second"),
+                          "lifetimeTokens": last_inference.get("lifetime_tokens"),
+                          "tokenCountMode": last_inference.get("token_count_mode", "unavailable"),
+                          "throughputMode": last_inference.get("throughput_mode", "unavailable"),
+                          "throughputState": "unavailable",
+                          "throughputSampledAt": last_inference.get("throughput_sampled_at"),
+                          "throughputModel": last_inference.get("throughput_model"),
+                          "inferenceActive": None,
+                          "loadedModel": None, "loadedModelDisplayName": None, "contextSize": None},
+            "manifest_errors": _public_manifest_errors(),
         }
+        env_file_read_error = get_env_file_read_error()
+        if env_file_read_error:
+            fallback["envFileReadError"] = env_file_read_error
+        return fallback
 
 
 @app.get("/api/readiness")
@@ -1385,6 +1585,44 @@ async def api_readiness(api_key: str = Depends(verify_api_key)):
     )
 
 
+async def _get_dashboard_remote_runtime() -> dict[str, object] | None:
+    """Read the active provider without claiming remote model residency."""
+    async def read_projection():
+        # The host starts a background readback on a cold/expired cache.
+        # Re-poll that transient gap within one absolute deadline.
+        for attempt in range(4):
+            status = await async_request_agent_json("GET", "/v1/model/status", timeout=2.0)
+            runtime = active_runtime_projection(status)
+            if runtime:
+                return runtime if runtime["source"] == "remote-provider" else None
+            if not awaiting_runtime_readback(status):
+                return None
+            if attempt < 3:
+                await asyncio.sleep(0.25)
+        return None
+
+    try:
+        return await asyncio.wait_for(read_projection(), timeout=2.0)
+    except (AgentClientError, asyncio.TimeoutError):
+        return None
+
+
+_THIS_COMPUTER_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+
+
+def _external_api_off_this_computer() -> bool:
+    """Installer API mode with a model API elsewhere, not a host Ollama or LM Studio.
+
+    Status called it local inference (inferenceMode "local"), so the dashboard
+    showed local GPU telemetry and "Chat with your local AI model" (fleet row 33).
+    """
+    if str(read_live_env_value("LLM_BACKEND") or "").strip().lower() != "external":
+        return False
+    provider = str(read_live_env_value("EXTERNAL_LLM_PROVIDER") or "").strip().lower()
+    host = (urlparse(str(read_live_env_value("EXTERNAL_LLM_URL") or "").strip()).hostname or "").lower()
+    return bool(host) and provider not in {"ollama", "lmstudio"} and host not in _THIS_COMPUTER_HOSTS
+
+
 async def _build_api_status() -> dict:
     """Build the full status payload.
 
@@ -1396,7 +1634,7 @@ async def _build_api_status() -> dict:
     (
         gpu_info, model_info, bootstrap_info, uptime,
         cpu_metrics, ram_metrics, disk_info,
-        service_statuses, loaded_model,
+        service_statuses, remote_runtime,
     ) = await asyncio.gather(
         asyncio.to_thread(get_gpu_info),
         asyncio.to_thread(get_model_info),
@@ -1406,27 +1644,63 @@ async def _build_api_status() -> dict:
         asyncio.to_thread(get_ram_metrics),
         asyncio.to_thread(get_disk_usage),
         _get_services(),
-        get_loaded_model(),
+        _get_dashboard_remote_runtime(),
     )
 
-    # Second fan-out: llama metrics + context size (need loaded_model)
-    llama_metrics_data, context_size = await asyncio.gather(
-        get_llama_metrics(model_hint=loaded_model),
-        get_llama_context_size(model_hint=loaded_model),
-    )
+    # Local residency/metrics say nothing about a selected remote provider.
+    cloud_mode = normalize_ods_mode(read_live_env_value("ODS_MODE")) == "cloud"
+    if remote_runtime or cloud_mode:
+        loaded_model, llama_metrics_data = None, {}
+        if remote_runtime:
+            llama_metrics_data = await get_cloud_throughput(
+                remote_runtime, remote_provider_status.EGRESS_URL,
+                app.state.cloud_telemetry_client)
+        context_size = remote_runtime["contextLength"] if remote_runtime else None
+    else:
+        loaded_model = await get_loaded_model()
+        llama_metrics_data, context_size = await asyncio.gather(
+            get_llama_metrics(model_hint=loaded_model),
+            get_llama_context_size(model_hint=loaded_model),
+        )
 
-    gpu_data = _serialize_gpu(gpu_info)
+    # Remote/cloud inference does not use the local GPU for primary inference.
+    # Suppress local GPU/tier reporting so the UI cannot present local hardware
+    # as the inference device. Local mode is unchanged.
+    external_api = not remote_runtime and not cloud_mode and _external_api_off_this_computer()
+    remote_inference = bool(remote_runtime) or cloud_mode or external_api
+    if remote_inference:
+        gpu_data = None
+        tier = "Cloud"
+        inference_mode_value = "remote" if remote_runtime or external_api else "cloud"
+        inference_source_value = ("remote-provider" if remote_runtime
+                                  else "external-api" if external_api else "cloud-mode")
+    else:
+        gpu_data = _serialize_gpu(gpu_info)
+        tier = _infer_tier(gpu_info)
+        inference_mode_value = "local"
+        inference_source_value = "local-runtime"
 
     services_data = _serialize_services(service_statuses, uptime)
 
     model_data = None
-    if model_info:
+    if remote_runtime:
         model_data = {
-            "name": model_info.name,
-            "currentModel": model_info.name,
+            "name": remote_runtime["model"],
+            "currentModel": remote_runtime["model"],
+            "configuredModel": model_info.name if model_info else None,
+            "loadedModel": None,
+            "tokensPerSecond": llama_metrics_data.get("tokens_per_second"),
+            "contextLength": context_size,
+        }
+    elif model_info and not cloud_mode:
+        runtime_model_name = loaded_model or model_info.name
+        model_data = {
+            "name": runtime_model_name,
+            "currentModel": runtime_model_name,
             "configuredModel": model_info.name,
-            "loadedModel": loaded_model or model_info.name,
-            "tokensPerSecond": llama_metrics_data.get("tokens_per_second") or None,
+            "loadedModel": runtime_model_name,
+            "tokensPerSecond": (llama_metrics_data.get("tokens_per_second")
+                                if llama_metrics_data.get("throughput_model") == runtime_model_name else None),
             "contextLength": context_size or model_info.context_length,
         }
 
@@ -1434,66 +1708,60 @@ async def _build_api_status() -> dict:
     if bootstrap_info.active:
         bootstrap_data = {
             "active": True, "model": bootstrap_info.model_name or "Full Model",
+            "phase": bootstrap_info.phase,
             "percent": bootstrap_info.percent or 0,
             "bytesDownloaded": int((bootstrap_info.downloaded_gb or 0) * 1024**3),
             "bytesTotal": int((bootstrap_info.total_gb or 0) * 1024**3),
             "eta": bootstrap_info.eta_seconds, "speedMbps": bootstrap_info.speed_mbps
         }
 
-    tier = _infer_tier(gpu_info)
-
-    loaded_model_name = loaded_model or (model_data["name"] if model_data else None)
-    configured_model_name = model_data["configuredModel"] if model_data else None
+    loaded_model_name = None if remote_runtime or cloud_mode else loaded_model or (model_data["name"] if model_data else None)
+    # The served id is a file name; the dashboard shows the Models page's name.
+    loaded_model_display_name = (
+        await asyncio.to_thread(models_router.loaded_model_display_name, loaded_model_name)
+        if loaded_model_name else None
+    )
+    current_model_name = remote_runtime["model"] if remote_runtime else loaded_model_name
+    configured_model_name = model_data["configuredModel"] if model_data else model_info.name if model_info else None
 
     result = {
         "gpu": gpu_data, "services": services_data, "model": model_data,
         "bootstrap": bootstrap_data, "uptime": uptime,
         "version": app.version, "tier": tier,
-        "currentModel": configured_model_name,
+        "inferenceMode": inference_mode_value,
+        "inferenceSource": inference_source_value,
+        "currentModel": current_model_name,
         "loadedModel": loaded_model_name,
         "configuredModel": configured_model_name,
         "cpu": cpu_metrics, "ram": ram_metrics,
         "disk": {"used_gb": disk_info.used_gb, "total_gb": disk_info.total_gb, "percent": disk_info.percent},
         "system": {"uptime": uptime, "hostname": os.environ.get("HOSTNAME", "ods")},
         "inference": {
-            "tokensPerSecond": llama_metrics_data.get("tokens_per_second", 0),
-            "lifetimeTokens": llama_metrics_data.get("lifetime_tokens", 0),
+            "tokensPerSecond": llama_metrics_data.get("tokens_per_second"),
+            "lifetimeTokens": llama_metrics_data.get("lifetime_tokens"),
             "tokenCountMode": llama_metrics_data.get("token_count_mode", "unavailable"),
+            "throughputMode": llama_metrics_data.get("throughput_mode", "unavailable"),
+            "throughputState": llama_metrics_data.get("throughput_state", "unavailable"),
+            "throughputSampledAt": llama_metrics_data.get("throughput_sampled_at"),
+            "throughputModel": llama_metrics_data.get("throughput_model"),
+            "inferenceActive": llama_metrics_data.get("inference_active"),
             "loadedModel": loaded_model_name,
+            "loadedModelDisplayName": loaded_model_display_name,
             "contextSize": context_size or (model_data["contextLength"] if model_data else None),
         },
-        "manifest_errors": MANIFEST_ERRORS,
+        "manifest_errors": _public_manifest_errors(),
     }
+    env_file_read_error = get_env_file_read_error()
+    if env_file_read_error:
+        result["envFileReadError"] = env_file_read_error
     return result
 
 
 # --- Settings ---
 
-@app.get("/api/service-tokens", dependencies=[Depends(verify_api_key)])
-async def service_tokens():
-    """Return connection tokens for services that need browser-side auth."""
-    def _read_tokens():
-        tokens = {}
-        oc_token = os.environ.get("OPENCLAW_TOKEN", "")
-        if not oc_token:
-            for path in [Path("/data/openclaw/home/gateway-token"), Path("/ods/.env")]:
-                try:
-                    if path.suffix == ".env":
-                        for line in path.read_text().splitlines():
-                            if line.startswith("OPENCLAW_TOKEN="):
-                                oc_token = line.split("=", 1)[1].strip()
-                                break
-                    else:
-                        oc_token = path.read_text().strip()
-                except (OSError, ValueError):
-                    continue
-                if oc_token:
-                    break
-        if oc_token:
-            tokens["openclaw"] = oc_token
-        return tokens
-
-    return await asyncio.to_thread(_read_tokens)
+# Sidebar names where the manifest name describes plumbing rather than the
+# application the link opens. Health matching keeps the manifest name.
+_SIDEBAR_LABELS = {"hermes-proxy": "Hermes"}
 
 
 @app.get("/api/external-links")
@@ -1505,7 +1773,7 @@ async def get_external_links(api_key: str = Depends(verify_api_key)):
         if not ext_port or sid == "dashboard-api" or cfg.get("external_link") is False:
             continue
         links.append({
-            "id": sid, "label": cfg.get("name", sid), "port": ext_port,
+            "id": sid, "label": _SIDEBAR_LABELS.get(sid, cfg.get("name", sid)), "port": ext_port,
             "ui_path": cfg.get("ui_path", "/"),
             "public_url": cfg.get("public_url", ""),
             "icon": SIDEBAR_ICONS.get(sid, "ExternalLink"),
@@ -1539,9 +1807,9 @@ async def api_storage(api_key: str = Depends(verify_api_key)):
             "disk": {"used_gb": disk_info.used_gb, "total_gb": disk_info.total_gb, "percent": disk_info.percent}
         }
 
-    result = await asyncio.to_thread(_compute_storage)
-    _cache.set("storage", result, _STORAGE_CACHE_TTL)
-    return result
+    # Settings times out after 12s. Keep one collector and publish its result
+    # even if every browser disconnects, so retries do not launch more walks.
+    return await resources._resource_snapshot("storage", _compute_storage, _STORAGE_CACHE_TTL)
 
 
 @app.get("/api/settings/summary")
@@ -1580,7 +1848,7 @@ async def api_settings_summary(api_key: str = Depends(verify_api_key)):
             "uptime": uptime,
             "hostname": os.environ.get("HOSTNAME", "ods"),
         },
-        "manifest_errors": MANIFEST_ERRORS,
+        "manifest_errors": _public_manifest_errors(),
     }
     _cache.set("settings_summary", result, _SETTINGS_SUMMARY_CACHE_TTL)
     return result
@@ -1638,6 +1906,24 @@ async def api_settings_env_save(
                 saved_values[key] = value
         saved_raw_text = _render_env_from_values(saved_values)
 
+    # Bind the authoritative post-write digest to the plan. Without it the
+    # plan cannot be applied safely: the host agent may have enforced values
+    # or another writer may have touched .env between save and apply.
+    env_revision = agent_resp.get("env_revision")
+    if isinstance(apply_plan, dict):
+        if isinstance(env_revision, str) and re.fullmatch(r"[0-9a-f]{64}", env_revision):
+            apply_plan = {**apply_plan, "envRevision": env_revision}
+        elif apply_plan.get("supported") and apply_plan.get("services"):
+            apply_plan = {
+                **apply_plan,
+                "status": "unsupported",
+                "supported": False,
+                "envRevision": None,
+                "summary": (
+                    "Update ODS, then reload the current settings, review your changes, and save again before applying."
+                ),
+            }
+
     _clear_settings_caches()
     result = await asyncio.to_thread(
         _build_settings_env_payload,
@@ -1661,6 +1947,14 @@ async def api_settings_env_apply(
             detail={"message": "service_ids must be a non-empty list."},
         )
 
+    expected_env_revision = payload.get("expected_env_revision")
+    if expected_env_revision is not None:
+        if not isinstance(expected_env_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_env_revision):
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "expected_env_revision must be a 64-character lowercase hex digest."},
+            )
+
     normalized: list[str] = []
     for service_id in sorted(set(service_ids)):
         if not isinstance(service_id, str) or service_id not in _SETTINGS_APPLY_ALLOWED_SERVICES:
@@ -1671,7 +1965,10 @@ async def api_settings_env_apply(
         normalized.append(service_id)
 
     try:
-        await asyncio.to_thread(_call_agent_core_recreate, normalized)
+        if expected_env_revision is None:
+            await asyncio.to_thread(_call_agent_core_recreate, normalized)
+        else:
+            await asyncio.to_thread(_call_agent_core_recreate, normalized, expected_env_revision)
         _clear_settings_caches()
         return {
             "success": True,
@@ -1679,8 +1976,29 @@ async def api_settings_env_apply(
             "message": f"Applied runtime changes to {', '.join(normalized)}.",
         }
     except AgentHTTPError as exc:
-        detail = exc.detail
-        raise HTTPException(status_code=503, detail={"message": detail}) from exc
+        if exc.status_code == 409:
+            try:
+                body = json.loads(exc.response_text) if exc.response_text else None
+            except (ValueError, TypeError):
+                body = None
+            if isinstance(body, dict) and body.get("code") == "model_lifecycle_busy":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "model_lifecycle_busy",
+                        "message": "ODS is finishing another operation. Wait for it to finish, then choose Apply changes again. If settings changed, ODS will ask you to review them.",
+                    },
+                ) from exc
+            if isinstance(body, dict) and body.get("code") == "env_revision_mismatch":
+                _clear_settings_caches()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "env_revision_mismatch",
+                        "message": "Settings changed while you were waiting. Reload the current settings, then review and save your changes before applying.",
+                    },
+                ) from exc
+        raise HTTPException(status_code=503, detail={"message": exc.detail}) from exc
     except AgentUnavailable as exc:
         raise HTTPException(
             status_code=503,
@@ -1714,8 +2032,9 @@ async def _poll_service_health():
     await asyncio.sleep(2)  # let services start
     while True:
         try:
+            revision = get_services_cache_revision()
             statuses = await get_all_services()
-            set_services_cache(statuses)
+            set_services_cache(statuses, expected_revision=revision)
         except Exception:
             logger.exception("Service health poll failed")
         await asyncio.sleep(_SERVICE_POLL_INTERVAL)

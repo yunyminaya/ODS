@@ -1,0 +1,1271 @@
+# Portal in ODS
+
+Portal is the public-facing name of ODS's conversational assistant and a core
+feature under active development. Its internal runtime and compatibility route
+retain the Pixel identifier; on qualified hosts the `portal/default` model in
+Open WebUI and the dedicated **Portal** app in the ODS Dashboard use the same
+assistant. The full goal is to create projects, use host tools,
+manage ODS, and carry out sustained work through conversation.
+
+See the [enhancement priorities](pixel/ENHANCEMENT-PRIORITIES.md) for the
+source-linked review of upstream Pixel proposals and their native ODS
+acceptance tests.
+
+The rollout is experimental: Hermes, OpenCode, Open WebUI and the other ODS
+applications remain available in parallel while Pixel matures. This integration
+does not require their removal or a Pixel-only core download. Hermes remains
+available; the macOS installer disables it while native Pixel is selected.
+OpenCode remains separately selectable. Pixel's capability and
+model-flexibility goals are unchanged.
+
+Pixel does not maintain a model allowlist and ODS does not block chat or tool
+use behind a "Pixel-ready" verdict. Every model or remote provider that is
+callable through the active ODS Switchboard route is callable through Pixel.
+ODS still applies its ordinary hardware-fit and inference-readiness checks when
+it chooses a fresh install's default model; any agent-quality measurements are
+advisory capability evidence, not an access gate. Hermes remains independently
+available when the Pixel runtime, host, or authenticated gateway is unavailable,
+not a substitute selected merely because a callable model scored poorly on an
+agent probe.
+
+The harness adapts its prompt and Tool Search budget to the active model while
+retaining the same mechanical authority boundaries, cancellation, receipts,
+verification, and rollback. A small model may need shorter tasks, more focused
+recovery turns, or produce less capable results than a larger model, but the UI
+must remain usable and honest about those limits. ODS-managed cloud, hybrid,
+local, and external OpenAI-compatible routes all bind Pixel through the same
+authenticated LiteLLM gateway used by other ODS consumers. Gateway readiness
+proves that the route is callable; it does not claim that every underlying
+model has equal intelligence or tool-use skill.
+
+## Capability-aware bootstrap defaults
+
+ODS scopes the exact shipped `AGENTS.md` and `TOOLS.md` bootstrap defaults in
+memory before each Pixel run. Each file is recognized both as shipped, which is
+what the macOS install keeps, and as the Linux and WSL install leaves it: Pixel's
+apply rewrites both files with `scripts/migrate-workspace-source-boundary.mjs`
+before the first run, adding email, Calendar and social sections and a second
+status-tool step that are scoped the same way. Detailed email, Calendar and
+Frontier guidance, the Source Broker's tool notes, and the step that calls its
+`pixel_limb_status` tool are omitted only when their provider is explicitly
+disabled or every corresponding tool is explicitly denied. ODS's own Pixel
+configuration loads no Source Broker and denies all of its tools, so Pixel is not
+told about email or Calendar tools it does not have. A tool deferred behind Tool
+Search remains enabled; Operations guidance and general authority, privacy,
+research and verification rules remain.
+The personal development contract in the known vendor default is
+replaced with instructions to use this installation's configured model and tools.
+
+This does not edit workspace files or alter available tools. Owner-customized
+files, unknown template revisions, other agents, mismatched workspaces and disabled
+prompt hooks retain their original text. Capability changes are evaluated on the
+next bootstrap, so enabling email, Calendar or Frontier restores its detailed guidance.
+Reduced bootstrap text is not evidence of task quality or a measured speedup.
+
+## Availability and runtime readiness
+
+The authenticated `/api/pixel/status` response keeps model-route `available`
+separate from its additive `readiness` projection. A callable model route does
+not establish effective host permissions or an installed-release match.
+Readiness version 1 reports current access verification and partial runtime
+identity, with states `unverified`, `attention`, or `unavailable`; it cannot
+report `ready`. Runtime identity version 1 leaves `runtimeMatchesRelease` null
+unless observed file drift establishes a mismatch (`false`).
+
+The readiness checks are read-only, concurrent, and individually bounded by a
+four-second whole-request deadline. Missing older endpoints, timeouts, and
+invalid proof remain unverified. A valid failed host access inspection or an
+unfinished access transition is shown as needing attention. `busy` alone is
+activity, not failed proof; `pending: false` does not establish that admission
+is open. No paths, credentials, or raw upstream errors enter this projection.
+
+Portal shows a readiness warning only for a concrete access failure, an
+unfinished access transition, or a runtime file mismatch. Unknown, missing,
+or unsupported readiness remains unverified in status diagnostics without a
+persistent chat warning. It does not disable chat, select another model,
+change access, bypass admission and recovery controls, or establish that the
+runtime is ready.
+
+## Legal and release boundary
+
+Pixel source is included in ODS at [`vendor/pixel`](../vendor/pixel) under the
+[Pixel License for ODS](../vendor/pixel/LICENSE.md). It grants broad use,
+modification and distribution rights as part of ODS, including commercial ODS
+use, without a separate agreement or acknowledgement flag. It does **not**
+license Pixel as a standalone product or under ODS's Apache-2.0 license. See
+the [repository licensing overview](../LICENSING.md).
+
+The Linux/WSL2 installer applies the following technical eligibility rules:
+
+| Request | Qualified host | Result |
+|---------|----------------|--------|
+| `ENABLE_PIXEL=auto` (default) | Yes | Pixel is enabled as the core agent and Open WebUI's default model |
+| `ENABLE_PIXEL=auto` | No | Pixel is skipped; existing ODS tools remain available |
+| `--pixel` | Yes | Pixel is required and installed |
+| `--pixel` | No | Installer stops before changing the agent route |
+| `--no-pixel` | Any | Pixel route is disabled; Hermes remains available |
+
+## Linux and WSL2 eligibility
+
+The Linux installer selects Pixel on:
+
+- Ubuntu 24.04/26.04 LTS or Debian 12;
+- Linux with `systemd` as PID 1;
+- a native Linux host or WSL2 (WSL1 is rejected); and
+- an ODS-managed local, cloud, hybrid, or external OpenAI-compatible model route.
+
+ODS supports more platforms than this Linux path. The native Windows PowerShell
+installer and other Linux distributions use Hermes. Docker Desktop's WSL2
+backend alone does not install Pixel: use the ODS Linux installer inside a
+qualified WSL2 distribution with systemd for that host runtime. External Ollama,
+LM Studio, and generic OpenAI-compatible endpoints are bound through authenticated LiteLLM;
+Pixel uses the exact selected upstream model behind `ods/current`. For a generic
+local/LAN endpoint, select `--external-llm-provider openai-compatible` together
+with `--external-llm-url` and `--external-llm-model`. This reuse path is for
+credential-free upstreams; credentialed remote providers use the Remote GPU
+provider workflow. Do not put credentials in an endpoint URL.
+These are ODS capability gates, not a reduction of the ODS support matrix.
+
+## Native macOS eligibility
+
+The Apple Silicon macOS installer enables native Pixel by default. It acquires
+the verified `vendor/pixel.bundle` from the public ODS checkout, prepares the
+gateway and managed host services, then activates them with the Docker ingress,
+edge, sandbox and preview services. Metal inference stays on the Mac. No
+separate Linux VM, Linux systemd, private GitHub repository or acknowledgement
+flag is needed for this path.
+
+`--no-pixel` selects the non-Pixel path for a fresh installation. The base
+installer rejects existing native Pixel state rather than silently replacing
+or disabling it; use the managed native update/migration path and preserve
+`data/pixel-native` and its receipts. Do not delete protected state or use force
+to work around that guard. See [MACOS-QUICKSTART.md](MACOS-QUICKSTART.md).
+
+If native retirement reports `native-retirement-stopped-job-needs-witness`, do
+not remove more files or fabricate a shutdown receipt. See the explicit,
+maintainer-assisted [stopped-service retirement recovery](MACOS_PIXEL_RETIREMENT_RECOVERY.md).
+It preserves verified autostart definitions and requires a Mac restart before
+retiring a deployment that lacks a live process-tree witness.
+
+### Retained initial installation stopped at final health
+
+A healthy gateway alone does not complete initial activation. The installer
+also waits for `pixel-native-ingress`, `pixel-workspace-preview`, and
+`pixel-edge`. A timeout reports each service's last observed state; preview
+startup errors report a fixed stage and reason without paths or configuration
+values. These diagnostics are also written to the install log.
+
+For an initial attempt with `activation.json` reporting `status: error`,
+`requiresRecovery: true`, and `phase: final-health` (or `webui-routing`), the
+maintainer recovery helper can finish the **Pixel stage** once the underlying
+services are healthy. Use a reviewed ODS source tree containing the helper,
+and run as the same signed-in Mac user who installed ODS:
+
+```bash
+python3 /path/to/reviewed-ODS/ods/installers/macos/lib/pixel-native-recover.py \
+  --install-dir "$HOME/ods" --ods-source "$HOME/ods"
+```
+
+Replace the source path and installation directory with their actual paths.
+The helper requests sudo for read-only verification of the protected initial
+activation. It checks the protected journals, exact runtime/service selection,
+live process identity, access readiness and released admission, then checks
+Docker health and refreshes Dashboard/Open WebUI's native route. It verifies
+protected readiness again before publishing `selection-update.json`. The
+original preparation and activation receipts are preserved. A rejected check
+before publication does not publish readiness; an identical completed recovery
+can be retried. The optional model handoff described below runs after publication.
+Do not edit the receipts, replay activation, uninstall, or clear volumes to
+bypass a rejection. This helper does not repair an unfinished protected
+activation, perform a native migration, or extend the health timeout.
+
+**This is not a whole-installer resume.** Success prints `native-pixel-ready`.
+The original installer may also have stopped before the host-agent setup,
+optional OpenCode setup, background full-model download, and final readiness
+summary. Those remaining steps need a separate maintainer-reviewed continuation
+before declaring ODS fully installed. In particular, model and extension
+management need a working host agent; do not infer that they work from Pixel
+health alone. Older failed installs may retain only the starter model because
+the selected full-model download arguments had not yet been persisted.
+
+For maintainer-assisted recovery, `--restore-host-agent` additionally runs the
+same isolated Python runtime and login LaunchAgent setup used by the normal
+installer. It uses the verified native Docker transport, configures the host
+bridge where needed, and requires an authenticated Dashboard-to-host-agent
+request to succeed. This runs between the protected readbacks; a setup failure
+does not publish a new successful selection. Success includes
+`hostAgentReady: true`, but still reports `installerComplete: false`.
+Private diagnostics are retained at
+`data/pixel-native/preparation/continuation-host-agent.log`; review them before
+sharing. A failed operation can leave the owner-level host agent partially
+configured, so preserve the installation and retry only after diagnosis.
+The flag does not install optional tools or launch the full-model download.
+Older attempts did not persist the OpenCode choice before the Pixel stage;
+do not infer that choice from a missing binary or LaunchAgent.
+
+New macOS installations save `ENABLE_OPENCODE=true` or `false` before Pixel
+activation. For a retained failed installation, maintainers can inspect the
+remaining choices without running recovery or setup:
+
+```bash
+python3 /path/to/reviewed-ODS/ods/installers/macos/lib/pixel-native-recover.py \
+  --install-dir "$HOME/ods" --ods-source "$HOME/ods" --inspect-continuation
+```
+
+This reads the retained configuration and renders the selected Compose stack;
+it does not request sudo, start services, write selection receipts or verify
+live readiness. Output distinguishes saved choices from unknown historical
+choices, lists checks still required, and omits credentials and download
+arguments. Missing `ENABLE_OPENCODE` yields `requiresChoice: ["opencode"]`.
+After confirming the user's original choice, add `--opencode-choice disabled`
+or `enabled` to the inspection command or optional-setup command below. This
+confirmation is not persisted and
+cannot override a saved choice. Whisper model setup and Perplexica configuration
+are listed only when those services are in the retained Compose selection.
+Inspection cannot be combined with setup options and never reports a
+completed installation.
+
+For observational checks against a running native installation, maintainers
+can run the separate API inspector as the signed-in owner (not with sudo):
+
+```bash
+python3 /path/to/reviewed-ODS/ods/installers/macos/lib/pixel-native-readiness.py \
+  --install-dir "$HOME/ods"
+```
+
+For an old installation without a saved OpenCode choice, confirm the original
+choice using `--opencode-choice disabled` or `enabled`. This does not change
+the saved configuration. The inspector checks Dashboard, authenticated host
+access, the selected model's live identity/context, extensions and Portal
+access. Cloud mode checks route discovery, not successful provider inference.
+Requests have bounded response sizes and wall-clock deadlines; credentials
+stay on loopback and are not printed or forwarded through redirects.
+
+Exit zero and `api-checks-passed` mean only these observations passed. Output
+always retains `installerComplete: false` and lists outstanding verification:
+protected recovery, selected service/optional-tool health, model completion,
+and Portal chat plus preview delivery. Release identity remains unverified
+unless a separate release attestation establishes it. This command does not
+activate services, resume setup or replace the genuine failed-install test.
+
+Add `--include-services` to also inspect the retained Docker selection after
+Pixel has reached its ready selection. This uses the installed native gateway's
+Docker socket/project, not the shell's current Docker context or Compose
+profiles. The existing native-selection and Compose security validators run
+before inspection; a missing or unrecovered selection is not bypassed.
+
+The inspector accepts init jobs only when their selected dependencies require
+successful completion and they exited with code zero. It requires every
+selected running replica to pass its configured healthcheck, respects disabled
+profiles as filtered by Compose, and checks profiles enabled in the retained
+environment rather than skipping services with a profile annotation. It
+rejects a running Docker model when that service is scaled to
+zero for native Metal inference. Configuration and selection are rechecked
+around Docker observations. No `up`, restart, setup or download is performed.
+Per-service booleans appear in `serviceChecks`; no container configuration or
+credentials are printed. Successful observations remove only the
+`selected-service-health` pending gate. If the resolved selection also confirms
+that none of OpenCode, Whisper or Perplexica was chosen, optional setup has no
+pending state to verify. Selected optional tools still require their setup and
+functional checks; container health alone does not certify those tools.
+
+Once the combined inspector passes, maintainers can explicitly exercise a
+visible answer and an actual tool-produced preview:
+
+```bash
+python3 /path/to/reviewed-ODS/ods/installers/macos/lib/pixel-native-acceptance.py \
+  --run --install-dir "$HOME/ods" --timeout 600
+```
+
+For a missing historical OpenCode choice, add the same confirmed
+`--opencode-choice disabled` or `enabled`. This test is **not read-only**: it
+creates two test conversation IDs and requests one uniquely named workspace
+directory with an HTML file and published preview. The prompts prohibit
+dependency installation and edits to other files. Use it when no other
+installation/model change is in progress. It does not run automatically after
+recovery or retry failed model actions.
+
+Before dispatch, the test saves an owner-only `acceptance-<id>.json` under
+`data/pixel-native/preparation` and prints its conversation IDs and markers.
+Each request has the specified wall-clock limit (1-900 seconds). An incomplete
+stream triggers one bounded cancellation request for that test conversation
+only; `cancelConfirmed: false` means the server's stop was not established.
+Preserve the record and inspect its conversation/workspace before another test.
+Partial work is never deleted. API credentials and model transcripts are not
+printed, and preview links are fetched only through the local preview port
+without forwarding API credentials or following redirects.
+
+`functional-checks-passed` requires a visible marker answer, a completed stream
+without errors, and HTTP 200 containing the unique marker from the published
+page, with matching configuration and readiness observations before/after.
+It remains `installerComplete: false`: this does not verify protected recovery,
+release identity, optional-tool inference or the reporter's original failure.
+The report removes only the model-completion and Portal chat/preview pending
+gates when both tests and the final stability observation pass. Other pending
+verification is retained, including protected recovery.
+
+`--restore-optional-tools` executes the same OpenCode, Whisper model and
+Perplexica setup functions as the normal installer, for the retained choices
+only. Historical installations missing the OpenCode choice require the
+explicit confirmation above before setup begins. Core with a confirmed or
+saved opt-out reports `optionalTools.status: not-selected` and starts no extra
+tools. A disabled choice does not stop a current user OpenCode session.
+
+Selected OpenCode must use the reviewed release, retain its inference route,
+and pass owned LaunchAgent plus local HTTP readiness checks. Foreign plists or
+jobs are not replaced. Selected Whisper requires a cached model, including
+after a bounded download trigger; an accepted trigger alone is not success.
+Perplexica must pass the existing endpoint, credential and model configuration
+readback.
+
+Optional setup runs inside the recovery selection lock, between protected
+readbacks and before readiness publication. It rechecks the retained
+environment and rendered Compose selection around setup. Failure preserves
+the original receipts and can leave partial owner-level configuration; inspect
+the private `data/pixel-native/preparation/continuation-optional-tools.log`
+before retrying. `optionalTools.status: ready` confirms this setup step, not
+completion of the full installer or the later model swap.
+
+The separate `--resume-model` option saves the verified Compose file selection
+and resumes the original full-model choice using the installed
+`bootstrap-upgrade.sh`. It matches the saved recommendation against the
+installed catalog, including context, pinned artifact URL and checksum; it
+does not reselect a model from current hardware policy. A different active
+model/store, ambiguous recommendation or conflicting retry metadata is refused.
+If the saved model is already selected, it only restores the missing Compose
+cache; this configuration check is not a live inference proof.
+
+For a qualifying retained failure, the setup options can be supplied together
+(add the confirmed OpenCode choice if the historical installation lacks it):
+
+```bash
+python3 /path/to/reviewed-ODS/ods/installers/macos/lib/pixel-native-recover.py \
+  --install-dir "$HOME/ods" --ods-source "$HOME/ods" \
+  --restore-host-agent --restore-optional-tools --resume-model
+```
+
+The model handoff occurs **after** Pixel readiness is published. A later
+handoff failure therefore leaves that successful Pixel selection intact.
+Original activation receipts are never rewritten. Existing same-owner upgrade
+processes are checked before starting a new one; do not delete PID/status files
+to bypass an in-progress worker. Retry arguments and the new PID are saved
+atomically. If starting the worker fails before it exists, a new failed status
+allows the normal `ods start`/`ods restart` retry path.
+
+The returned `modelUpgrade.status: download-started` means only that the
+background worker started. Inspect `logs/model-upgrade.log` and
+`data/bootstrap-status.json`, then verify the active model and Portal after
+the swap. The helper still reports `installerComplete: false`: final
+full-install readiness remains a separate release gate, as does optional setup
+when `--restore-optional-tools` was not requested.
+
+For the preview crash loop reported in #7448, the old generic logs cannot
+establish the original startup exception. Recovery of services after the
+timeout does not prove that the underlying startup problem has been fixed.
+
+## Linux host architecture
+
+The following systemd/socket layout describes Linux and WSL2. macOS uses native
+service management and a Docker ingress instead of these systemd services;
+the edge authentication, scoped tools and Operations approval boundaries remain.
+
+```text
+Browser
+  | no Pixel credential
+  +--> Open WebUI ------------------------------+
+  |                                             |
+  +--> Dashboard /pixel -> nginx -> dashboard-api
+                                                |
+                         narrow generated edge key
+                                                v
+                                  pixel-edge container
+                                  - no published port
+                                  - read-only filesystem
+                                  - fixed pixel/default model
+                                                |
+                                  mode-0660 Unix socket
+                                                v
+                                  pixel-ingress.service
+                                  - unprivileged Pixel owner
+                                  - no listening TCP port
+                                  - request allowlist and bounds
+                                                |
+                          owner-private gateway token injected here only
+                                                v
+                           Pixel/OpenClaw gateway on 127.0.0.1:18789
+                                                |
+            +--------------------+----------------------+--------------------+
+            |                    |                      |                    |
+            v                    v                      v                    v
+ exact-digest ODS plugin   Operations plugin     sandbox coding      ods-gateway/
+ eight typed tools        typed request spool    and public web      ods/current
+            |                    |                                           |
+            v                    v                                           v
+ /run/ods-pixel/         isolated root-owned                         authenticated
+ ods-status.json         Operations Broker                          LiteLLM loopback
+                              |                                          |
+                              v                                          v
+                   root-only quarantine                     active ODS model/
+                              |                              provider route
+                              v
+                   fixed artifact-promoter
+                   socket -> owner workspace
+                             |
+                             v
+                   create-only static snapshot
+                   -> site-*.localhost on-host origin
+                   -> group-scoped Unix HTTP relay
+                   -> authenticated Dashboard remote route
+                   -> sandboxed Dashboard panel/new tab
+```
+
+The Open WebUI and Dashboard paths converge at `pixel-edge`. The browser never
+receives either the edge key or Pixel's operator/gateway token. The edge key
+cannot call the loopback gateway directly. With the rest of the owner's home
+hidden, the host ingress bind-mounts only Pixel's exact owner-private gateway
+config read-only into its private runtime namespace, injects its token only on
+the final loopback hop, strips inbound headers, forces `openclaw/default`, and
+bounds request, response, stream, and timeout sizes.
+
+The edge and host ingress health checks fail closed unless the next hop is
+actually ready. Open WebUI startup does not depend on Pixel health; its ordinary
+models remain selectable. Pixel requests fail closed when the private
+ingress is unavailable.
+
+### Operations capability and exact downloads
+
+ODS enables Pixel's `engineering-operator` capability profile but explicitly
+keeps email, Calendar, social, Web Courier, and Frontier limbs disabled until
+their credentials and qualification paths are configured. The Operations limb
+is enabled through Pixel's isolated broker, not by granting the model a host
+shell, Docker socket, or privileged credential.
+
+The installer writes an owner-private, mode-`0600` policy at
+`$INSTALL_DIR/data/pixel/operations-policy.json`. Pixel copies the reviewed
+policy into root-controlled broker custody. The gateway can write typed request
+and cancellation records and read sanitized inventory, event, and result
+projections, but it cannot read broker policy, approvals, credentials, plans,
+leases, private state, or SSH material.
+
+The ODS management marker binds both the onboarding document and the exact
+Operations-policy bytes. A policy change therefore forces Pixel to regenerate
+and reinstall its broker configuration even when the immutable Pixel release
+itself is unchanged. Installation fails unless the resulting root-owned,
+mode-`0640` broker policy is byte-for-byte equal to the owner-private source;
+an installer success message is never treated as sufficient custody evidence.
+
+The default policy provides seventeen read-only named host actions. Identity
+and platform observations use `host.identity`, `host.kernel`,
+`host.architecture`, `host.platform`, and `host.os-release`. Broad machine
+exploration combines identity, kernel, platform, and operating-system evidence
+with `host.uptime`, `host.processes`, `host.services`, `host.cpu`, `host.gpu`,
+`host.memory`, `host.storage`, `host.network-addresses`,
+`host.network-routes`, `host.listening-ports`, and `host.tailscale`. It does not
+require the redundant
+`host.architecture` action because both platform and CPU observations already
+carry architecture evidence. A narrow architecture-only request still requires
+the dedicated action. In a broad inventory that already contains a structurally
+validated `host.cpu` receipt, the verifier may satisfy an explicit architecture
+facet from that receipt's exact `Architecture:` field instead of discarding the
+otherwise complete report; malformed or absent architecture data still fails
+closed.
+
+The seventeenth action, `host.network-peer`, activates only when the owner
+positively names one private LAN or Tailscale peer and asks for a connectivity
+check. It resolves that one name or private address and performs bounded ICMP
+and TCP checks against at most eight explicit or standard service ports. It
+cannot scan a range, follow a URL, reach a public or loopback address,
+authenticate, execute a remote command, guess credentials, or mutate either
+machine. A separate owner-requested SSH command still uses the immutable,
+externally approved host-command route.
+
+These actions intentionally expose useful host state without exposing a raw
+privileged shell. Process observations omit command arguments and environment
+values; service observations omit service environments; storage observation
+reports capacity rather than file contents; and network observation reports
+interfaces, routes, and listening endpoints without process arguments or
+credentials. Uptime reports only elapsed host uptime, user count, and the one,
+five, and fifteen minute load averages. The actions execute from the broker's
+protected state directory, so the broker still does not need access to the
+owner's home directory. Raw
+host shell remains disabled in Operations; Pixel's sandbox shell remains
+available for ordinary workspace work. Workspace file tools continue to
+operate only inside Pixel's sandbox; broader owner-file exploration requires a
+separately audited typed read bridge and is not implied by these host inventory
+actions.
+
+The policy also permits bounded automatic
+staging from a finite set of common public artifact hosts:
+
+- `example.com` for deterministic qualification;
+- GitHub and `githubusercontent.com`;
+- Hugging Face and `hf.co`;
+- npm, Node.js, PyPI, and `pythonhosted.org`.
+
+Other public domains do not become silently trusted. The broker compiles them
+as approval-required immutable plans. Credential-bearing URLs, non-HTTPS URLs,
+raw or private addresses, DNS rebinding, redirects outside reviewed domains,
+oversized content, digest mismatches, and emergency-pause or cancellation
+events fail closed.
+
+Successful downloads first enter a root-only, non-executable mode-`0600`
+quarantine under `/var/lib/pixel-ops-broker/artifacts/<job-id>/`. A submission
+receipt is not success. After a matching terminal broker result reports
+`succeeded`, Pixel may call the separately bounded
+`pixel_ods_download_promote` tool with that exact job ID, filename, requested
+HTTPS source, optional expected digest, and a safe relative workspace path.
+
+The root-custodied artifact promoter accepts only Pixel's owner UID over a
+mode-`0600` Unix socket. It re-reads the broker result, reopens the quarantined
+file without following symlinks, verifies the source, filename, byte count,
+SHA-256 digest, and stable file identity, and create-only publishes the same
+bytes into Pixel's workspace as an owner-owned, mode-`0600`, non-executable
+file. It has no network, shell, Docker, credential, overwrite, or arbitrary
+source-file capability. Parent traversal, symlink parents, broker-result drift,
+source or digest mismatch, and existing targets fail closed.
+
+ODS accepts an exact-download claim only after the promoter returns a
+host-authoritative final receipt containing the workspace path, exact byte
+count, SHA-256 digest, bound HTTPS source, `executable=false`, and
+`overwritten=false`. A transformed `web_fetch` response, a model-created
+workspace substitute, or a broker staging receipt can never satisfy this
+contract.
+
+### What the agent sandbox can run
+
+In Sandbox mode, Portal's `exec` commands run in Pixel's Docker sandbox
+(`vendor/pixel/deploy/sandbox/Dockerfile`). It has bash, python3 without pip,
+git, rg, jq, rsync, curl, OCR and PDF tools, and Node.js: the official `node`
+binary, pinned by SHA-256 for amd64 and arm64 in
+`vendor/pixel/RELEASE-MANIFEST.json` (`sandboxNodeRuntime`). npm, npx and
+corepack are not in the image, and the sandbox has no network, so the agent can
+run `node --check`, plain scripts and `node --test` offline but cannot install
+packages. There is no DOM or canvas; browser behaviour is still checked on the
+published preview with `pixel_ods_workspace_preview_inspect`. Workspace npm
+projects with dependencies use the separate `pixel_ods_project_build` service
+where it is installed.
+
+The same image definition serves Linux, WSL (including Arm64) and native macOS
+Pixel, which builds it for `linux/arm64`. Bootstrap (`pixel bootstrap --apply`)
+on Linux and WSL, and native preparation on macOS, run the new image's `node`
+once offline and refuse an image with another version or architecture or with a
+package manager before any live change. Building the image downloads Debian
+packages from deb.debian.org and Node.js from nodejs.org. Full Access runs
+commands natively instead, and its prompt makes no claim about installed
+runtimes. Existing installations pick up the runtime through a normal ODS
+update, which brings a new Pixel version and rebuilds the sandbox image. The
+update also removes the previous agent sandbox container before the new
+gateway starts (Linux and WSL through `openclaw sandbox recreate`, a macOS
+native update through Docker while every Pixel job is stopped). OpenClaw would
+otherwise keep a container used in the last five minutes on the old image. The
+container holds no state, because the workspace is a bind mount.
+
+A node check, test or harness that exits 1 with output is recorded as a test
+result, not as a failed tool call, up to `FREE_NODE_RESULTS_PER_RUN` per
+response, so the edit and test loop the agent is asked to run does not end the
+response at the run's failure limits. A missing node, a missing script, a
+timeout, a crash without output and inline `node -e` code still count as
+failures. `extensions/services/pixel-agent/COMPLETION-RELIABILITY.md` has the
+exact rules.
+
+### Cancellation and sandbox execution
+
+The Dashboard cancel path is an execution boundary, not only a UI gesture.
+The ODS plugin maps the opaque chat user to one exact active OpenClaw run. Each
+`exec` command in that run is launched in its own process group by an
+owner-installed wrapper. Cancellation atomically creates one zero-byte marker
+named with the run ID's SHA-256; the sandbox sees the owner-private control
+directory read-only, terminates only that process group with `TERM` and then
+`KILL`, and returns status 130. The gateway run is drained independently, the
+marker is removed after a short bounded delay, and the edge closes a successful
+cancelled stream with only `[DONE]`. A different concurrent chat and its
+process group are not touched.
+
+OpenClaw requires `dangerouslyAllowExternalBindSources=true` for this one
+host-to-sandbox bind. ODS does not treat that opt-in as general bind authority:
+the installer accepts exactly
+`~/.openclaw/.ods-exec-control:/run/pixel-ods-control:ro`, validates the source
+owner, type, link count, and exact `0700`/`0500` modes, recreates the Pixel
+sandbox after lifecycle changes, and rejects every additional bind. OpenClaw's
+security audit will still report the generic dangerous-flag warning. Removing
+the flag without removing the bind makes cancellation fail closed; adding a
+second source is outside the ODS contract.
+
+The dashboard route also handles explicit requests to open private HTTP(S)
+URLs at the edge. It returns one exact local explanation without forwarding the
+request to Pixel or the model, while ordinary conversation, public URLs, and
+text that merely mentions a private development URL continue through normally.
+Private browsing requires a separately reviewed and approved capability; the
+public-web tools and shell cannot be used as substitutes.
+
+## Install
+
+From a qualified Ubuntu 24.04/26.04 or Debian 12 host:
+
+```bash
+git clone https://github.com/Osmantic/ODS.git
+cd ODS/ods
+./install.sh --pixel
+```
+
+Omit `--pixel` to use automatic selection. Explicit `--pixel` is recommended
+for qualification because it turns an unexpected fallback into a visible
+installer failure.
+
+The installer uses the local, one-commit Pixel bundle shipped in ODS and
+checks its immutable digest before activation; it does not clone a private
+repository. To qualify an
+owner-controlled local Pixel checkout, place it under a secure directory you
+own and set all three source values:
+
+```bash
+PIXEL_SOURCE_DIR=/home/me/src \
+PIXEL_SOURCE_URL=/home/me/src/Pixel \
+PIXEL_SOURCE_REF=<40-character-commit> \
+./install.sh --pixel
+```
+
+Public ODS installs accept only the verified bundle shipped in ODS or an
+explicit absolute local checkout; remote source URLs are not supported,
+including as development overrides. A local source must be a clean Git
+checkout below `PIXEL_SOURCE_DIR`; the owner directories must not be group-
+or world-writable. Source operations are bounded. Normal ODS users need no
+Pixel Git credentials.
+
+## User experience
+
+After a successful install:
+
+1. Open `http://localhost:3000`. New chats default to `portal/default` when
+   Portal is enabled; the ordinary ODS model remains selectable.
+2. Open `http://localhost:3001/pixel`, or choose **Portal** in the Dashboard
+   toolbar, for the dedicated streaming agent UI.
+3. Hermes remains at its authenticated proxy URL shown by the installer.
+4. OpenCode remains an independent coding UI when enabled.
+
+Pixel follows the active ODS model without a qualification allowlist. Every
+callable ODS chat model can be used in the dedicated Pixel UI and through
+`portal/default`. Qualification affects recommendation and the displayed
+reliability tier only: a model that has not passed the demanding multi-step
+agent replay uses Pixel's **adaptive** route, while the composer remains enabled.
+Model intelligence may change the quality, speed, tool judgment, and length of
+work it can complete, but Pixel's broker permissions, approvals, receipts, and
+cancellation boundary do not change with that label.
+
+Open WebUI search-query generation uses the ordinary ODS model route, not Pixel,
+to avoid recursive agent routing. Automatic title, tag, and follow-up
+generation is disabled while Pixel is active because those cosmetic jobs would
+otherwise compete with the agent for the same local inference slot.
+The dedicated Dashboard keeps the current bounded conversation and opaque chat
+ID in that browser's local storage so a reload or Dashboard restart resumes the
+same Pixel session. It stores no gateway credential. **New chat** replaces that
+local pointer with a fresh opaque ID; older OpenClaw session files remain under
+the owner's normal Pixel lifecycle and are not exposed to the browser.
+For the default no-think mode, the managed Pixel route omits OpenClaw's Qwen
+thinking compatibility switch and declares reasoning inactive. The independently
+pinned llama.cpp no-think setting then remains authoritative on every model
+request. This avoids an OpenClaw 2026.6.33 compatibility path that treats the
+literal effort `off` as truthy and can otherwise spend the whole output budget
+in hidden reasoning after a tool call. This policy does not broaden the tool
+allowlist or make custom tools replay-safe.
+
+Playground project folders are not Git repositories, so the first time a
+response touches a project, before that call runs, the plugin keeps a copy of
+the project's files (`plugin/project-snapshots.mjs`). A call touches a project
+when it names a path in `Playground/<name>/`: a read, write, edit or patch, an
+exec whose working directory is in it, an ODS tool given the folder, or that
+path anywhere in an exec command or in what a process call sends. A mention of
+Playground without one plain project name (`Playground/*`, `cd Playground`,
+`os.path.join('Playground', ...)`, `find Playground`), or a named project left
+with `..` (`cd Playground/game && cd ../notes`), touches every project, up to
+the 16 whose files changed most recently. Before a response's first call that
+may change files, the plugin also takes a stat-level fingerprint of every
+project; a copy taken after its project had already changed is marked late, and
+Portal says that putting it back may not undo every change. A project changed
+only by a command that names neither it nor Playground (a script that edits
+every project) gets no copy. Every Pixel call that may change files, whatever
+started its run (a Portal response, a cron job, a webhook or a channel), waits
+while a restore runs.
+
+Copies and restores run in `plugin/project-snapshots.py`, a child process of
+the gateway, so they never block it. It opens the project and every folder
+below it relative to an open folder descriptor with `O_NOFOLLOW` and changes
+files only with the `*at()` calls on those descriptors, so a link is never
+followed, even when a folder is swapped for one while a copy or restore runs:
+no file outside the project folder is read into a copy, or written or removed
+by a restore, and a process that moves the project folder itself only moves
+where the files land, inside the workspace. Paths read back from the copies
+are checked too. Systems without those calls (Windows) offer no undo. Copies
+live in the OpenClaw state folder, `.ods-project-snapshots/` (private to the
+gateway's user, never mounted into the agent's sandbox and never published),
+with each file's content stored once. A copy lists every entry first, then
+copies code and small files first; links, hard-linked and special files,
+`node_modules`, `dist`, `out`, `venv` and dot-folders such as `.git`, files over
+8 MiB and anything past 2,048 files or 32 MiB are listed, not copied; a name
+with a control character is skipped. Each project keeps the copies of its five
+latest turns that changed it, and all copies together stay under 512 MiB,
+oldest dropped first, though never a project's latest copy that offers Put
+back, the latest restore's copies or a running response's copy. A project's
+copies are dropped two weeks after ODS first finds the project missing.
+
+A response's end, recorded when its own chat session ends (a delegated child
+that ends earlier records nothing), says whether the turn changed each
+project. A copy whose response never ended, because the gateway restarted, is
+ended at the helper's next request. Only the latest turn that changed a
+project offers **Put back files from before this turn**
+(`/api/pixel/projects/restore-options` asks which turns do;
+`/api/pixel/projects/restore` puts back, relayed by the edge and the ingress to
+the gateway routes `/pixel-ods/project-restore-options` and
+`/pixel-ods/project-restore`). Putting back makes the project match the copy:
+files the turn changed or deleted are written back, and when the copy listed
+everything, files and folders added since the copy are removed. What either
+copy left out stays as it is and is named. If files changed after the turn
+ended, if another response changed the project while the turn ran, or if the
+turn's end was recorded only after a restart, Portal first names the files it
+would overwrite or remove and changes nothing until the owner says yes. A
+restore first keeps a copy of the files as they are, which its **Undo** puts
+back, and records that it started before it changes anything: a restore that
+stops midway is finished by trying again, and its Undo still brings back the
+turn's version. The host remembers the latest restore, so the Undo is still
+offered after a reload; if files changed since, it asks first in the same way.
+A retried restore gets the same answer; one that could not change some files
+names them and why, and its retry finishes the job under the same Undo. A
+restore is refused while any Portal run, tool or background command is alive.
+A preview keeps what Portal last published, often the turn's version, until
+Portal publishes the project again.
+
+### Model swapping
+
+Pixel follows the same model gateway as the rest of ODS. Its private OpenClaw
+provider is `ods-gateway`, bound only to authenticated LiteLLM on
+`127.0.0.1`. It always requests ODS's stable `ods/current` alias. Every
+supported LiteLLM mode publishes that alias, and the Model Switchboard can
+move its concrete backend without changing Pixel's persisted route. Provider
+credentials, arbitrary URLs, and browser-supplied model IDs cannot rewrite
+that route.
+
+Using the Dashboard Models page or `ods model swap <tier>` keeps the stable
+alias while transactionally updating Pixel's concrete-model display metadata,
+context window, output limit, reasoning capability, and model-family
+compatibility policy after the new runtime and downstream routes pass their
+proofs. Cloud, hybrid, and external OpenAI-compatible routes can change the
+route behind the same alias without teaching Pixel a provider-specific
+endpoint. The Pixel
+gateway is restarted and verified before the transaction commits. The public
+Open WebUI identity remains `portal/default` throughout. Existing clients may
+continue to request the legacy `pixel/default` API alias; it is not listed for
+new conversations.
+
+The Dashboard Remote Provider page uses that same stable alias. A direct
+provider becomes active only after its egress probe, a real LiteLLM completion,
+and Pixel reconciliation all succeed. An SSH-backed provider remains visibly
+staged until the managed tunnel proof completes. The operator supplies the
+provider's context window, output limit, and reasoning capability so broad
+model swaps update Pixel's runtime policy rather than inheriting stale local
+limits. Repeated route tests verify the live LiteLLM and Pixel consumers; they
+do not trust an old readiness marker. Disabling the provider restores the exact
+pre-provider ODS mode and Pixel contract while retaining a private, non-secret
+saved route profile and the existing secret custody. `ods remote-provider
+enable` then performs a new direct or SSH proof before Pixel moves back to that
+route; a failed SSH proof automatically pauses it again. Removing the provider
+restores the same local contract but also deletes the saved profile and secrets.
+
+If Pixel reconciliation fails, ODS restores and proves both the previous model
+runtime and Pixel route. The first upgrade from the legacy direct
+`ods-local`/llama.cpp binding is also transactional: the rollback contract
+captures the exact prior provider, model limits, reasoning mode, and route.
+The LiteLLM key stays only in owner-private mode-`0600` Pixel state and is never
+sent to the browser or written to a public config. A stopped or unmanaged Pixel
+is never adopted. Model
+family changes are supported: an explicitly reasoning-enabled Qwen route gets
+the Qwen chat-template compatibility policy and a real non-off effort; that
+policy is removed for no-think Qwen routes and when a non-Qwen model is
+activated. Pixel's
+managed agent route supports OpenClaw's 4096-token minimum, including the
+bundled 8K T0 profile. Models below 16K run in a deliberately constrained
+adaptive mode, where task complexity and reliability vary with the available
+prompt budget; they are not excluded. An advanced custom activation below 4K
+is rejected before any model state changes. ODS sets Pixel's output ceiling to
+one quarter of the context, up to 8192 tokens. OpenClaw's compaction reserve is
+one fifth of the context plus four fifths of that output ceiling, with no
+separate reserve floor, because a redundant floor can reject otherwise usable
+compacted history. At 8K this leaves about 4.9K tokens for the prompt and tool
+definitions, which many Portal tasks exceed ("context overflow"). With
+`ODS_MODEL_PROFILES=enabled`, Portal shows a "context too small" advisory for a
+local model served below 16K, with the fix: load it with more context, or switch
+models. The retained recent tail is capped at one sixteenth of the selected
+context (and 20K tokens globally), so compaction always removes real history
+instead of recording a no-op when the runtime's fixed 20K default exceeds the
+whole model window.
+
+Generic `EXTERNAL_LLM_URL` reuse remains outside this contract because it
+bypasses the managed LiteLLM route. Automatic selection uses Hermes for that
+case, and explicit `--pixel` fails visibly instead of implying provider parity.
+
+## Bounded ODS tools
+
+The default ODS integration exposes nine narrowly scoped tools to Pixel. They
+remain available to every callable model through the same policy-filtered Tool
+Search catalog; model qualification labels describe observed quality and never
+act as a capability gate:
+
+- `pixel_ods_status` returns the sanitized overall ODS state, an explicit
+  application count, and allowlisted application states.
+- `pixel_ods_apps_list` returns the same explicit count and allowlisted
+  application inventory in an app-oriented shape. User-facing entries include
+  an allowlisted purpose and the configured localhost URL, so Pixel can name
+  and link ODS applications without guessing default ports. The count avoids
+  asking small local models to infer it from the array.
+- `pixel_ods_host_observe` runs one exact, read-only host observation through
+  the external Operations Broker and returns its terminal receipt. It has no
+  broker-target, command, mutation, approval, or raw-shell input. Its only
+  optional dynamic inputs are the sanitized one-peer name/private address and
+  bounded port list required by `host.network-peer`.
+- `pixel_ods_host_command_propose` submits one owner-requested command to the
+  fixed `ods-host` target and waits internally for the broker's immutable plan
+  or terminal receipt. Its only input is the exact command; it cannot approve
+  the plan, and an `awaiting-approval` receipt proves that no command ran.
+- `pixel_ods_evidence_report` and `pixel_ods_evidence_readback` are guard-only
+  controls for an owner-requested report tied to verified Operations evidence.
+  On compact models the guard may complete that exact report atomically after
+  receipt validation: it accepts one owner-named workspace-relative path,
+  generates the body mechanically from the validated receipt, rejects unsafe
+  parents and multiply-linked destinations, writes mode `0600`, and verifies
+  readback through the same file descriptor. It cannot write model-authored
+  content or provide a generic host-filesystem capability.
+- `pixel_ods_web_extract` uses OpenClaw's strict public-web network guard to find a
+  distinctive literal method or section name anywhere in a long public page.
+  A bounded fallback accepts two or three keywords only when they co-occur in
+  one evidence window. The tool returns only that bounded, explicitly untrusted
+  window. It is the targeted fallback when the normal `web_fetch` prefix is
+  truncated before the requested detail; local, private, single-label,
+  credentialed, and raw-IP destinations remain blocked. It requests a page as
+  a browser-compatible navigation that names `ODS-Pixel/1.0`, and only after a
+  plain 403 or 406 repeats the plain request once. Script and style text is
+  removed before extraction. A bot challenge or block is reported as not read;
+  ODS never solves, waits out or retries one, and runs no JavaScript.
+- `pixel_ods_download_promote` can publish one already-successful, exact broker
+  download into one new relative path in Pixel's workspace. It cannot fetch,
+  transform, overwrite, execute, or select an arbitrary host file.
+- `pixel_ods_workspace_preview` publishes one owner-requested static site from
+  a workspace-relative directory. The host service accepts only bounded,
+  owner-controlled, non-linked HTML/CSS/JavaScript/image/font files, requires
+  `index.html`, copies them into a create-only content-addressed snapshot, and
+  performs an HTTP readback before returning a receipt. The private ingress
+  carries that exact receipt in a structured terminal frame; the Dashboard
+  never opens a URL parsed from model prose. The Pixel portal automatically
+  shows the snapshot in a side panel with a script-capable iframe. Every
+  Dashboard client, including localhost and SSH-forwarded clients, uses
+  `/pixel-preview/<site-id>/` on that same Dashboard authority. The underlying
+  host snapshot retains its content-addressed `site-*.localhost` URL and rejects
+  mismatched host/path pairs; that URL is not the Dashboard's iframe route.
+  Nginx authenticates the hop to the internal-only Pixel Edge, Pixel Edge reads
+  through a group-scoped Unix socket rather than opening a host port, and the
+  returned document receives an enforced CSP sandbox without
+  `allow-same-origin`. The preview document can run its scripts and load its own
+  immutable local assets, but it cannot inherit Dashboard cookies, DOM, or
+  storage authority; the same CSP applies to the new-tab view. Accessing
+  `localStorage` or `sessionStorage`, including their property getters, reads
+  and writes, may throw. Model-authored apps must treat persistence as optional:
+  keep working state in memory and guard storage access and every operation
+  with `try/catch` and an in-memory fallback. Failed saving must not prevent
+  startup or continued interaction. In-memory state does not survive reload;
+  neither the preview contract nor a publication receipt promises durable
+  persistence. Do not add `allow-same-origin`, inject a storage shim, or bypass
+  isolation to make an artifact work. Dashboard previews
+  allow client-side form validation/submit handlers and browser downloads for
+  exports (for example, a clicked CSV download link). CSP still denies every
+  network form action with `form-action 'none'`. They block external
+  connections, popups, top-level navigation, camera, microphone, and
+  geolocation. The standard `allow-downloads` permission enables browser-managed
+  downloads; it does not guarantee that every download required a user gesture,
+  and it grants no application execution or arbitrary host-file access. A
+  development server inside Pixel's disposable sandbox is not the owner's
+  browser-facing host. HTTP readback establishes publication only, not successful
+  script startup or interaction. Verify requested controls and continued work
+  after failed saving at the exact published URL before claiming they work.
+
+  Every creative artifact follows the same model-authored workspace path.
+  Open-ended demos, games, task boards, animated SVGs, voxel scenes, named
+  designs, and arbitrary sites must be written by the active model before the
+  preview adapter can publish them. The adapter never supplies or fabricates
+  creative bytes, and new creative work is always written by the active model.
+  ODS ships one finished example project, Elf of Doom, which Portal wrote in
+  ODS from natural-language prompts. The installers copy it to
+  `Playground/elf-of-doom` whenever Playground/elf-of-doom is absent and the
+  workspace has never received it (a private record in the OpenClaw state
+  folder, `.ods-example-projects/<SHA-256 of the workspace path>.json`, which
+  the agent's sandbox never mounts, lists each example received, so a deleted
+  or renamed copy is never added again, and each one ODS itself added; the
+  run after one that stopped before writing it recognizes ODS's own unchanged
+  copy), and never replace, merge into or delete an existing entry of that
+  name; it is ordinary owner content. Only a folder the record says ODS
+  added is the example: an owner's own earlier `Playground/elf-of-doom` is
+  neither listed as it nor guarded.
+  While the folder exists, Portal's sidebar lists it under
+  Projects > Playground like any other project, and clicking it publishes that
+  existing folder through the same create-only preview service with no model
+  run (the plugin's gateway route `/pixel-ods/example-projects`, relayed by
+  the ingress, the edge and `/api/pixel/example-projects`). Portal changes
+  it only when the owner's own message starts with "In elf-of-doom,", for
+  example "In elf-of-doom, make the arrows give 7"; on such a turn project
+  routing keeps every write, edit and exec working folder in
+  Playground/elf-of-doom and does not treat the request as a new project.
+  When any other run changes it, ODS puts it back, and the reply Portal
+  shows ends with one line saying so: the run's verification carries it as
+  `notice`, which the ingress adds after the delivered reply
+  (`host/pixel_ingress.mjs`). The plugin (`plugin/example-guard.mjs`) keeps
+  a known-good tree of the folder in memory:
+
+  - When a run starts while no other Portal run works in that workspace, the
+    folder as it is then becomes the known-good tree; a run never restores
+    when it starts. So what changed while Portal was idle is the owner's: a
+    hand edit, a folder the owner deleted, or what an earlier run's
+    background process wrote after that run ended.
+  - For a run whose message does not have that form, the folder is compared
+    with the tree after each tool call, at finalize and when the run ends,
+    and restored exactly on any difference. Nothing ODS finds there is
+    deleted: what it takes out (a changed file, or a file or folder moved
+    in) is moved to a new folder beside it,
+    `Playground/elf-of-doom-recovered-<UTC time>`, and the owner's line
+    names that folder. A link found there is removed itself, never what it
+    points to.
+  - From the start of a run with that form until it ends (or its deadline
+    plus two minutes, if the gateway never sees its end), no other run's
+    change is undone, and its end makes the folder as it is then the
+    known-good tree. So with two chats at once, what one changes while the
+    other names the example stays. A run that starts while another works
+    keeps the tree it finds.
+
+  The guard protects a folder of at most 512 files and folders and 16 MiB
+  that holds no link or hard-linked file; otherwise it leaves the folder to
+  the owner and logs that once. After a gateway restart the folder as the
+  gateway first finds it is the known-good tree. To remove the example, the
+  owner deletes the folder; the record keeps the installers from adding it
+  again. This keeps the owner's game safe from mistakes; it is not a
+  sandbox. The adapter accepts only the existing relative
+  directory, so safety enforcement, static validation, snapshot isolation,
+  and HTTP readback cannot be confused with authorship. Pixel may author
+  either a self-contained `index.html` or a richer set of local files; ODS
+  imposes no creative-size ceiling and publishes only the exact completed
+  snapshot.
+
+The status tools read only `/run/ods-pixel/ods-status.json`. The plugin does not
+receive the Docker socket, Dashboard API key, Open WebUI key, host shell, or ODS
+operator credentials. The targeted extractor receives only a public URL and
+literal query and delegates transport to OpenClaw's DNS-pinned, redirect-aware
+web guard. The projection accepts only its documented schema, service and app
+enums, owner, mode, size, timestamp freshness, UTF-8, and fixed path. It rejects
+symlinks, replacement races, unknown keys, duplicate apps, stale or future
+timestamps, and group/world-writable files.
+
+`web_fetch` and `pixel_ods_web_extract` return transformed, safety-marked page
+evidence, not the origin server's exact response bytes. Pixel must not save that
+representation as a byte-exact download or attribute its size or digest to the
+remote object. For an exact-byte request, the loop guard binds one HTTPS URL and
+one safe relative workspace path, then requires `pixel_ops_download_stage`, a
+terminal `pixel_ops_job_wait`, and `pixel_ods_download_promote` in that order. It
+rejects substitute writes and blocks a success claim without the promoter's
+matching final receipt. If staging or promotion is unavailable, the request
+fails closed without creating a substitute artifact; ordinary page research
+remains available.
+
+Adding an ODS action is a security-boundary change. It requires a new explicit
+tool contract, policy and authorization design, adversarial tests, and fresh
+install/rollback qualification; do not broaden the projection reader into a
+generic shell, HTTP, Docker, or filesystem tool.
+
+OpenClaw's security audit also reports its generic `models.small_params`
+critical when the active local model is at or below 300B and public web tools
+are enabled. The qualified ODS posture is a personal assistant for one trusted
+operator, with sandbox mode `all`, bounded tool loops, public-only destinations,
+and page content explicitly treated as untrusted evidence. It is not a
+multi-tenant or hostile-input deployment. Operators who expose Pixel to
+untrusted users must deny `group:web` and `browser` for that model (losing web
+research) or qualify a stronger model and threat model first; do not describe
+the generic audit finding as green or suppressed.
+
+## Installer ownership and upgrades
+
+ODS writes `~/.config/ods/pixel-managed.json` with mode `0600`. The marker is
+created before Pixel is changed and moves from `installing` to `ready` only
+after Pixel verification, systemd activation, and private-ingress health pass.
+The marker records that no active Pixel release or runtime attestation existed
+before ODS created it. After Pixel verification it binds the verified contract,
+live config, exact active release identity and install-manifest hashes, release
+version, and validated live sandbox image ID while remaining `installing`, so
+an interrupted ingress setup can safely verify and reuse the active release on
+retry without claiming readiness. The ready marker also binds the exact Pixel
+source revision and a domain-separated SHA-256 of the deterministic ODS
+onboarding contract, including the approved ODS plugin tree digest, plus a
+canonical hash of the verified live OpenClaw configuration. When all bindings
+match exactly, a rerun skips Pixel's
+same-release apply transaction, verifies the exact source, and reinstalls the
+ODS ingress. If only the ODS extension contract changed while the exact
+verified Pixel source and newly planned canonical runtime configuration still
+match the live configuration, ODS refreshes OpenClaw's persisted plugin
+registry, verifies the exact plugin root and seven-tool descriptor in both the
+persisted and current registry views, then restarts and verifies the gateway.
+Pixel source drift or runtime-configuration drift takes the ordinary
+configure/plan/apply path and remains fail closed.
+
+The managed runtime preserves the upstream default workspace-bootstrap ceilings
+(`bootstrapMaxChars=32000` and `bootstrapTotalMaxChars=96000`). At 32K context
+and above, Pixel uses a `14000`-character per-file and `36000`-character total
+ceiling so the shipped `AGENTS.md` and `TOOLS.md` contracts remain available in
+full while unrelated workspace material stays bounded. Below 32K, injecting
+those verbose files would overflow a fresh turn before the model could call a
+tool. ODS therefore uses OpenClaw's supported `contextInjection=never` mode for
+that agent route and supplies a concise safety/execution core plus only the
+route-specific contract needed by the owner's current request. Tool availability,
+sandboxing, approvals, and broker authority do not change with context size.
+
+ODS explicitly enables OpenClaw's local-model lean surface for Pixel. The
+stable `ods/current` alias prevents OpenClaw from inferring that the provider is
+local, so without this setting even a lightweight laptop model receives every
+direct tool schema. Lean mode retains the same capabilities behind the
+`tool_search`, `tool_describe`, and `tool_call` structured controls while
+reducing the first-turn schema burden. Pixel Edge also adds a
+short, trusted delivery instruction next to each current owner message. This
+prevents small models from selecting OpenClaw's asynchronous `NO_REPLY`
+sentinel in interactive chat; it does not fabricate an answer or retry a
+possibly side-effecting tool request.
+
+ODS will not adopt or overwrite an ambient Pixel/OpenClaw deployment. If it
+finds an existing OpenClaw configuration, Pixel gateway environment, Pixel
+onboarding record, active release, runtime attestation, or gateway systemd unit
+without its management marker, the installer stops and leaves that deployment
+untouched.
+
+An upgrade from the former ODS-managed Pixel source pin migrates the canonical
+`https://github.com/Osmantic/Pixel.git` setting to ODS's bundled source without
+contacting that repository. Before replacing installed ODS files, the installer
+verifies and retires the previous managed Pixel release using its exact local
+source checkout. If that checkout is missing or changed, the upgrade stops
+before retirement or source copy; restore the checkout from a local backup and
+retry. Custom remote source settings are not silently migrated.
+
+On Linux/WSL2, a retained-source retry can restart its existing Pixel Edge if
+it stopped cleanly before the installer could acquire the source-upgrade
+hold. This runs only through the root installer operation: ordinary status
+polling and model requests do not restart containers. The active gateway must
+still prove the same configured access mode, the source plan must remain
+staged and unheld, and the original private Edge gate must be idle. The
+coordinator verifies the container's installation identity, protected owner
+credential, restrictions and unshared Compose volume before starting that
+immutable container ID once. It then verifies health and the unchanged gate
+before acquiring the usual durable source hold. The already-running path is
+unchanged.
+
+Paused/restarting containers, nonzero exits, OOM termination, foreign or
+changed containers, missing/held/interrupted gate state, stale runtime proof
+and existing transitions are not silently repaired. A bounded `source-edge-*`
+reason identifies a refusal without exposing credentials. A failed check
+preserves source snapshots, admission holds and the selected access mode; it
+does not recreate a container or volume. This recovery addresses a cleanly
+stopped retained Edge, not the underlying reason it stopped.
+
+The focused `test_source_edge_restart.py` suite covers custody, race and
+transition refusals. Portal runtime CI additionally runs
+`test_source_edge_restart_docker.py` on an isolated Linux Docker runner using
+the production image and Compose fragment. That test exercises stopped-volume
+inspection, immutable-ID start, readiness and preservation of an existing
+hold; host gateway/source proofs use fixtures, so it is not a full WSL or
+model-install qualification.
+
+## Configuration reference
+
+| Variable | Default / owner | Meaning |
+|----------|-----------------|---------|
+| `ENABLE_PIXEL` | `auto` | `auto`, exact `true`, or exact `false` selection |
+| `PIXEL_SOURCE_URL` | `bundled` | Local ODS source bundle; explicit developer overrides only |
+| `PIXEL_SOURCE_REF` | ODS-pinned full SHA | Immutable Pixel source revision |
+| `PIXEL_SOURCE_DIR` | empty | Secure owner-controlled root for a local checkout |
+| `PIXEL_OPENWEBUI_KEY` | generated; installer | Narrow Open WebUI/Dashboard-to-edge key; secret |
+| `PIXEL_INGRESS_RUNTIME_DIR` | `/run/ods-pixel` | Host directory containing only the socket/projection |
+| `PIXEL_PREVIEW_RUNTIME_DIR` | `/run/ods-pixel-preview` | Host runtime directory containing the group-scoped immutable-preview relay socket |
+| `PIXEL_INGRESS_GID` | generated; installer | Numeric `ods-pixel` group used by the edge container |
+| `PIXEL_PREVIEW_PORT` | `9437` | Dedicated loopback-only static preview service; every snapshot uses an isolated `site-*.localhost` origin and the port must not collide with an ODS application port |
+
+Do not copy generated secrets into issues, logs, support bundles, or PRs.
+
+## Health and operations
+
+```bash
+systemctl status openclaw-gateway.service pixel-ingress.service pixel-ops-broker.service \
+  pixel-workspace-preview.service
+sudo -u "$USER" curl --unix-socket /run/ods-pixel/pixel-ingress.sock \
+  http://localhost/health
+docker inspect --format '{{.State.Health.Status}}' ods-pixel-edge
+docker compose ps
+```
+
+Expected state is four active system services, `{"status":"ok"}` from the
+private socket, a current Operations inventory projection, and a healthy
+`ods-pixel-edge`. The socket is intentionally not reachable over a host TCP
+port.
+
+Useful logs:
+
+```bash
+journalctl -u openclaw-gateway.service -u pixel-ingress.service \
+  -u pixel-ops-broker.service --since today
+docker logs ods-pixel-edge
+docker logs ods-dashboard-api
+```
+
+Errors are sanitized across both proxies. Inspect service logs for diagnosis;
+the UI intentionally does not reflect gateway bodies, tokens, filesystem
+paths, or internal exception text.
+
+## Rollback
+
+To restore Hermes as the default agent route:
+
+```bash
+./install.sh --no-pixel --hermes
+```
+
+Then verify Open WebUI selects the ordinary ODS model, the Dashboard remains
+healthy, and the authenticated Hermes URL works. This removes the Pixel edge
+Compose layer, model registration, environment, and default route. When the
+private ODS management marker securely binds the active deployment to this
+exact install, rollback also stops and removes the managed host gateway and
+private ingress, then stops the isolated Operations Broker. It verifies the
+broker unit, environment, executable, private policy, state-tree identities,
+and dedicated system user/group before removing those privileged artifacts and
+their quarantined downloads, plans, receipts, and authority state. Symlinks,
+hardlinks, special files, foreign ownership, unexpected group membership, or
+byte drift fail closed before deletion. Rollback also removes the active
+release link and runtime attestation, and moves the fully verified release tree
+into Pixel's private
+`retired-ods-releases/` archive. An ambient, legacy, incompletely bound, or
+drifted Pixel/OpenClaw deployment is left untouched. Re-enable only after the
+qualification predicate is still valid; ODS then
+recreates the live deployment from the configured immutable Pixel source:
+
+```bash
+./install.sh --pixel
+```
+
+A full `ods-uninstall.sh` removes the Pixel host deployment only when the
+private ODS management marker securely binds it to that exact install. It
+stops the ingress before the gateway, validates every user and root deletion
+target before mutation, and leaves an ambient, legacy, incompletely bound, or
+drifted Pixel/OpenClaw deployment untouched. For a fully bound ODS-created
+deployment, uninstall holds Pixel's deployment lock, verifies the installed
+release manifest, retires only Pixel's validated sandbox containers, and
+removes the exact live sandbox tag, active-release link, and runtime
+attestation. It also removes the exact byte-matched workspace preview service
+and a recursively revalidated preview snapshot tree; linked, foreign-owned,
+writable, or special-file-bearing preview state fails closed before mutation.
+The same bounded teardown removes only a byte-matched Operations
+Broker installation and a recursively validated broker state root; it never
+adopts or recursively deletes a partial ready, drifted, linked, mounted,
+foreign-owned, or special-file-bearing tree. It moves the byte-verified release
+tree out of Pixel's active
+`releases/<version>` namespace into a private
+`retired-ods-releases/<version>-<identity>.<nonce>/release` archive. The exact
+retired bytes, candidate image tag, deployment lock, browser/bootstrap caches,
+workspace, and user backups therefore remain available for recovery without a
+path-bound release blocking a fresh install of the same Pixel version. An
+interrupted deactivation resumes from its private staged or archive state. This
+behavior is the same with `--keep-data`; that flag additionally preserves the
+ODS `data/` tree. The bounded deactivation prevents a retired ODS install from
+blocking a later fresh install at a different path without treating ambient
+Pixel state as ODS-owned.
+
+An installer **source transition** first applies the same strict broker-home
+validation as uninstall. A clean home follows the ordinary verified cleanup
+path. If a child fails that deletion guard, ODS stops the old broker and moves
+the entire old `/var/lib/pixel-ops-broker` home into a root-only private sibling
+named `.pixel-ops-broker-custody-*/state`, then installs a fresh broker home.
+This preserves any unique files as well as `/etc/skel` entries copied by older
+Pixel installers; the installer prints the exact retained path. ODS does not
+automatically restore or delete that retained state. Review it after the
+upgrade, especially if you need prior Operations Broker receipts or artifacts;
+retained custody consumes disk space until reviewed and removed by the owner.
+Rollback and full uninstall continue to use the strict validated removal path
+described above.
+
+## Qualification gate
+
+A candidate is not fresh-install ready until all of these pass on the exact PR
+head:
+
+- Pixel host ingress and projection Node tests;
+- Pixel edge proxy Python tests;
+- capability, license, immutable-source, and host-installer Bash tests;
+- resolved Docker Compose validation with no published Pixel port or operator
+  token and a real health dependency from Open WebUI;
+- Dashboard API tests, Dashboard component tests, and production build;
+- extension manifest validation and repository regression checks;
+- a clean supported-host install with PID1 systemd;
+- a real Open WebUI `portal/default` chat;
+- a real Dashboard `/pixel` streaming chat;
+- a real static website build whose host-readback receipt opens the interactive
+  Dashboard side panel, with click behavior verified and a model-authored
+  localhost URL proven unable to open the panel;
+- the diverse live site, app, game, visualization, animated-SVG, and voxel-art
+  scenarios in `docs/pixel/visual-capability-qualification.md`, including
+  responsive rendering, exact interaction evidence, iterative refinement,
+  malformed-output recovery, cancellation, privacy, and concurrent isolation;
+- a fresh first turn with no workspace-bootstrap truncation warning and a
+  visible `Working` state while a tool turn is active;
+- cancellation of a real long-running sandbox command, proving a clean
+  `[DONE]` stream, status 130, marker cleanup, no surviving descendant, and a
+  successful fresh command afterward;
+- concurrent-chat cancellation isolation, proving the cancelled command stops
+  while the other chat completes unchanged;
+- a real turn invoking `pixel_ods_status` with sanitized ODS results;
+- a real exact-byte download through stage, terminal wait, and create-only
+  promotion, independently matching the remote byte count and SHA-256 digest,
+  plus live rejection of overwrite, traversal, and symlink-parent attempts;
+- a cross-family model swap and a context-only change, with Pixel using the
+  newly active identity and invoking both bounded ODS tools after each change;
+- live adaptive use at the bundled 8K T0 profile, plus rejection of a
+  managed-Pixel activation below OpenClaw's 4K minimum with the previous runtime,
+  persisted configuration, and gateway process unchanged;
+- `--no-pixel --hermes` rollback with ordinary chat and Hermes verified;
+- reinstallation/reactivation from the same clean, exact source; and
+- OpenClaw's deep security audit, with every remaining finding recorded and
+  reconciled to this documented single-operator threat model.
+
+Record the ODS and Pixel commit SHAs, resolved Compose config, service states,
+test logs, install log, and sanitized chat/tool evidence. A green unit suite
+alone is not proof of live usability.
+
+## Maintainer change map
+
+| Concern | Source of truth |
+|---------|-----------------|
+| Host/license/source capability gates | `installers/lib/pixel-integration.sh` |
+| Host installation, adoption guard, systemd | `installers/lib/pixel-host-install.sh` |
+| Open WebUI and Dashboard edge | `extensions/services/pixel-edge/` |
+| Host ingress and bounded ODS plugin | `extensions/services/pixel-agent/` |
+| Exact-download promotion boundary | `extensions/services/pixel-agent/host/artifact_promoter.py`, `extensions/services/pixel-agent/plugin/download-promote.mjs` |
+| Static workspace preview boundary | `extensions/services/pixel-agent/host/workspace_preview.py`, `extensions/services/pixel-agent/plugin/workspace-preview.mjs` |
+| Dashboard API/UI | `extensions/services/dashboard-api/routers/pixel.py`, `extensions/services/dashboard/src/pages/Pixel.jsx` |
+| Feature selection and Compose inclusion | `installers/phases/03-features.sh`, `installers/phases/11-services.sh` |
+| Generated secrets and pinned source | `installers/phases/06-directories.sh` |
+| Health and operator handoff | `installers/phases/12-health.sh`, `installers/phases/13-summary.sh` |
+| Focused integration tests | `tests/test-pixel-*.sh` and each service's `tests/` directory |
+
+## Export a browser-local conversation
+
+In the expanded conversation sidebar, use the **Export chat** download control
+on a conversation row. It downloads an ods-pixel-<chat-id>.json file with the
+complete retained messages, unsent draft, and saved task/publication metadata.
+The model's per-request context limit does not truncate this export.
+
+Export reads the latest browser-local record without sending a request to Pixel,
+switching chats, or stopping a running task. Treat an export made during a run as
+a snapshot of what this browser has observed so far. Workspace files, published
+asset bytes, Docker volumes, and server configuration are not included.
+
+Keep the file private if the conversation contains sensitive content. This is a
+portable JSON archive for inspection and backup. Chat options → **Import
+conversation** can import its messages and draft as a new local conversation
+after confirmation. Import deliberately discards task IDs, permissions and
+publication receipts; it never resumes exported work. Neither operation replaces
+an installation or volume backup.

@@ -3,6 +3,7 @@
 import sqlite3
 import os
 import threading
+from collections import deque
 from datetime import date, timedelta
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "data", "usage.db"))
@@ -23,7 +24,7 @@ _local = threading.local()
 
 def _get_conn() -> sqlite3.Connection:
     if not hasattr(_local, "conn") or _local.conn is None:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
         _local.conn = sqlite3.connect(DB_PATH)
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA busy_timeout=5000")
@@ -89,6 +90,8 @@ def init_db():
         "filter_tools_removed": "INTEGER DEFAULT 0",
         "provider_name": "TEXT",
         "cost_source": "TEXT",
+        # NULL preserves historical event arithmetic; never infer old formats.
+        "token_buckets_version": "INTEGER",
     }
 
     import re
@@ -128,6 +131,8 @@ def log_usage(entry: dict):
         "filter_chars_saved", "filter_tokens_saved", "filter_tools_removed",
     ]
     values = [entry.get(c) for c in cols]
+    cols.append("token_buckets_version")
+    values.append(1)  # New receipts use disjoint input/cache token buckets.
     placeholders = ", ".join(["?"] * len(cols))
     col_names = ", ".join(cols)
     conn.execute(f"INSERT INTO usage ({col_names}) VALUES ({placeholders})", values)
@@ -245,8 +250,11 @@ def query_report(start: str, end: str) -> dict:
         WHERE timestamp >= ? AND timestamp < ?
         ORDER BY timestamp ASC
         """,
-        (f"{start_day.isoformat()}T00:00:00Z", f"{end_exclusive.isoformat()}T00:00:00Z"),
-    ).fetchall()
+        # Match the fractional UTC representation written by the column default.
+        # "." sorts before "Z", so a bare 00:00:00Z excludes that day's
+        # first second while admitting the following day's first second.
+        (f"{start_day.isoformat()}T00:00:00.000Z", f"{end_exclusive.isoformat()}T00:00:00.000Z"),
+    )
 
     report = _empty_report(start, end)
     daily = {row["date"]: row for row in report["daily"]}
@@ -258,7 +266,11 @@ def query_report(start: str, end: str) -> dict:
     local_providers = set()
     untracked_providers = set()
 
+    request_count = 0
+    # Aggregate directly from the cursor. A bounded date range can still hold
+    # millions of requests, while the report only retains grouped totals.
     for sqlite_row in rows:
+        request_count += 1
         row = dict(sqlite_row)
         day = (row.get("timestamp") or "")[:10]
         if day not in daily:
@@ -330,7 +342,7 @@ def query_report(start: str, end: str) -> dict:
             target["cost_usd"] += cost
 
     summary = report["summary"]
-    summary["requests"] = len(rows)
+    summary["requests"] = request_count
     for day_row in report["daily"]:
         summary["spend_usd"] += day_row["spend_usd"]
         summary["input_tokens"] += day_row["input_tokens"]
@@ -415,9 +427,27 @@ def query_session_status(agent: str, char_limit: int = 200_000) -> dict:
         FROM usage
         WHERE agent = ? AND timestamp > {_RECENT_TS_BOUND}
         ORDER BY timestamp ASC
-    """, [agent, "-24 hours"]).fetchall()
+    """, [agent, "-24 hours"])
 
-    if not rows:
+    # A status poll needs a scalar session summary and only the last five
+    # turns, not a second in-memory copy of the entire day's usage history.
+    last_5 = deque(maxlen=5)
+    session_turns = 0
+    current_history = 0
+    total_cost = 0
+    for row in rows:
+        history = row["conversation_history_chars"] or 0
+        if current_history > 1000 and history < current_history * 0.5:
+            session_turns = 0
+            total_cost = 0
+            last_5.clear()
+        current_history = history
+        last_cost = row["estimated_cost_usd"] or 0
+        total_cost += last_cost
+        session_turns += 1
+        last_5.append(row)
+
+    if not session_turns:
         return {
             "agent": agent,
             "current_session_turns": 0,
@@ -430,23 +460,7 @@ def query_session_status(agent: str, char_limit: int = 200_000) -> dict:
             "recommendation": "no_data",
         }
 
-    rows = [dict(r) for r in rows]
-
-    # Find last session reset: a turn where history drops by >50%
-    last_reset_idx = 0
-    for i in range(1, len(rows)):
-        prev = rows[i - 1]["conversation_history_chars"] or 0
-        curr = rows[i]["conversation_history_chars"] or 0
-        if prev > 1000 and curr < prev * 0.5:
-            last_reset_idx = i
-
-    session_rows = rows[last_reset_idx:]
-    current_history = session_rows[-1]["conversation_history_chars"] or 0
-    last_cost = session_rows[-1]["estimated_cost_usd"] or 0
-    total_cost = sum(r["estimated_cost_usd"] or 0 for r in session_rows)
-
     # Last 5 turns for rolling averages
-    last_5 = session_rows[-5:]
     avg_cost_5 = sum(r["estimated_cost_usd"] or 0 for r in last_5) / max(len(last_5), 1)
     total_cache_5 = sum((r["cache_read_tokens"] or 0) + (r["cache_write_tokens"] or 0) for r in last_5)
     total_write_5 = sum(r["cache_write_tokens"] or 0 for r in last_5)
@@ -466,19 +480,23 @@ def query_session_status(agent: str, char_limit: int = 200_000) -> dict:
 
     return {
         "agent": agent,
-        "current_session_turns": len(session_rows),
+        "current_session_turns": session_turns,
         "current_history_chars": current_history,
         "last_turn_cost": round(last_cost, 6),
         "avg_cost_last_5": round(avg_cost_5, 6),
         "cache_write_pct_last_5": round(cache_write_pct, 4),
         "cost_since_last_reset": round(total_cost, 6),
-        "turns_since_last_reset": len(session_rows),
+        "turns_since_last_reset": session_turns,
         "recommendation": rec,
     }
 
 
 def query_recent_events(limit: int = 100, after_id: str = None):
-    """Query recent token usage events for SSE streaming."""
+    """Emit the newest initial window, then unseen rows in insertion order.
+
+    The SSE consumer retains the final row's ID. Both paths must finish at
+    the largest emitted ID, including when timestamps tie or clocks move back.
+    """
     conn = _get_conn()
     conn.row_factory = sqlite3.Row
 
@@ -488,11 +506,13 @@ def query_recent_events(limit: int = 100, after_id: str = None):
             SELECT
                 id, agent as agent_name, model,
                 input_tokens, output_tokens,
-                (input_tokens + output_tokens) as total_tokens,
+                (input_tokens + output_tokens + CASE WHEN token_buckets_version = 1
+                    THEN COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
+                    ELSE 0 END) as total_tokens,
                 estimated_cost_usd as cost_usd, timestamp
             FROM usage
             WHERE id > ?
-            ORDER BY timestamp DESC
+            ORDER BY id ASC
             LIMIT ?
             """,
             (after_id, limit)
@@ -503,11 +523,13 @@ def query_recent_events(limit: int = 100, after_id: str = None):
             SELECT
                 id, agent as agent_name, model,
                 input_tokens, output_tokens,
-                (input_tokens + output_tokens) as total_tokens,
+                (input_tokens + output_tokens + CASE WHEN token_buckets_version = 1
+                    THEN COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
+                    ELSE 0 END) as total_tokens,
                 estimated_cost_usd as cost_usd, timestamp
             FROM usage
-            ORDER BY timestamp DESC
-            LIMIT ?
+            WHERE id IN (SELECT id FROM usage ORDER BY id DESC LIMIT ?)
+            ORDER BY id ASC
             """,
             (limit,)
         ).fetchall()

@@ -12,8 +12,15 @@
 #   Add new background task types here.
 # ============================================================================
 
-# Registry file for background tasks
-BG_TASK_REGISTRY="${BG_TASK_REGISTRY:-/tmp/ods-bg-tasks.json}"
+# Registry file for background tasks. Keep the default install-scoped so a
+# second ODS tree cannot report another install's task as its own.
+if [[ -z "${BG_TASK_REGISTRY:-}" ]]; then
+    if [[ -n "${INSTALL_DIR:-}" ]]; then
+        BG_TASK_REGISTRY="${INSTALL_DIR}/logs/background-tasks.json"
+    else
+        BG_TASK_REGISTRY="/tmp/ods-bg-tasks.json"
+    fi
+fi
 
 # Start tracking a background task
 # Usage: bg_task_start <task_id> <pid> <description> <log_file>
@@ -23,12 +30,12 @@ bg_task_start() {
     local description="$3"
     local log_file="$4"
     
-    # Create registry if it doesn't exist
-    if [[ ! -f "$BG_TASK_REGISTRY" ]]; then
-        echo "[]" > "$BG_TASK_REGISTRY"
-    fi
-    
-    # Add task to registry
+    # Keep the registry parent install-scoped. Registry creation and updates
+    # happen together in Python so a starter never observes an absent registry
+    # between a separate shell-level `[]` initialization and its own update.
+    mkdir -p "$(dirname "$BG_TASK_REGISTRY")"
+
+    # Add or reconcile the task in the registry.
     python3 - "$BG_TASK_REGISTRY" "$task_id" "$pid" "$description" "$log_file" <<'PY'
 import json
 import os
@@ -42,14 +49,35 @@ pid = int(sys.argv[3])
 description = sys.argv[4]
 log_file = sys.argv[5]
 
-tasks = json.loads(registry_path.read_text())
-tasks.append({
+tasks = json.loads(registry_path.read_text()) if registry_path.exists() else []
+task = {
     "id": task_id,
     "pid": pid,
     "description": description,
     "log_file": log_file,
     "status": "running"
-})
+}
+
+# A rerun may launch a short-lived duplicate while the original long-running
+# task still owns its lifecycle lock. Preserve that live task; replacing it
+# with the duplicate would make the summary report completion as soon as the
+# duplicate exits even though the original download is still active. Replace
+# only stale records, and never append a duplicate ID.
+for index, existing in enumerate(tasks):
+    if existing.get("id") == task_id:
+        existing_pid = existing.get("pid")
+        existing_running = False
+        if isinstance(existing_pid, int) and existing_pid > 0:
+            try:
+                os.kill(existing_pid, 0)
+                existing_running = True
+            except OSError:
+                pass
+        if not existing_running:
+            tasks[index] = task
+        break
+else:
+    tasks.append(task)
 fd, tmp_path = tempfile.mkstemp(dir=str(registry_path.parent), suffix=".tmp")
 try:
     with os.fdopen(fd, "w") as f:
@@ -80,6 +108,7 @@ bg_task_status() {
 import json
 import sys
 import os
+import re
 from pathlib import Path
 
 registry_path = Path(sys.argv[1])
@@ -105,6 +134,9 @@ except OSError:
     log_file = task.get("log_file", "")
     if log_file and Path(log_file).exists():
         log_content = Path(log_file).read_text()
+        # OpenClaw cleanup reports zero failures in a successful summary.
+        # Ignore only that complete line; errors elsewhere still count.
+        log_content = re.sub(r"(?m)^[ \t]*Done: [0-9]+ removed, 0 failed[ \t]*\r?$", "", log_content)
         if "ERROR" in log_content or "FAILED" in log_content or "failed" in log_content:
             sys.exit(2)  # Failed
         else:
@@ -159,6 +191,7 @@ bg_task_summary() {
 import json
 import sys
 import os
+import re
 from pathlib import Path
 
 registry_path = Path(sys.argv[1])
@@ -182,6 +215,8 @@ for task in tasks:
         log_file = task.get("log_file", "")
         if log_file and Path(log_file).exists():
             log_content = Path(log_file).read_text()
+            # Ignore the successful OpenClaw cleanup line, not other failures.
+            log_content = re.sub(r"(?m)^[ \t]*Done: [0-9]+ removed, 0 failed[ \t]*\r?$", "", log_content)
             if "ERROR" in log_content or "failed" in log_content:
                 status = "failed"
             else:

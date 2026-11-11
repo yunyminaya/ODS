@@ -4,7 +4,7 @@
 # Part of: installers/windows/phases/
 # Purpose: Install OpenCode (AI coding IDE), Claude Code CLI, and Codex CLI.
 #          Configures OpenCode to point at the local llama-server and creates
-#          a manual launcher instead of auto-starting it at login.
+#          login persistence plus a manual recovery launcher.
 #
 # Reads:
 #   $dryRun, $cloudMode         -- from orchestrator context
@@ -23,6 +23,8 @@
 
 Write-Phase -Phase 7 -Total 13 -Name "DEVELOPER TOOLS" -Estimate "~2-5 minutes"
 
+. (Join-Path $PSScriptRoot '../lib/host-agent-process.ps1')
+
 if ($dryRun) {
     Write-AI "[DRY RUN] Would install OpenCode v$($script:OPENCODE_VERSION) to $($script:OPENCODE_EXE)"
     Write-AI "[DRY RUN] Would configure OpenCode for local llama-server (model: $($tierConfig.LlmModel))"
@@ -39,55 +41,16 @@ if ($dryRun) {
 # Config helpers are sourced from installers/windows/lib/opencode-config.ps1.
 Write-AI "Setting up OpenCode AI coding assistant..."
 
-if (-not (Test-Path $script:OPENCODE_EXE)) {
-    Write-AI "Downloading OpenCode v$($script:OPENCODE_VERSION)..."
-    $_ocZip = Join-Path $env:TEMP $script:OPENCODE_ZIP
+. (Join-Path $PSScriptRoot '../lib/opencode-runtime.ps1')
+. (Join-Path $PSScriptRoot '../lib/opencode-startup.ps1')
+$_ocReady = Install-ODSOpenCode
+if ($_ocReady) { Write-AISuccess "OpenCode v$($script:OPENCODE_VERSION) ready" }
 
-    # Download with retry (resume-capable via curl.exe -C -)
-    if (-not (Test-Path $_ocZip)) {
-        $dlOk = Invoke-DownloadWithRetry `
-            -Url         $script:OPENCODE_URL `
-            -Destination $_ocZip `
-            -Label       "OpenCode v$($script:OPENCODE_VERSION)"
-        if (-not $dlOk) {
-            Write-AIWarn "OpenCode download failed after retries -- skipping (install manually later)."
-            Write-AI "  Manual: https://github.com/anomalyco/opencode/releases"
-        }
-    }
-
-    if (Test-Path $_ocZip) {
-        # Validate zip before extraction
-        $_zipCheck = Test-ZipIntegrity -Path $_ocZip
-        if (-not $_zipCheck.Valid) {
-            Write-AIWarn "OpenCode archive is corrupt: $($_zipCheck.ErrorMessage)"
-            Remove-Item $_ocZip -Force -ErrorAction SilentlyContinue
-            Write-AIWarn "Skipping OpenCode (re-run installer to retry)"
-        } else {
-            # Extract to ~/.opencode/bin/
-            New-Item -ItemType Directory -Path $script:OPENCODE_BIN -Force | Out-Null
-            if (Invoke-ExtractionWithRetry -ZipPath $_ocZip -DestinationPath $script:OPENCODE_BIN) {
-                # Zip may contain a subdirectory -- locate opencode.exe
-                $_ocExeFound = Get-ChildItem -Path $script:OPENCODE_BIN -Recurse -Filter "opencode.exe" |
-                    Select-Object -First 1
-                if ($_ocExeFound -and $_ocExeFound.FullName -ne $script:OPENCODE_EXE) {
-                    Move-Item -Path $_ocExeFound.FullName -Destination $script:OPENCODE_EXE -Force
-                }
-                if (Test-Path $script:OPENCODE_EXE) {
-                    Write-AISuccess "OpenCode v$($script:OPENCODE_VERSION) installed"
-                } else {
-                    Write-AIWarn "opencode.exe not found after extraction -- skipping"
-                }
-            } else {
-                Write-AIWarn "OpenCode extraction failed -- skipping"
-            }
-        }
-    }
-} else {
-    Write-AISuccess "OpenCode already installed ($($script:OPENCODE_EXE))"
-}
-
-# ── OpenCode configuration ────────────────────────────────────────────────────
-if (Test-Path $script:OPENCODE_EXE) {
+# Phase 06 has persisted the selected port; use the same configuration
+# as the dashboard link, CLI and later login launches.
+$script:OPENCODE_PORT = Get-WindowsODSEnvPort `
+    -EnvMap (Get-WindowsODSEnvMap -InstallDir $installDir) -Name 'OPENCODE_PORT' -DefaultPort 3003
+if ($_ocReady -and (Test-Path $script:OPENCODE_EXE)) {
     $_ocSync = Sync-WindowsOpenCodeConfigFromEnv `
         -InstallDir $installDir `
         -GpuBackend $gpuInfo.Backend `
@@ -114,11 +77,25 @@ if (Test-Path $script:OPENCODE_EXE) {
     $_ocLauncherPath = Join-Path $script:OPENCODE_DIR "start-opencode.ps1"
     $_ocExeLiteral = $script:OPENCODE_EXE.Replace("'", "''")
     $_ocDirLiteral = $script:OPENCODE_DIR.Replace("'", "''")
+    # Keep this new path ASCII in the BOM-less script read by PowerShell 5.1.
+    $_ocInstallBase64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($installDir))
     $_ocLauncherContent = @"
 `$ErrorActionPreference = "Stop"
+`$odsInstallDir = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$_ocInstallBase64'))
+. (Join-Path `$odsInstallDir 'lib/llm-endpoint.ps1')
+`$opencodePort = Get-WindowsODSEnvPort -EnvMap (Get-WindowsODSEnvMap -InstallDir `$odsInstallDir) -Name 'OPENCODE_PORT' -DefaultPort 3003
 Remove-Item Env:OPENCODE_SERVER_PASSWORD -ErrorAction SilentlyContinue
+`$env:OPENCODE_ENABLE_EXA = '1'
+# Preserve inherited OPENCODE_WEBSEARCH_PROVIDER; enabled Exa is the default.
+# OpenCode 1.18.x (Bun 1.3.14) copies bundled native libraries to a new temp
+# file on every load and never deletes them (anomalyco/opencode#42700).
+# Start from an emptied ODS-owned BUN_TMPDIR.
+`$bunTmp = Join-Path `$env:LOCALAPPDATA 'ODS\opencode-bun-tmp'
+if (Test-Path -LiteralPath `$bunTmp) { Remove-Item -LiteralPath `$bunTmp -Recurse -Force }
+New-Item -ItemType Directory -Path `$bunTmp -Force | Out-Null
+`$env:BUN_TMPDIR = `$bunTmp
 Set-Location -LiteralPath '$_ocDirLiteral'
-& '$_ocExeLiteral' web --port $($script:OPENCODE_PORT) --hostname 127.0.0.1
+& '$_ocExeLiteral' web --port `$opencodePort --hostname 127.0.0.1
 exit `$LASTEXITCODE
 "@
     Write-Utf8NoBom -Path $_ocLauncherPath -Content $_ocLauncherContent
@@ -151,6 +128,7 @@ exit `$LASTEXITCODE
 
     $_ocTaskArgument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($_ocLauncherPath)`""
     $_ocStarted = $false
+    $_ocRegistered = $false
     try {
         try { Stop-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction SilentlyContinue } catch { }
         try { Unregister-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue } catch { }
@@ -168,10 +146,21 @@ exit `$LASTEXITCODE
             -Settings $_ocTaskSettings -Principal $_ocTaskPrincipal `
             -Description "ODS OpenCode browser application" `
             -Force -ErrorAction Stop | Out-Null
+        $_ocRegistered = $true
+        try { Remove-ODSOpenCodeStartupFallback -InstallDir $installDir }
+        catch { Write-AIWarn "Could not remove the previous OpenCode Startup fallback: $_" }
         Start-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction Stop
         $_ocStarted = $true
     } catch {
-        Write-AIWarn "Could not register the OpenCode login task: $_"
+        Write-AIWarn "Could not start OpenCode through Task Scheduler: $_"
+        if (-not $_ocRegistered) {
+            try {
+                $_ocStartup = Set-ODSOpenCodeStartupFallback -InstallDir $installDir
+                Write-AISuccess "OpenCode login persistence configured in the owner Startup folder: $_ocStartup"
+            } catch {
+                Write-AIWarn "OpenCode login persistence is unavailable; only this session will run: $_"
+            }
+        }
         Write-AI "Starting OpenCode for this session..."
         try {
             Start-Process -FilePath "powershell.exe" -ArgumentList $_ocTaskArgument `
@@ -442,7 +431,7 @@ if (Test-Path $_agentScript) {
             $_oldPid = $null
             try {
                 $_oldPid = [int](Get-Content $script:ODS_AGENT_PID_FILE -Raw).Trim()
-                Stop-Process -Id $_oldPid -Force -ErrorAction SilentlyContinue
+                Stop-ODSHostAgentProcess -ProcessId $_oldPid -AgentScript $_agentScript
             } catch { }
             Remove-Item $script:ODS_AGENT_PID_FILE -Force -ErrorAction SilentlyContinue
         }

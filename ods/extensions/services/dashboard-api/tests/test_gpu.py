@@ -12,6 +12,21 @@ from gpu import (
 )
 
 
+def test_gpu_assignment_env_reader_preserves_unmatched_quote(monkeypatch, tmp_path):
+    import gpu
+
+    (tmp_path / ".env").write_text(
+        "GPU_ASSIGNMENT_JSON_B64=payload'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ODS_INSTALL_DIR", str(tmp_path))
+
+    assert gpu._read_env_var_from_file_state("GPU_ASSIGNMENT_JSON_B64") == (
+        True,
+        "payload'",
+    )
+
+
 # --- get_gpu_tier (pure function, no I/O) ---
 
 
@@ -53,8 +68,9 @@ class TestGetGpuTierUnified:
 
 class TestGetGpuInfoNvidia:
 
-    def test_parses_valid_output(self, monkeypatch):
-        csv = "NVIDIA GeForce RTX 4090, 2048, 24564, 35, 62, 285.5"
+    @pytest.mark.parametrize("temperature", ["62", "62.00", "62.60"])
+    def test_parses_valid_output(self, monkeypatch, temperature):
+        csv = f"NVIDIA GeForce RTX 4090, 2048, 24564, 35, {temperature}, 285.5"
         monkeypatch.setattr("gpu.run_command", lambda cmd, **kw: (True, csv))
 
         info = get_gpu_info_nvidia()
@@ -86,6 +102,13 @@ class TestGetGpuInfoNvidia:
         assert info.temperature_c == 0
         assert info.utilization_available is False
         assert info.temperature_available is False
+
+    @pytest.mark.parametrize("temperature", ["NaN", "inf", "-inf"])
+    def test_rejects_nonfinite_temperature(self, monkeypatch, temperature):
+        csv = f"NVIDIA GeForce RTX 4090, 2048, 24564, 35, {temperature}, 285.5"
+        monkeypatch.setattr("gpu.run_command", lambda cmd, **kw: (True, csv))
+
+        assert get_gpu_info_nvidia() is None
 
     def test_returns_none_on_command_failure(self, monkeypatch):
         monkeypatch.setattr("gpu.run_command", lambda cmd, **kw: (False, ""))
@@ -125,7 +148,8 @@ class TestGetGpuInfoNvidia:
         info = get_gpu_info_nvidia()
         assert info is not None
         assert info.name == "NVIDIA GB10"
-        assert info.memory_used_mb == 12000
+        assert info.memory_used_mb == 0
+        assert info.memory_usage_available is False
         assert info.memory_total_mb == 124000
         assert info.memory_type == "unified"
         assert info.utilization_percent == 6
@@ -414,38 +438,26 @@ class TestGetGpuInfoAmd:
 
 class TestGetGpuInfoAppleContainer:
 
-    def test_host_ram_gb_returns_gpu_info(self, monkeypatch):
-        """Linux container with GPU_BACKEND=apple and HOST_RAM_GB=64."""
+    def test_native_host_counters_override_static_capacity(self, monkeypatch):
         monkeypatch.setattr("gpu.platform.system", lambda: "Linux")
-        monkeypatch.setattr("gpu.os.environ", {
-            "GPU_BACKEND": "apple",
-            "HOST_RAM_GB": "64",
-        })
-
+        monkeypatch.setenv("GPU_BACKEND", "apple")
+        monkeypatch.setenv("HOST_RAM_GB", "64")
+        monkeypatch.setattr("gpu.apple_host_metrics", lambda: {"gpu": {
+            "name": "Apple M4", "memory_total_mb": 16384,
+            "memory_used_mb": 8428, "utilization_percent": 99}})
         info = get_gpu_info_apple()
-        assert info is not None
-        assert info.memory_total_mb == 64 * 1024
-        assert info.memory_type == "unified"
-        assert info.gpu_backend == "apple"
-        assert "64" in info.name
+        assert info.memory_total_mb == 16384
+        assert info.memory_used_mb == 8428
+        assert info.utilization_percent == 99
+        assert info.memory_type == "unified" and info.gpu_backend == "apple"
+        assert info.memory_usage_available and info.utilization_available
+        assert not info.temperature_available
 
-    def test_no_host_ram_returns_none(self, monkeypatch):
-        """Linux container with GPU_BACKEND=apple but no HOST_RAM_GB."""
+    def test_unavailable_host_does_not_report_vm_as_mac(self, monkeypatch):
         monkeypatch.setattr("gpu.platform.system", lambda: "Linux")
-        monkeypatch.setattr("gpu.os.environ", {
-            "GPU_BACKEND": "apple",
-        })
-
-        assert get_gpu_info_apple() is None
-
-    def test_invalid_host_ram_returns_none(self, monkeypatch):
-        """Linux container with GPU_BACKEND=apple and invalid HOST_RAM_GB."""
-        monkeypatch.setattr("gpu.platform.system", lambda: "Linux")
-        monkeypatch.setattr("gpu.os.environ", {
-            "GPU_BACKEND": "apple",
-            "HOST_RAM_GB": "not-a-number",
-        })
-
+        monkeypatch.setenv("GPU_BACKEND", "apple")
+        monkeypatch.setenv("HOST_RAM_GB", "64")
+        monkeypatch.setattr("gpu.apple_host_metrics", lambda: {"gpu": None})
         assert get_gpu_info_apple() is None
 
 

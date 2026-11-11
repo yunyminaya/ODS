@@ -48,6 +48,28 @@ teardown() {
     rm -rf "$BATS_TEST_TMPDIR/ods" "$BATS_TEST_TMPDIR/install-target"
 }
 
+install_preflight_tool_stubs() {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/curl" << 'MOCK'
+#!/bin/bash
+if [[ " $* " == *" --version "* ]]; then
+    echo "curl 8.0.0"
+    exit 0
+fi
+case "${*: -1}" in
+    https://github.com) printf '200' ;;
+    https://registry-1.docker.io/v2/) printf '401' ;;
+    *) exit 7 ;;
+esac
+MOCK
+    cat > "$BATS_TEST_TMPDIR/bin/jq" << 'MOCK'
+#!/bin/bash
+echo "jq-1.7"
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/curl" "$BATS_TEST_TMPDIR/bin/jq"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
 # ── Root check ──────────────────────────────────────────────────────────────
 
 @test "preflight: fails when run as root" {
@@ -140,21 +162,7 @@ teardown() {
 
 @test "preflight: passes when compose files exist" {
     touch "$SCRIPT_DIR/docker-compose.base.yml"
-    # Create a fake curl in PATH
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    cat > "$BATS_TEST_TMPDIR/bin/curl" << 'MOCK'
-#!/bin/bash
-echo "curl 8.0.0"
-MOCK
-    chmod +x "$BATS_TEST_TMPDIR/bin/curl"
-    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
-
-    # Create fake jq
-    cat > "$BATS_TEST_TMPDIR/bin/jq" << 'MOCK'
-#!/bin/bash
-echo "jq-1.7"
-MOCK
-    chmod +x "$BATS_TEST_TMPDIR/bin/jq"
+    install_preflight_tool_stubs
 
     # Source the phase script (it will exit on error, so we capture)
     run bash -c '
@@ -189,13 +197,10 @@ MOCK
 @test "preflight: detects existing installation" {
     touch "$SCRIPT_DIR/docker-compose.base.yml"
     mkdir -p "$INSTALL_DIR"
+    touch "$INSTALL_DIR/.env"
 
-    # Stub curl and jq so the phase script doesn't try to auto-install them via sudo
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    printf '#!/bin/bash\necho "curl 8.0.0"\n' > "$BATS_TEST_TMPDIR/bin/curl"
-    printf '#!/bin/bash\necho "jq-1.7"\n'     > "$BATS_TEST_TMPDIR/bin/jq"
-    chmod +x "$BATS_TEST_TMPDIR/bin/curl" "$BATS_TEST_TMPDIR/bin/jq"
-    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+    # Stub successful required-network probes and required tools.
+    install_preflight_tool_stubs
 
     run bash -c '
         export SCRIPT_DIR="'"$SCRIPT_DIR"'"
@@ -223,24 +228,47 @@ MOCK
     assert_output --partial "Existing installation"
 }
 
+@test "preflight: an install folder without .env is not an existing installation" {
+    touch "$SCRIPT_DIR/docker-compose.base.yml"
+    mkdir -p "$INSTALL_DIR"
+    install_preflight_tool_stubs
+
+    run bash -c '
+        export SCRIPT_DIR="'"$SCRIPT_DIR"'"
+        export INSTALL_DIR="'"$INSTALL_DIR"'"
+        export LOG_FILE="'"$LOG_FILE"'"
+        export INTERACTIVE=false
+        export DRY_RUN=false
+        export PKG_MANAGER="apt"
+        export VERSION="2.3.0"
+        export ODS_ALLOW_LEGACY_PARALLEL=1
+
+        log() { echo "LOG: $1"; }
+        warn() { :; }
+        error() { echo "ERROR: $1"; exit 1; }
+        ai() { :; }
+        ai_ok() { :; }
+        signal() { echo "SIGNAL: $1"; }
+        show_phase() { :; }
+        show_stranger_boot() { :; }
+        ods_progress() { :; }
+
+        source "'"$BATS_TEST_DIRNAME/../../installers/phases/01-preflight.sh"'"
+        echo "PHASE_COMPLETE"
+    '
+
+    # An empty folder or an unpacked source tree keeps no secrets to preserve.
+    assert_output --partial "PHASE_COMPLETE"
+    refute_output --partial "Existing install"
+}
+
 # ── Optional tools warning ──────────────────────────────────────────────────
 
 @test "preflight: warns about missing optional tools" {
     touch "$SCRIPT_DIR/docker-compose.base.yml"
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-
-    # Create curl and jq, then shadow command -v rsync so the warning path is deterministic
-    cat > "$BATS_TEST_TMPDIR/bin/curl" << 'MOCK'
-#!/bin/bash
-echo "curl 8.0.0"
-MOCK
-    chmod +x "$BATS_TEST_TMPDIR/bin/curl"
-    cat > "$BATS_TEST_TMPDIR/bin/jq" << 'MOCK'
-#!/bin/bash
-echo "jq-1.7"
-MOCK
-    chmod +x "$BATS_TEST_TMPDIR/bin/jq"
-    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+    # Stub successful required-network probes, then shadow command -v rsync so
+    # the optional-tool warning path remains deterministic.
+    install_preflight_tool_stubs
 
     run bash -c '
         export SCRIPT_DIR="'"$SCRIPT_DIR"'"

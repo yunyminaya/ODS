@@ -90,11 +90,15 @@ STUB
 
 extract_firewall_helper() {
     local out="$1"
+    cat > "$out" <<'HELPERS'
+ods_sudo_available() { [[ "${TEST_SUDO_AVAILABLE:-true}" == "true" ]]; }
+ods_sudo() { sudo "$@"; }
+HELPERS
     awk '
-        /^    _phase11_external_lemonade\(\) \{/ { capture=1 }
+        /^    _phase11_host_native_llm\(\) \{/ { capture=1 }
         capture && /amd_gpu_runtime_devices_available/ { exit }
         capture { print }
-    ' "$PHASE11" > "$out"
+    ' "$PHASE11" >> "$out"
 }
 
 @test "services firewall: UFW rule is scoped to detected ods-network subnet" {
@@ -155,7 +159,27 @@ extract_firewall_helper() {
     refute_output --partial "ufw allow"
 }
 
-@test "services firewall: external Lemonade UFW rule is scoped to detected ods-network subnet" {
+@test "services firewall: unavailable privilege skips rules without invoking sudo" {
+    helper="$BATS_TEST_TMPDIR/helper.sh"
+    extract_firewall_helper "$helper"
+
+    run bash -c '
+        source "'"$helper"'"
+        ai_ok() { echo "OK: $1"; }
+        ai_warn() { echo "WARN: $1"; }
+        export TEST_SUDO_AVAILABLE=false
+        export SYSTEMCTL_ACTIVE_UNITS="ufw"
+        export DOCKER_NETWORK_SUBNETS="10.89.0.0/24"
+        _phase11_allow_host_agent_firewall ods-network
+        cat "$COMMAND_LOG"
+    '
+
+    assert_success
+    assert_output --partial "privileged firewall access is unavailable"
+    refute_output --partial "ufw allow"
+}
+
+@test "services firewall: host-native llama-server UFW rule is scoped to detected ods-network subnet" {
     helper="$BATS_TEST_TMPDIR/helper.sh"
     extract_firewall_helper "$helper"
 
@@ -166,14 +190,14 @@ extract_firewall_helper() {
         _phase11_env_get() { echo "${2:-}"; }
         export SYSTEMCTL_ACTIVE_UNITS="ufw"
         export DOCKER_NETWORK_SUBNETS="10.91.0.0/24"
-        export LEMONADE_EXTERNAL=true
-        export AMD_INFERENCE_PORT=13305
-        _phase11_allow_external_lemonade_firewall ods-network
+        export NATIVE_LLM_BASE_URL=http://localhost:18080
+        export AMD_INFERENCE_PORT=18080
+        _phase11_allow_host_native_llm_firewall ods-network
         cat "$COMMAND_LOG"
     '
 
     assert_success
-    assert_output --partial "ufw allow from 10.91.0.0/24 to any port 13305 proto tcp comment ods-external-lemonade"
+    assert_output --partial "ufw allow from 10.91.0.0/24 to any port 18080 proto tcp comment ods-native-llm"
     refute_output --partial "172.16.0.0/12"
 }
 

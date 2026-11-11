@@ -1,4 +1,7 @@
+import ModelActivationNotice from '../components/ModelActivationNotice'
+import PortalModelRecovery from '../components/PortalModelRecovery'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import HelpLink from '../components/HelpLink'
 import {
   AlertCircle,
   Box,
@@ -20,6 +23,11 @@ import { Link } from 'react-router-dom'
 import { useModels } from '../hooks/useModels'
 import { useDownloadProgress } from '../hooks/useDownloadProgress'
 import HuggingFaceModelBrowser from '../components/model-library/HuggingFaceModelBrowser'
+import ModelProfileSummary from '../components/model-library/ModelProfileSummary'
+import MetalMetricIcon from '../components/MetalMetricIcon'
+import FittedLibraryPage from '../components/FittedLibraryPage'
+import odsMark from '../assets/ods-mark.png'
+import './models-refined.css'
 
 const PAGE_SIZE = 10
 const DOWNLOAD_STATUS_TIMEOUT_MS = 15000
@@ -54,20 +62,34 @@ function catalogModelIdForProgress(models, progressModel) {
   return fileMatch?.id ?? null
 }
 
-export default function Models() {
+export default function Models({ compact = false }) {
   const downloadProgress = useDownloadProgress()
   const {
     models,
     gpu,
     currentModel,
+    loadedModel,
     configuredModel,
     odsMode,
     configuredMode,
+    llmBackend,
+    hostRuntime,
+    externalApi,
+    activeRuntime,
+    modelManagement,
+    modelLifecycle,
+    modelActivation,
+    modelRecoveryPending,
+    runtimeActionLoading,
+    stopRuntime,
+    startRuntime,
     canActivateModels,
     activationModeError,
     recommendationAlternatives,
     hermesMinimumContext,
+    pixelMinimumContext,
     loading,
+    catalogConfirmed,
     error,
     actionLoading,
     actionLoadingModels,
@@ -77,7 +99,9 @@ export default function Models() {
     benchmarkModel,
     deleteModel,
     refresh,
-  } = useModels()
+  } = useModels({ reuseLastCatalog: true })
+  // Opened again, the page shows the last catalog at once; actions wait for its fresh read.
+  const catalogHeld = catalogConfirmed === false
 
   const [downloadStarting, setDownloadStarting] = useState(null)
   const [downloadAwaitingStatus, setDownloadAwaitingStatus] = useState(false)
@@ -89,6 +113,7 @@ export default function Models() {
   const [speedFilter, setSpeedFilter] = useState('any')
   const [contextFloor, setContextFloor] = useState(0)
   const [deleteConfirmModel, setDeleteConfirmModel] = useState(null)
+  const [unloadConfirmOpen, setUnloadConfirmOpen] = useState(false)
   const [activationConfigModel, setActivationConfigModel] = useState(null)
   const [libraryScope, setLibraryScope] = useState('recommended')
   const libraryRef = useRef(null)
@@ -146,12 +171,18 @@ export default function Models() {
     () => models.filter(model => ['downloaded', 'loaded'].includes(model.status)),
     [models]
   )
-  const odsCatalogModels = useMemo(
-    () => models
-      .filter(model => model.metadata?.catalogSource !== 'huggingface')
-      .sort((left, right) => Number(Boolean(right.recommended)) - Number(Boolean(left.recommended)) || Number(Boolean(right.fitsVram)) - Number(Boolean(left.fitsVram))),
-    [models]
-  )
+  const odsCatalogModels = useMemo(() => {
+    // The catalog's own picks for this hardware follow the recommended model.
+    // Where every model fits (a DGX Station's 346 GB), catalog order alone put
+    // the smallest models right after it.
+    const fitRank = new Map(recommendationAlternatives.map((item, index) => [item.id, index]))
+    const rank = model => fitRank.get(model.id) ?? fitRank.size
+    return models
+      .filter(model => model.metadata?.catalogSource !== 'huggingface' && model.metadata?.source !== 'runtime')
+      .sort((left, right) => Number(Boolean(right.recommended)) - Number(Boolean(left.recommended))
+        || rank(left) - rank(right)
+        || Number(Boolean(right.fitsVram)) - Number(Boolean(left.fitsVram)))
+  }, [models, recommendationAlternatives])
   const scopedModels = libraryScope === 'installed' ? installedModels : odsCatalogModels
   const categoryOptions = useMemo(
     () => buildCategoryOptions(scopedModels, hermesMinimumContext),
@@ -214,8 +245,13 @@ export default function Models() {
     await deleteModel(modelId)
   }
 
+  const activationBusy = Boolean(catalogHeld || activationLoading || runtimeActionLoading || modelLifecycle?.active || modelRecoveryPending)
+  const providerBusy = Boolean(modelLifecycle?.active && ['remote_provider_apply', 'remote_provider_proof'].includes(modelLifecycle.operation))
+  const activeRemoteRuntime = !activationBusy && activeRuntime?.source === 'remote-provider' ? activeRuntime : null
+  const remoteRouteActive = Boolean(activeRemoteRuntime)
+  const visibleActivationModeError = providerBusy ? 'Wait for the model connection change to finish.' : activationModeError
   const handleConfirmActivation = async (contextLength) => {
-    if (!activationConfigModel?.id) return
+    if (!activationConfigModel?.id || activationBusy) return
     const modelId = activationConfigModel.id
     setActivationConfigModel(null)
     await loadModel(modelId, { contextLength })
@@ -232,12 +268,35 @@ export default function Models() {
   }
 
   const pendingModelActions = actionLoadingModels ?? (actionLoading ? [actionLoading] : [])
-  const visibleDownloadProgress = downloadProgress.progress || (downloadStartFailure && {
+  const runtimeControlsBusy = Boolean(catalogHeld || runtimeActionLoading || activationLoading || modelLifecycle?.active || pendingModelActions.length || downloadProgress.isDownloading)
+  // Unloading stops Portal and Hermes until Resume, so it asks first. The
+  // question closes for good if the model stops or another operation starts.
+  const unloadAvailable = Boolean(modelManagement?.managed === true && modelManagement.canUnload === true
+    && modelManagement.running && !runtimeControlsBusy)
+  useEffect(() => {
+    if (!unloadAvailable) setUnloadConfirmOpen(false)
+  }, [unloadAvailable])
+  const handleConfirmUnload = async () => {
+    setUnloadConfirmOpen(false)
+    await stopRuntime()
+  }
+  const visibleDownloadProgress = downloadProgress.progress || (downloadProgress.statusError && {
+    status: 'error',
+    error: downloadProgress.statusError,
+  }) || (downloadStartFailure && {
     status: 'error',
     model: downloadStartFailure.modelId,
     error: downloadStartFailure.error,
   })
   const retryModelId = catalogModelIdForProgress(models, visibleDownloadProgress?.model)
+  const renderModel = model => <ModelTableRow key={model.id} compact={compact} model={model} gpu={gpu}
+    canActivateModels={canActivateModels} activationModeError={visibleActivationModeError} apiMode={llmBackend === 'external'} remoteRouteActive={remoteRouteActive}
+    hermesMinimumContext={hermesMinimumContext} pixelMinimumContext={pixelMinimumContext}
+    isCurrentModel={model.id === currentModel} isLoading={pendingModelActions.includes(model.id)}
+    loadBusy={pendingModelActions.length > 0} activationBusy={activationBusy}
+    downloadBusy={catalogHeld || downloadProgress.isDownloading || !!downloadStarting} downloadStarting={downloadStarting === model.id}
+    onDownload={() => handleDownload(model.id)} onLoad={() => { if (canActivateModels && !activationBusy) setActivationConfigModel(model) }}
+    onBenchmark={() => benchmarkModel(model.id)} onDelete={() => setDeleteConfirmModel(model)}/>
 
   if (loading) {
     return (
@@ -258,10 +317,10 @@ export default function Models() {
   }
 
   return (
-    <div className="p-3 sm:p-6 lg:p-8">
-      <header className="mb-7 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+    <div className={compact ? 'models-refined' : 'p-3 sm:p-6 lg:p-8'}>
+      {compact ? <header className="models-toolbar"><h2>Your models</h2><button type="button" className="models-browse-link" onClick={() => { setLibraryScope('recommended'); libraryRef.current?.scrollIntoView?.({ block: 'start' }) }}>Browse {odsCatalogModels.length} {odsCatalogModels.length === 1 ? 'model' : 'models'} ↓</button><span>Runtime: {runtimeLabel(odsMode, configuredMode, externalApi, activeRemoteRuntime)}</span><button className="pixel-metal-control" title="Refresh models" onClick={refresh}><MetalMetricIcon icon={RefreshCw} size={14}/></button></header> : <header className="mb-7 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-theme-text">Models</h1>
+          {!compact && <h1 className="text-2xl font-bold text-theme-text">Models</h1>}
           <p className="mt-1 text-sm text-theme-text-muted">
             Discover, filter, and deploy the right model for your workflow.
           </p>
@@ -269,8 +328,7 @@ export default function Models() {
 
         <div className="flex max-w-full flex-wrap items-center gap-2">
           <span className="inline-flex min-h-9 max-w-full items-center rounded-lg border border-theme-border bg-theme-bg/45 px-3 py-2 text-center text-xs font-medium text-theme-text-secondary">
-            Runtime: {formatModeLabel(odsMode)}
-            {configuredMode !== odsMode ? ` / configured ${formatModeLabel(configuredMode)}` : ''}
+            Runtime: {runtimeLabel(odsMode, configuredMode, externalApi, activeRemoteRuntime)}
           </span>
           <button
             type="button"
@@ -289,27 +347,31 @@ export default function Models() {
             <RefreshCw size={16} />
           </button>
         </div>
-      </header>
+      </header>}
+
+      <ModelActivationNotice value={modelActivation} pending={modelLifecycle?.operation === 'model_activation'} onRefresh={refresh}/>
+      {providerBusy && <p role="status">ODS is checking or changing the model connection. Wait for it to finish before switching models or requesting recovery.</p>}
+      <PortalModelRecovery active={Boolean(modelRecoveryPending || modelActivation?.outcome === 'rollback_unconfirmed') && !modelLifecycle?.active && !catalogHeld} operationActive={Boolean(modelLifecycle?.active)} refreshKey={modelActivation} onRecovered={refresh}/>
 
       {error && (
         <div className="mb-5 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
-          {error}
+          {error} <HelpLink />
         </div>
       )}
 
-      {!canActivateModels && (
-        <section className="mb-5 flex flex-col gap-3 rounded-xl border border-amber-400/25 bg-amber-500/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+      {!providerBusy && !activeRemoteRuntime && !canActivateModels && !(modelManagement?.managed === true && modelManagement.running === false) && (
+        <section className={compact ? 'models-external-notice' : 'mb-5 flex flex-col gap-3 rounded-xl border border-theme-border bg-theme-text-secondary/10 p-4 sm:flex-row sm:items-center sm:justify-between'}>
           <div className="flex min-w-0 items-start gap-3">
-            <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-300" />
+            <AlertCircle size={18} className="mt-0.5 shrink-0 text-theme-text-secondary" />
             <div>
-              <p className="text-sm font-semibold text-amber-100">Local model runtime unavailable</p>
-              <p className="mt-1 text-sm text-amber-100/75">{activationModeError}</p>
-              <p className="mt-1 text-xs text-amber-100/60">Model downloads and deletion remain available.</p>
+              <p className="text-sm font-semibold text-theme-text-secondary">{llmBackend === 'external' ? 'Using a model API' : hostRuntime && modelManagement?.managed === false ? 'Model changes managed externally' : hostRuntime && modelManagement?.managed == null ? 'Runtime management unavailable' : 'Local model runtime unavailable'}</p>
+              <p className="mt-1 text-sm text-theme-text-secondary/75">{activationModeError}</p>
+              {!compact && <p className="mt-1 text-xs text-theme-text-secondary/60">Model downloads and deletion remain available.</p>}
             </div>
           </div>
           <Link
             to="/settings"
-            className="inline-flex h-8 shrink-0 items-center justify-center rounded-md border border-amber-500/25 bg-theme-bg/45 px-3 text-xs font-semibold text-amber-500 transition-colors hover:border-amber-500/45"
+            className="inline-flex h-8 shrink-0 items-center justify-center rounded-md border border-theme-border bg-theme-bg/45 px-3 text-xs font-semibold text-theme-text-secondary transition-colors hover:border-theme-border"
           >
             Review runtime settings
           </Link>
@@ -320,27 +382,48 @@ export default function Models() {
         <DownloadProgressBar
           progress={visibleDownloadProgress}
           helpers={downloadProgress}
-          onRetry={retryModelId
+          onRetry={retryModelId && !catalogHeld
             ? () => handleDownload(retryModelId)
             : null}
         />
       )}
 
+      {modelManagement?.managed === true && modelManagement.canUnload === true && (
+        <section aria-label="Model runtime controls" className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-theme-border p-3 text-sm">
+          <div className="min-w-0">
+            <p>{modelManagement.running ? 'Unload the model to release GPU memory. Your saved model selection is kept.' : 'The model runtime is stopped. Resume your saved model to enable model changes.'}</p>
+            {!modelManagement.running && modelManagement.runtimeError && (
+              <p role="status" className="mt-1 text-xs text-theme-text-secondary">{modelManagement.runtimeError}</p>
+            )}
+          </div>
+          <button type="button" onClick={modelManagement.running ? () => setUnloadConfirmOpen(true) : startRuntime}
+            disabled={runtimeControlsBusy}
+            className="rounded-md border border-theme-border px-3 py-2 disabled:opacity-50">
+            {runtimeActionLoading === 'stop' ? 'Unloading…' : runtimeActionLoading === 'start' ? (modelManagement.startRefusal ? 'Starting…' : 'Resuming…') : modelManagement.running ? 'Unload model' : modelManagement.startRefusal ? 'Start anyway' : 'Resume model'}
+          </button>
+        </section>
+      )}
+
       <CurrentModelPanel
+        compact={compact}
         model={activeModel}
-        currentModel={currentModel}
+        currentModel={currentModel || loadedModel}
         gpu={gpu}
+        externalApi={externalApi}
+        activeRuntime={activeRemoteRuntime}
+        showProfile={canActivateModels && !catalogHeld}
+        lifecycleActive={Boolean(modelLifecycle?.active || modelActivation?.active || activationLoading || runtimeActionLoading)}
       />
 
-      {!currentModel && configuredModel && (
-        <section className="mb-4 rounded-xl border border-amber-400/25 bg-amber-500/10 p-4">
+      {!currentModel && !loadedModel && configuredModel && !externalApi && (
+        <section className="mb-4 rounded-xl border border-theme-border bg-theme-text-secondary/10 p-4">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-sm text-amber-200">
+            <div className="text-sm text-theme-text-secondary">
               <AlertCircle size={14} className="mr-2 inline" />
               Selected during install: <strong>{configuredModel}</strong>. Run a benchmark after first launch for local tok/s.
             </div>
             {recommendationAlternatives.length > 0 && (
-              <div className="text-xs text-amber-100/70">
+              <div className="text-xs text-theme-text-secondary/70">
                 Top catalog fit: {recommendationAlternatives.slice(0, 3).map(item => item.name).join(' / ')}
               </div>
             )}
@@ -348,28 +431,32 @@ export default function Models() {
         </section>
       )}
 
+      <div ref={libraryRef}>
       <ModelSourceTabs
+        compact={compact}
         value={libraryScope}
         onChange={setLibraryScope}
         installedCount={installedModels.length}
         recommendedCount={odsCatalogModels.length}
       />
+      </div>
 
       {libraryScope === 'huggingface' ? (
         <section
-          ref={libraryRef}
-          className="rounded-lg border p-4 sm:p-5"
-          style={TECH_PANEL_STYLE}
+          className={compact ? 'models-hub' : 'rounded-lg border p-4 sm:p-5'}
+          style={compact ? undefined : TECH_PANEL_STYLE}
         >
           <HuggingFaceModelBrowser
             gpu={gpu}
-            downloadBusy={downloadProgress.isDownloading || Boolean(downloadStarting)}
+            downloadBusy={catalogHeld || downloadProgress.isDownloading || Boolean(downloadStarting || runtimeActionLoading)}
             onImportStarted={handleHuggingFaceImportStarted}
           />
         </section>
       ) : (
-      <div className="grid gap-4 xl:grid-cols-[260px_minmax(0,1fr)]">
-        <ModelsFilterPanel
+      <div className={compact ? 'models-library' : 'grid gap-4 xl:grid-cols-[260px_minmax(0,1fr)]'}>
+        {compact && <label className="models-search"><Search size={15} aria-hidden="true"/><input aria-label="Search models" placeholder="Search models..." value={query} onChange={event => setQuery(event.target.value)}/></label>}
+        <details open={compact ? undefined : true} className="model-filter-disclosure"><summary>{compact && <MetalMetricIcon icon={SlidersHorizontal} size={13}/>}Filters</summary><ModelsFilterPanel
+          compact={compact}
           query={query}
           setQuery={setQuery}
           categoryFilter={categoryFilter}
@@ -390,16 +477,18 @@ export default function Models() {
             setSpeedFilter('any')
             setContextFloor(0)
           }}
-        />
+        /></details>
 
-        <section
-          ref={libraryRef}
+        {compact ? <>
+          <div className="models-results"><span>{libraryScope === 'installed' ? 'On this device' : 'ODS recommended'}</span><span>{filteredModels.length} {filteredModels.length === 1 ? 'model' : 'models'}</span></div>
+          {filteredModels.length ? <FittedLibraryPage key={`${libraryScope}:${query}:${categoryFilter}:${compatibilityFilter}:${speedFilter}:${contextFloor}`} items={filteredModels} label="Model library" minimumItems={6}>{items => <div className="models-list">{items.map(renderModel)}</div>}</FittedLibraryPage> : <p className="models-empty">No models match the current filters.</p>}
+        </> : <section
           className="overflow-hidden rounded-xl border"
           style={TECH_PANEL_STYLE}
         >
           <div className="min-w-full overflow-x-auto">
-            <div className="lg:min-w-[1074px]">
-              <div className="hidden grid-cols-[minmax(250px,1.7fr)_184px_70px_110px_120px_90px_130px] gap-5 border-b border-theme-border px-5 py-3 text-[9px] font-semibold uppercase tracking-[0.18em] text-theme-text-muted/75 lg:grid">
+            <div className={compact ? 'min-w-0' : 'lg:min-w-[1074px]'}>
+              <div className={`${compact ? 'hidden' : 'hidden lg:grid'} grid-cols-[minmax(250px,1.7fr)_184px_70px_110px_120px_90px_130px] gap-5 border-b border-theme-border px-5 py-3 text-[9px] font-semibold uppercase tracking-[0.18em] text-theme-text-muted/75`}>
                 <span>Model</span>
                 <span>Actions</span>
                 <span>Size</span>
@@ -410,29 +499,7 @@ export default function Models() {
               </div>
 
               <div className="divide-y divide-theme-border">
-                {visibleModels.map((model, index) => {
-                  const rowId = `${model.id || model.name || 'model'}:${startIndex + index}`
-                  return (
-                    <ModelTableRow
-                      key={rowId}
-                      model={model}
-                      gpu={gpu}
-                      canActivateModels={canActivateModels}
-                      activationModeError={activationModeError}
-                      hermesMinimumContext={hermesMinimumContext}
-                      isCurrentModel={model.id === currentModel}
-                      isLoading={pendingModelActions.includes(model.id)}
-                      loadBusy={pendingModelActions.length > 0}
-                      activationBusy={Boolean(activationLoading)}
-                      downloadBusy={downloadProgress.isDownloading || !!downloadStarting}
-                      downloadStarting={downloadStarting === model.id}
-                      onDownload={() => handleDownload(model.id)}
-                      onLoad={() => setActivationConfigModel(model)}
-                      onBenchmark={() => benchmarkModel(model.id)}
-                      onDelete={() => setDeleteConfirmModel(model)}
-                    />
-                  )
-                })}
+                {visibleModels.map(renderModel)}
               </div>
 
               {filteredModels.length === 0 && (
@@ -449,7 +516,7 @@ export default function Models() {
             </span>
             <Pagination page={safePage} pageCount={pageCount} onChange={setPage} />
           </div>
-        </section>
+        </section>}
       </div>
       )}
 
@@ -460,12 +527,21 @@ export default function Models() {
           onConfirm={handleConfirmDelete}
         />
       )}
+      {unloadConfirmOpen && unloadAvailable && (
+        <UnloadModelDialog
+          onCancel={() => setUnloadConfirmOpen(false)}
+          onConfirm={handleConfirmUnload}
+        />
+      )}
       {activationConfigModel && (
         <ModelActivationDialog
           model={activationConfigModel}
           gpu={gpu}
+          pixelMinimumContext={pixelMinimumContext}
           hermesMinimumContext={hermesMinimumContext}
           isCurrentModel={activationConfigModel.id === currentModel}
+          canActivate={canActivateModels && !activationBusy}
+          activationModeError={visibleActivationModeError}
           onCancel={() => setActivationConfigModel(null)}
           onConfirm={handleConfirmActivation}
         />
@@ -474,12 +550,25 @@ export default function Models() {
   )
 }
 
-function CurrentModelPanel({ model, currentModel, gpu }) {
+function CurrentModelPanel({ model, currentModel, gpu, compact = false, externalApi = null, activeRuntime = null, showProfile = false, lifecycleActive = false }) {
+  if (externalApi) return <ExternalApiPanel compact={compact} externalApi={externalApi} />
+  if (activeRuntime?.source === 'remote-provider') return <RemoteProviderPanel compact={compact} activeRuntime={activeRuntime} />
   const modelLabel = currentModel || model?.id
-  const speed = getSpeedDisplay(model)
+  const speed = getSpeedDisplay(model, gpu)
   const context = model ? formatContext(model.contextLength) : '--'
   const memory = model ? getMemoryMeta(model, gpu) : null
   const statusLabel = currentModel ? 'Currently running' : 'Model runtime'
+
+  if (compact) return (
+    <section className="models-active" aria-label="Model runtime">
+      <header><span className={currentModel ? 'models-live' : ''}>{statusLabel}</span><Link to="/dashboard">Dashboard <ChevronRight size={12}/></Link></header>
+      <div className="models-active-name"><MetalMetricIcon icon={Box} size={22}/><strong title={modelLabel}>{model?.name || modelLabel || 'No model running'}</strong></div>
+      {currentModel && <>
+        <dl><div><dt>Context</dt><dd>{context}</dd></div>{memory && <div><dt>VRAM estimate</dt><dd>{memory.label}</dd></div>}</dl>
+        {showProfile && model?.id && <ModelProfileSummary modelId={model.id} lifecycleActive={lifecycleActive}/>}
+      </>}
+    </section>
+  )
 
   return (
     <section className="mb-4 rounded-xl border p-4" style={TECH_TILE_STYLE}>
@@ -492,20 +581,21 @@ function CurrentModelPanel({ model, currentModel, gpu }) {
                 {statusLabel}: {modelLabel || 'none'}
               </h2>
               {model?.quantization && <Badge>{model.quantization}</Badge>}
-              {model?.fitsVram && <Badge tone="green">{model.fitLabel || 'Fits GPU'}</Badge>}
+              {model?.fitsVram && hasGpuCapacity(gpu) && <Badge tone="green">{model.fitLabel || 'Fits GPU'}</Badge>}
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-theme-text-muted">
               <span>{currentModel ? 'Active runtime' : 'Ready after first launch'}</span>
               {memory && <span>{memory.label} VRAM ({memory.percent}%)</span>}
               <span>{context} context</span>
             </div>
+            {showProfile && currentModel && model?.id && <ModelProfileSummary modelId={model.id} lifecycleActive={lifecycleActive} />}
           </div>
         </div>
 
         <ModelSpeedVisual model={model} speed={speed} compact />
 
         <Link
-          to="/"
+          to="/dashboard"
           className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-theme-border bg-theme-bg/45 px-3 text-xs font-semibold text-theme-text transition-colors hover:border-theme-accent/35 hover:bg-theme-accent/10"
         >
           Dashboard
@@ -515,7 +605,7 @@ function CurrentModelPanel({ model, currentModel, gpu }) {
   )
 }
 
-function ModelSourceTabs({ value, onChange, installedCount, recommendedCount }) {
+function ModelSourceTabs({ value, onChange, installedCount, recommendedCount, compact = false }) {
   const tabs = [
     {
       id: 'installed',
@@ -530,7 +620,7 @@ function ModelSourceTabs({ value, onChange, installedCount, recommendedCount }) 
       label: 'ODS Recommended',
       detail: 'Curated catalog',
       count: recommendedCount,
-      image: '/osmantic-os-icon-192.png',
+      image: odsMark,
       tone: 'purple',
     },
     {
@@ -542,32 +632,33 @@ function ModelSourceTabs({ value, onChange, installedCount, recommendedCount }) 
       tone: 'amber',
     },
   ]
+  if (compact) return <div className="portal-model-tabs" role="tablist" aria-label="Model sources">{tabs.map(tab => <button key={tab.id} role="tab" aria-selected={value === tab.id} onClick={() => onChange(tab.id)}>{tab.label}{tab.count !== null && <small>{tab.count}</small>}</button>)}</div>
   const activeStyles = {
     emerald: {
       borderColor: 'rgba(52, 211, 153, 0.48)',
-      background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(76, 29, 149, 0.14))',
-      boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.08), 0 0 28px rgba(16,185,129,0.1)',
+      background: '#1d1e1f',
+      boxShadow: 'none',
     },
     purple: {
-      borderColor: 'rgba(184, 100, 255, 0.58)',
-      background: 'linear-gradient(135deg, rgba(126, 34, 206, 0.22), rgba(71, 25, 120, 0.16))',
-      boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.08), 0 0 30px rgba(157,0,255,0.15)',
+      borderColor: '#777c85',
+      background: '#1d1e1f',
+      boxShadow: 'none',
     },
     amber: {
-      borderColor: 'rgba(251, 191, 106, 0.72)',
-      background: 'linear-gradient(135deg, rgba(120, 53, 15, 0.2), rgba(126, 34, 206, 0.22))',
-      boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.1), 0 0 32px rgba(251,191,36,0.14)',
+      borderColor: 'rgb(var(--theme-text-secondary) / 0.72)',
+      background: '#1d1e1f',
+      boxShadow: 'none',
     },
   }
   const iconStyles = {
     emerald: 'border-emerald-300/20 bg-emerald-400/10 text-emerald-200',
     purple: 'border-theme-accent/25 bg-theme-accent/10 text-theme-accent-light',
-    amber: 'border-amber-300/20 bg-amber-300/10 text-amber-100',
+    amber: 'border-theme-border bg-theme-text-secondary/10 text-theme-text-secondary',
   }
   const indicatorStyles = {
     emerald: 'bg-emerald-300 shadow-[0_0_10px_rgba(110,231,183,0.75)]',
-    purple: 'bg-theme-accent-light shadow-[0_0_10px_rgba(192,132,252,0.8)]',
-    amber: 'bg-amber-200 shadow-[0_0_12px_rgba(253,230,138,0.9)]',
+    purple: 'bg-theme-accent-light',
+    amber: 'bg-theme-text-secondary shadow-none',
   }
   return (
     <div
@@ -594,12 +685,12 @@ function ModelSourceTabs({ value, onChange, installedCount, recommendedCount }) 
           >
             <span className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] ${iconStyles[tone]}`}>
               {image
-                ? <img src={image} alt="" className={image === '/osmantic-os-icon-192.png' ? 'h-10 w-10 object-contain' : 'h-8 w-8 object-contain'} />
+                ? <img src={image} alt="" className={image === odsMark ? 'h-10 w-10 object-contain grayscale mix-blend-screen' : 'h-8 w-8 object-contain'} />
                 : <Icon size={27} strokeWidth={1.75} />}
             </span>
             <span className="min-w-0 flex-1">
               <span className="block text-[13px] font-semibold leading-4 text-theme-text sm:text-[15px] sm:leading-5">{label}</span>
-              <span className={`mt-1 block truncate text-xs ${active && tone === 'amber' ? 'text-amber-200/80' : 'text-theme-text-muted/70'}`}>{detail}</span>
+              <span className={`mt-1 block truncate text-xs ${active && tone === 'amber' ? 'text-theme-text-secondary/80' : 'text-theme-text-muted/70'}`}>{detail}</span>
             </span>
             {count !== null && (
               <span className="flex h-10 min-w-10 shrink-0 items-center justify-end border-l border-theme-border pl-3 font-mono text-lg font-semibold text-theme-accent">
@@ -615,6 +706,7 @@ function ModelSourceTabs({ value, onChange, installedCount, recommendedCount }) 
 }
 
 function ModelsFilterPanel({
+  compact = false,
   query,
   setQuery,
   categoryFilter,
@@ -644,7 +736,7 @@ function ModelsFilterPanel({
           </button>
         </div>
 
-        <label className="relative block">
+        {!compact && <label className="relative block">
           <Search size={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-theme-text-muted" />
           <input
             value={query}
@@ -652,7 +744,7 @@ function ModelsFilterPanel({
             placeholder="Search models..."
             className="h-9 w-full rounded-lg border border-theme-border bg-theme-bg/45 pl-9 pr-3 text-xs text-theme-text outline-none transition-colors placeholder:text-theme-text-muted/60 focus:border-theme-accent/45"
           />
-        </label>
+        </label>}
 
         <div className="mt-5">
           <SectionLabel>Categories</SectionLabel>
@@ -781,11 +873,15 @@ function FilterChip({ active, onClick, children }) {
 }
 
 function ModelTableRow({
+  compact = false,
   model,
   gpu,
   canActivateModels,
   activationModeError,
+  apiMode = false,
+  remoteRouteActive = false,
   hermesMinimumContext,
+  pixelMinimumContext,
   isCurrentModel,
   isLoading,
   loadBusy,
@@ -798,22 +894,39 @@ function ModelTableRow({
   onDelete,
 }) {
   const isLoaded = model.status === 'loaded' || isCurrentModel
+  const isLoadedLocally = isLoaded && remoteRouteActive
   const isDownloaded = model.status === 'downloaded'
+  const isRuntimeManaged = model.metadata?.source === 'runtime'
   const memory = getMemoryMeta(model, gpu)
-  const compatibility = getCompatibilityMeta(model, memory, hermesMinimumContext)
-  const speed = getSpeedDisplay(model)
+  const compatibility = getCompatibilityMeta(model, memory, pixelMinimumContext)
+  const compatibilityNotes = getCompatibilityNotes(model)
+  const speed = getSpeedDisplay(model, gpu)
   const tags = getModelTags(model, hermesMinimumContext)
   const iconTone = getIconTone(model, compatibility)
-  const performanceBadge = getPerformanceBadge(model)
-  const runDisabledReason = getRunDisabledReason({
+  const performanceBadge = getPerformanceBadge(model, gpu)
+  const runDisabledReason = isRuntimeManaged ? null : getRunDisabledReason({
     model,
     gpu,
     canActivateModels,
     activationModeError,
     hermesMinimumContext,
+    pixelMinimumContext,
     loadBusy,
     activationBusy,
   })
+  const runWarning = isRuntimeManaged ? null : getRunMemoryWarning({ model, gpu, pixelMinimumContext })
+  const runNote = runDisabledReason || runWarning
+
+  if (compact) return <article className="model-entry" aria-label={model.name}>
+    <header><span className="model-entry-symbol"><ModelPublisherIcon model={model} tone={iconTone}/></span><div><h3 title={model.name}>{model.name}</h3><span>{model.quantization || 'Quantization unspecified'}{model.size ? ` · ${model.size}` : ''}</span></div><span className={isLoaded && !isLoadedLocally ? 'models-live model-state' : 'model-state'}>{isLoadedLocally ? 'Loaded locally' : isLoaded ? 'Active' : isDownloaded ? 'Installed' : 'Available'}</span></header>
+    <dl className="model-entry-metrics"><div><dt>Context</dt><dd>{formatContext(model.contextLength)}</dd></div><div><dt>VRAM estimate</dt><dd>{memory.value}</dd></div><div className="model-speed-reading"><dt>Speed</dt><dd>{speed.label}</dd></div></dl>
+    <div className="model-fit"><span>{compatibility.label}</span><span>{compatibility.detail}</span></div>
+    <footer><div className="model-entry-actions">
+      <PrimaryAction model={model} isLoaded={isLoaded} isDownloaded={isDownloaded} isLoading={isLoading} activationBusy={activationBusy} downloadBusy={downloadBusy} downloadStarting={downloadStarting} runDisabledReason={runDisabledReason} runWarning={runWarning} apiMode={apiMode} hermesMinimumContext={hermesMinimumContext} onDownload={onDownload} onLoad={onLoad} onBenchmark={onBenchmark}/>
+      {isLoaded && !isRuntimeManaged && <button aria-label={`Configure context for ${model.name}`} title={activationModeError || `Configure context for ${model.name}`} disabled={activationBusy || !canActivateModels} onClick={onLoad}><MetalMetricIcon icon={SlidersHorizontal} size={14}/></button>}
+      <DeleteAction model={model} isLoaded={isLoaded} isDownloaded={isDownloaded} isLoading={isLoading} activationBusy={activationBusy} onDelete={onDelete}/>
+    </div><details className="model-entry-details"><summary>Details <ChevronRight size={12}/></summary><div><p>{model.description || 'No description available.'}</p><p>{tags.join(' · ')}</p>{performanceBadge && <p>{performanceBadge.label}</p>}<p>{compatibility.label}: {compatibility.detail}</p>{compatibilityNotes.map(note => <p key={note}>{note}</p>)}{runNote && <p>{runNote}</p>}</div></details></footer>
+  </article>
 
   return (
     <div className="grid grid-cols-2 gap-x-3 gap-y-4 px-3 py-4 transition-colors hover:bg-theme-surface-hover/70 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[minmax(250px,1.7fr)_184px_70px_110px_120px_90px_130px] lg:gap-5 lg:px-5 lg:py-3.5">
@@ -830,7 +943,8 @@ function ModelTableRow({
               {tags.map(tag => <Badge key={tag} subdued>{tag}</Badge>)}
               {performanceBadge && <Badge tone={performanceBadge.tone}>{performanceBadge.label}</Badge>}
               {model.recommended && !isLoaded && <Badge tone="amber">Selected install</Badge>}
-              {isLoaded && <Badge tone="green">Active</Badge>}
+              {isLoadedLocally && <Badge tone="green">Loaded locally</Badge>}
+              {isLoaded && !isLoadedLocally && <Badge tone="green">Active</Badge>}
             </div>
           </div>
         </div>
@@ -846,18 +960,20 @@ function ModelTableRow({
           downloadBusy={downloadBusy}
           downloadStarting={downloadStarting}
           runDisabledReason={runDisabledReason}
+          runWarning={runWarning}
+          apiMode={apiMode}
           hermesMinimumContext={hermesMinimumContext}
           onDownload={onDownload}
           onLoad={onLoad}
           onBenchmark={onBenchmark}
         />
-        {isLoaded && (
+        {isLoaded && !isRuntimeManaged && (
           <button
             type="button"
             onClick={onLoad}
-            disabled={activationBusy}
+            disabled={activationBusy || !canActivateModels}
             aria-label={`Configure context for ${model.name}`}
-            title={`Configure context for ${model.name}`}
+            title={activationModeError || `Configure context for ${model.name}`}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-theme-border bg-theme-bg/45 text-theme-text-muted transition-colors hover:border-theme-accent/35 hover:text-theme-accent disabled:cursor-not-allowed disabled:opacity-40"
           >
             <SlidersHorizontal size={14} />
@@ -903,7 +1019,7 @@ function ModelTableRow({
         {formatContext(model.contextLength)}
       </div>
 
-      <div className="col-span-2 self-center lg:col-span-1">
+      <div className="col-span-2 self-center lg:col-span-1" title={compatibilityNotes.join(' ') || undefined}>
         <MobileMetricLabel>Compatibility</MobileMetricLabel>
         <Badge tone={compatibility.tone}>{compatibility.label}</Badge>
         <p className="mt-1 text-[10px] text-theme-text-muted">{compatibility.detail}</p>
@@ -921,11 +1037,17 @@ function PrimaryAction({
   downloadBusy,
   downloadStarting,
   runDisabledReason,
+  runWarning = null,
+  apiMode = false,
   hermesMinimumContext,
   onDownload,
   onLoad,
   onBenchmark,
 }) {
+  if (model.metadata?.source === 'runtime') {
+    return <span className="text-xs text-theme-text-muted">Managed by runtime</span>
+  }
+
   if (isLoading) {
     return (
       <button disabled className="inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md bg-theme-accent/20 px-3 text-xs font-semibold text-theme-accent">
@@ -952,23 +1074,26 @@ function PrimaryAction({
 
   if (isDownloaded) {
     const runDisabled = Boolean(runDisabledReason)
-    const directChatBlocked = isOpenAiChatBlocked(getOpenAiChatCompatibility(model))
-    const buttonLabel = directChatBlocked ? 'Chat Unsupported' : 'Run'
+    // A downloaded model does not run while API mode is on. Say so on the
+    // button: a greyed "Run" read as available (fleet, Strixy).
+    const apiModeBlocked = apiMode && runDisabled
+    // A memory warning keeps Run available; the run dialog asks to accept it.
+    const title = runDisabledReason || runWarning || `Run ${model.name}`
     return (
-      <span className="inline-flex" title={runDisabledReason || `Run ${model.name}`}>
+      <span className="inline-flex" title={title}>
         <button
           type="button"
           onClick={onLoad}
           disabled={runDisabled}
-          title={runDisabledReason || `Run ${model.name}`}
+          title={title}
           className={`inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md px-3 text-xs font-semibold transition-colors ${
             !runDisabled
               ? 'bg-theme-accent text-white shadow-[0_0_18px_rgba(168,85,247,0.32)] hover:bg-theme-accent-hover'
               : 'cursor-not-allowed border border-theme-border bg-theme-bg/45 text-theme-text-muted'
           }`}
         >
-          {directChatBlocked ? <AlertCircle size={13} /> : <Play size={13} />}
-          {buttonLabel}
+          {!apiModeBlocked && <Play size={13} />}
+          {apiModeBlocked ? 'API mode' : 'Run'}
         </button>
       </span>
     )
@@ -1078,18 +1203,76 @@ function DeleteModelDialog({ model, onCancel, onConfirm }) {
   )
 }
 
+function UnloadModelDialog({ onCancel, onConfirm }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="unload-model-title"
+        aria-describedby="unload-model-detail"
+        className="w-full max-w-md rounded-xl border border-red-400/25 bg-theme-card p-5 shadow-[0_24px_80px_rgba(0,0,0,0.32)]"
+      >
+        <div className="flex items-start gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-red-300/20 bg-red-500/10 text-red-300">
+            <AlertCircle size={17} />
+          </div>
+          <div className="min-w-0">
+            <h2 id="unload-model-title" className="text-sm font-semibold text-theme-text">
+              Unload the model?
+            </h2>
+            <p id="unload-model-detail" className="mt-2 text-sm leading-5 text-theme-text-muted">
+              Portal and Hermes stop answering until you choose Resume model. Loading it again can take a few minutes.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            autoFocus
+            className="inline-flex h-9 items-center justify-center rounded-md border border-theme-border bg-theme-bg/45 px-3 text-xs font-semibold text-theme-text-secondary transition-colors hover:border-theme-accent/35 hover:text-theme-text"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="inline-flex h-9 items-center justify-center rounded-md border border-red-300/30 bg-red-500/15 px-3 text-xs font-semibold text-red-200 transition-colors hover:border-red-200/50 hover:bg-red-500/25"
+          >
+            Unload model
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ModelActivationDialog({
   model,
   gpu,
+  pixelMinimumContext,
   hermesMinimumContext,
   isCurrentModel,
+  canActivate,
+  activationModeError,
   onCancel,
   onConfirm,
 }) {
   const options = getContextOptions(model, gpu)
-  const initialContext = Number(model.contextLength || options[0]?.contextLength || 8192)
+  const fittingOptions = options.filter(option => option.fitsVram === true)
+  const hermesFit = fittingOptions.filter(option => option.contextLength >= Number(hermesMinimumContext || 65536))
+  const pixelFit = fittingOptions.filter(option => option.contextLength >= Number(pixelMinimumContext || 16384))
+  const bestShorterContext = Math.max(0, ...(hermesFit.length ? hermesFit : pixelFit).map(option => option.contextLength))
+  const initialContext = Number(
+    model.fitsVram === false && !model.recommended && bestShorterContext > 0
+      ? bestShorterContext
+      : model.contextLength || options[0]?.contextLength || 8192
+  )
   const [selectedContext, setSelectedContext] = useState(initialContext)
   const [customContext, setCustomContext] = useState(String(initialContext))
+  const [runAnyway, setRunAnyway] = useState(false)
   const selected = options.find(option => option.contextLength === selectedContext)
     || estimateContextOption(model, gpu, options, selectedContext)
   const currentContext = Number(model.contextLength || 0)
@@ -1098,10 +1281,30 @@ function ModelActivationDialog({
   const contextValid = Number.isSafeInteger(selectedContext)
     && selectedContext >= 1024
   const sameContext = contextValid && isCurrentModel && selectedContext === currentContext
-  const hermesReady = selectedContext >= Number(hermesMinimumContext || 65536)
+  const openAiChat = getOpenAiChatCompatibility(model)
+  const pixelAgent = getPixelAgentCompatibility(model)
+  const agentViability = getAgentViabilityCompatibility(model)
+  const pixelContextReady = selectedContext >= Number(pixelMinimumContext || 16384)
+  const appProfile = isOpenAiChatBlocked(openAiChat)
+    ? { label: 'Portal adaptive', tone: 'text-theme-accent-light' }
+    : isAgentViabilityBlocked(pixelAgent)
+    ? { label: 'Portal adaptive', tone: 'text-theme-accent-light' }
+    : isAgentViabilityBlocked(agentViability)
+      ? { label: 'Portal adaptive', tone: 'text-theme-accent-light' }
+      : !pixelContextReady
+        ? { label: `Portal compact · ${formatContext(selectedContext)}`, tone: 'text-theme-text-secondary' }
+        : isPixelAgentVerified(pixelAgent)
+          ? { label: 'Portal verified', tone: 'text-emerald-400' }
+          : { label: 'Portal adaptive', tone: 'text-theme-accent-light' }
   const memoryCapacity = Number(gpu?.vramTotal || 0)
   const exceedsMemory = selected?.fitsVram === false
   const exceedsDeclaredLimit = declaredLimit > 0 && selectedContext > declaredLimit
+  // Where Run used to stop for memory, the owner may now run anyway after an
+  // explicit tick, except on a hard stop (see memoryHardStop).
+  const memoryBlocked = model.fitsVram === false && !model.recommended && exceedsMemory
+  const memoryStop = !hasGpuCapacity(gpu) || (memoryBlocked && memoryHardStop(selected?.estimatedRequired, gpu))
+  const runAnywayOffered = memoryBlocked && !memoryStop
+  const sharedMemoryTotal = sharedMemoryTotalGb(gpu)
 
   const selectContext = (value) => {
     setSelectedContext(value)
@@ -1217,24 +1420,52 @@ function ModelActivationDialog({
             />
             <ContextMetric
               label="GPU capacity"
-              value={memoryCapacity > 0 ? `${memoryCapacity.toFixed(1)} GB` : 'Not reported'}
+              value={hasGpuCapacity(gpu) ? `${memoryCapacity.toFixed(1)} GB` : 'Not reported'}
             />
             <ContextMetric
               label="App profile"
-              value={hermesReady ? 'Hermes ready' : 'Chat only'}
-              tone={hermesReady ? 'text-emerald-400' : 'text-amber-300'}
+              value={appProfile.label}
+              tone={appProfile.tone}
             />
           </div>
 
-          {exceedsMemory && (
-            <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2.5 text-xs text-theme-text-secondary">
-              <AlertCircle size={15} className="mt-0.5 shrink-0 text-amber-400" />
+          {!hasGpuCapacity(gpu) && (
+            <p role="status" className="mt-4 text-xs text-theme-text-secondary">
+              GPU capacity is unavailable. Wait for the memory reading before running this model.
+            </p>
+          )}
+          {exceedsMemory && hasGpuCapacity(gpu) && (
+            <div className="mt-4 flex items-start gap-2 rounded-lg border border-theme-border bg-theme-text-secondary/10 px-3 py-2.5 text-xs text-theme-text-secondary">
+              <AlertCircle size={15} className="mt-0.5 shrink-0 text-theme-text-secondary" />
               This context exceeds the reported GPU memory estimate. Activation may use system memory or roll back.
             </div>
           )}
+          {runAnywayOffered && (
+            <div className="mt-3 rounded-lg border border-theme-border bg-theme-bg/35 px-3 py-2.5 text-xs text-theme-text-secondary">
+              <label className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 shrink-0"
+                  checked={runAnyway}
+                  onChange={event => setRunAnyway(event.target.checked)}
+                />
+                <span>Run it anyway. It may run slowly using system memory, or ODS goes back to your current model if it cannot load.</span>
+              </label>
+              <p className="ml-6 mt-1.5"><HelpLink className="text-[11px] text-theme-text-muted" /></p>
+            </div>
+          )}
+          {memoryStop && sharedMemoryTotal !== null && Number(selected?.estimatedRequired) > 0 && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-theme-border bg-theme-text-secondary/10 px-3 py-2.5 text-xs text-theme-text-secondary">
+              <AlertCircle size={15} className="mt-0.5 shrink-0 text-theme-text-secondary" />
+              <span>
+                This context needs about {formatNumber(selected.estimatedRequired)} GB, more than the {formatNumber(sharedMemoryTotal)} GB of memory this machine has. Choose a shorter context.{' '}
+                <HelpLink />
+              </span>
+            </div>
+          )}
           {contextValid && exceedsDeclaredLimit && (
-            <div className="mt-3 flex items-start gap-2 rounded-lg border border-orange-400/25 bg-orange-500/10 px-3 py-2.5 text-xs text-theme-text-secondary">
-              <AlertCircle size={15} className="mt-0.5 shrink-0 text-orange-400" />
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-theme-border bg-theme-text-secondary/10 px-3 py-2.5 text-xs text-theme-text-secondary">
+              <AlertCircle size={15} className="mt-0.5 shrink-0 text-theme-text-secondary" />
               This override exceeds the model&apos;s declared context. The runtime may reject it or roll back.
             </div>
           )}
@@ -1242,7 +1473,7 @@ function ModelActivationDialog({
 
         <div className="flex items-center justify-between gap-3 border-t border-theme-border bg-theme-bg/25 px-5 py-4">
           <span className="text-[11px] text-theme-text-muted">
-            {isCurrentModel ? `Active: ${formatContext(currentContext)}` : model.quantization || 'GGUF'}
+            {!canActivate ? activationModeError || 'Wait for the runtime operation to finish.' : isCurrentModel ? `Active: ${formatContext(currentContext)}` : model.quantization || 'GGUF'}
           </span>
           <div className="flex gap-2">
             <button
@@ -1255,7 +1486,7 @@ function ModelActivationDialog({
             <button
               type="button"
               onClick={() => onConfirm(selectedContext)}
-              disabled={!contextValid || sameContext}
+              disabled={!canActivate || !contextValid || sameContext || memoryStop || (runAnywayOffered && !runAnyway)}
               className="inline-flex h-9 min-w-28 items-center justify-center gap-2 rounded-md bg-theme-accent px-4 text-xs font-semibold text-white shadow-[0_0_18px_rgba(168,85,247,0.28)] transition-colors hover:bg-theme-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Play size={13} />
@@ -1310,7 +1541,8 @@ function MobileMetricLabel({ children }) {
 }
 
 function DownloadProgressBar({ progress, helpers, onRetry }) {
-  const { formatBytes, formatEta, cancelDownload, cancelError, isCancelling } = helpers
+  const { formatBytes, formatEta, cancelDownload, cancelError, statusError, isCancelling } = helpers
+  const hasKnownTotal = Number.isFinite(progress.bytesTotal) && progress.bytesTotal > 0
 
   if (progress.error) {
     const cancelled = progress.status === 'cancelled'
@@ -1321,7 +1553,9 @@ function DownloadProgressBar({ progress, helpers, onRetry }) {
             <AlertCircle size={20} className="shrink-0 text-red-400" />
             <div className="min-w-0">
               <p className="font-medium text-red-300">{cancelled ? 'Download Cancelled' : 'Download Failed'}</p>
-              <p className="break-words text-sm text-red-300/70">{progress.error}</p>
+              <p className="break-words text-sm text-red-300/70">
+                {progress.error}{!cancelled && <> <HelpLink /></>}
+              </p>
             </div>
           </div>
           {onRetry && (
@@ -1352,16 +1586,25 @@ function DownloadProgressBar({ progress, helpers, onRetry }) {
               {progress.status === 'verifying' ? 'Verifying' : 'Downloading'} {progress.model}
             </p>
             <p className="text-sm text-theme-text-muted">
-              {formatBytes(progress.bytesDownloaded)} / {formatBytes(progress.bytesTotal)}
+              {hasKnownTotal
+                ? `${formatBytes(progress.bytesDownloaded)} / ${formatBytes(progress.bytesTotal)}`
+                : progress.bytesDownloaded > 0
+                  ? `${formatBytes(progress.bytesDownloaded)} downloaded · Total size unavailable`
+                  : 'Progress unavailable'}
               {progress.speedMbps > 0 && ` - ${progress.speedMbps.toFixed(1)} MB/s`}
-              {progress.eta && ` - ETA: ${formatEta(progress.eta)}`}
+              {hasKnownTotal && progress.eta && ` - ETA: ${formatEta(progress.eta)}`}
             </p>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-3">
-          <span className="text-lg font-bold text-theme-accent">
-            {progress.percent?.toFixed(0) || 0}%
-          </span>
+          {hasKnownTotal ? (
+            <span className="text-lg font-bold text-theme-accent">
+              {progress.percent?.toFixed(0) || 0}%
+            </span>
+          ) : (
+            <Loader2 size={20} role="progressbar" aria-label="Download progress"
+              className="text-theme-accent motion-safe:animate-spin" />
+          )}
           <button
             type="button"
             onClick={cancelDownload}
@@ -1376,16 +1619,25 @@ function DownloadProgressBar({ progress, helpers, onRetry }) {
 
       {cancelError && (
         <p role="alert" className="mb-3 text-sm text-red-300">
-          {cancelError}
+          {cancelError} <HelpLink />
         </p>
       )}
 
-      <div className="h-2.5 overflow-hidden rounded-full bg-theme-border">
-        <div
-          className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-300"
-          style={{ width: `${progress.percent || 0}%` }}
-        />
-      </div>
+      {statusError && (
+        <p role="alert" className="mb-3 text-sm text-theme-text-secondary">
+          {statusError} <HelpLink />
+        </p>
+      )}
+
+      {hasKnownTotal && (
+        <div role="progressbar" aria-label="Download progress" aria-valuenow={progress.percent || 0}
+          className="h-2.5 overflow-hidden rounded-full bg-theme-border">
+          <div
+            className="h-full rounded-full bg-theme-accent transition-all duration-300"
+            style={{ width: `${progress.percent || 0}%` }}
+          />
+        </div>
+      )}
     </div>
   )
 }
@@ -1439,32 +1691,111 @@ function getRunDisabledReason({
   canActivateModels,
   activationModeError,
   hermesMinimumContext,
+  pixelMinimumContext,
   loadBusy,
   activationBusy,
 }) {
   if (!canActivateModels) {
     return activationModeError || 'The local model runtime is unavailable. Review runtime settings before running this model.'
   }
-  const openAiChat = getOpenAiChatCompatibility(model)
-  if (isOpenAiChatBlocked(openAiChat)) {
-    return openAiChat.reason || 'This model is not currently validated for direct local chat.'
-  }
-  if (model.fitsVram !== true && !model.recommended) {
-    const required = Number(model.estimatedRequired || model.vramRequired || 0)
-    const total = Number(gpu?.vramTotal || 0)
-    if (required > 0 && total > 0) {
-      return `Requires ${formatNumber(required)} GB VRAM; the detected GPU has ${formatNumber(total)} GB total.`
-    }
-    return 'This model does not fit the detected GPU memory.'
-  }
+  const memoryWarning = getRunMemoryWarning({ model, gpu, pixelMinimumContext })
+  if (memoryWarning && memoryHardStop(requiredMemoryGb(model), gpu)) return memoryWarning
   if (activationBusy) return 'Wait for the current model swap to finish.'
   if (loadBusy) return 'Another model action is in progress.'
   return null
 }
 
+function requiredMemoryGb(model) {
+  return Number(model.estimatedRequired || model.vramRequired || 0)
+}
+
+// Why a model may not fit at any context that suits Portal. It is a warning:
+// the run dialog asks the owner to accept it, unless memoryHardStop applies.
+function getRunMemoryWarning({ model, gpu, pixelMinimumContext }) {
+  if (!hasGpuCapacity(gpu)) return 'GPU capacity is unavailable. Wait for the memory reading before running this model.'
+  if (model.fitsVram === true || model.recommended) return null
+  const shorterContextFits = getContextOptions(model, gpu).some(option =>
+    option.fitsVram === true && option.contextLength >= Number(pixelMinimumContext || 16384)
+  )
+  if (shorterContextFits) return null
+  const required = requiredMemoryGb(model)
+  const total = Number(gpu?.vramTotal || 0)
+  const budget = Number(gpu?.modelMemoryBudgetGb ?? total)
+  if (required > 0 && budget > 0 && Math.abs(budget - total) > 0.1) {
+    return `Requires ${formatNumber(required)} GB; ODS has a ${formatNumber(budget)} GB model memory budget (${formatNumber(total)} GB GPU memory detected).`
+  }
+  if (required > 0 && total > 0) {
+    return `Requires ${formatNumber(required)} GB VRAM; the detected GPU has ${formatNumber(total)} GB total.`
+  }
+  return 'This model does not fit the detected GPU memory.'
+}
+
+// Shared (unified) memory, as on Apple silicon: the API then reports a model
+// memory budget that differs from the GPU total, and that total is the
+// machine's memory, all a model can ever use (on Apple it is hw.memsize).
+// Returns the total in GB; null for a discrete GPU, whose budget is its total.
+function sharedMemoryTotalGb(gpu) {
+  const total = Number(gpu?.vramTotal || 0)
+  const budget = Number(gpu?.modelMemoryBudgetGb ?? total)
+  return total > 0 && Math.abs(budget - total) > 0.1 ? total : null
+}
+
+// The host does not refuse a model that needs more memory than the estimate
+// allows: it may run slowly using system memory, or ODS goes back to the
+// current model. Keep the stop where running cannot work or the page cannot
+// tell: shared memory smaller than the model, or no memory figures at all.
+function memoryHardStop(requiredGb, gpu) {
+  if (!hasGpuCapacity(gpu)) return true
+  const sharedTotal = sharedMemoryTotalGb(gpu)
+  const required = Number(requiredGb || 0)
+  return sharedTotal !== null && !(required > 0 && required <= sharedTotal)
+}
+
+function hasGpuCapacity(gpu) {
+  const total = Number(gpu?.vramTotal)
+  return Number.isFinite(total) && total > 0
+}
+
+// API mode: chat uses the model the API serves, not a model on this computer.
+function ExternalApiPanel({ externalApi, compact = false }) {
+  const name = externalApi.model || 'The API\'s model'
+  const where = externalApi.host ? `Served by the API at ${externalApi.host}` : 'Served by a model API'
+  if (compact) return (
+    <section className="models-active" aria-label="Model runtime">
+      <header><span className="models-live">In use</span><Link to="/dashboard">Dashboard <ChevronRight size={12}/></Link></header>
+      <div className="models-active-name"><MetalMetricIcon icon={Box} size={22}/><strong title={name}>{name}</strong></div>
+      <p className="text-xs text-theme-text-muted">{where}</p>
+    </section>
+  )
+  return (
+    <section className="mb-4 rounded-xl border p-4" style={TECH_TILE_STYLE} aria-label="Model runtime">
+      <h2 className="truncate text-sm font-semibold text-theme-text sm:text-base">In use: {name}</h2>
+      <p className="mt-1 text-xs text-theme-text-muted">{where}</p>
+    </section>
+  )
+}
+
+function runtimeLabel(odsMode, configuredMode, externalApi, activeRuntime = null) {
+  if (externalApi) return externalApi.host ? `API (${externalApi.host})` : 'API'
+  if (activeRuntime?.source === 'remote-provider') return 'Model API'
+  return `${formatModeLabel(odsMode)}${configuredMode !== odsMode ? ` / configured ${formatModeLabel(configuredMode)}` : ''}`
+}
+
+function RemoteProviderPanel({ compact = false, activeRuntime }) {
+  return (
+    <section className={compact ? 'models-active' : 'mb-4 rounded-xl border p-4'}
+      style={compact ? undefined : TECH_TILE_STYLE} aria-label="Model runtime">
+      <header><span className="models-live">Using a model API</span></header>
+      <div className="models-active-name"><MetalMetricIcon icon={Box} size={22}/><strong>{activeRuntime.model}</strong></div>
+      <dl><div><dt>Context</dt><dd>{formatContext(activeRuntime.contextLength)}</dd></div></dl>
+      <p className="mt-2 text-sm text-theme-text-secondary">Switch back to a local model in Model connections to use local model activation controls.</p>
+      <Link className="mt-2 inline-flex items-center gap-1 text-sm text-theme-accent" to="/settings?section=remote">Model connections <ChevronRight size={12}/></Link>
+    </section>
+  )
+}
+
 function formatModeLabel(mode) {
   if (!mode || mode === 'unknown') return 'Unknown'
-  if (mode === 'lemonade') return 'Lemonade'
   return `${mode.charAt(0).toUpperCase()}${mode.slice(1)}`
 }
 
@@ -1483,7 +1814,7 @@ function ModelSpeedVisual({ model, speed, compact = false }) {
 
   const path = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ')
   const area = `${path} L 100 30 L 0 30 Z`
-  const stroke = speed.tone === 'orange' ? '#f59e0b' : '#a855f7'
+  const stroke = '#aeb5c0'
 
   return (
     <svg viewBox="0 0 100 30" className={sizeClass} aria-hidden="true">
@@ -1505,7 +1836,7 @@ function Badge({ children, tone = 'neutral', subdued = false }) {
       ? 'border-theme-border bg-theme-bg/35 text-theme-text-muted'
       : 'border-theme-border bg-theme-surface-hover text-theme-text-secondary',
     green: 'border-emerald-400/20 bg-emerald-500/12 text-emerald-300',
-    amber: 'border-amber-400/25 bg-amber-500/12 text-amber-300',
+    amber: 'border-theme-border bg-theme-text-secondary/12 text-theme-text-secondary',
     red: 'border-red-400/25 bg-red-500/12 text-red-300',
     purple: 'border-theme-accent/25 bg-theme-accent/12 text-theme-accent-light',
   }
@@ -1652,7 +1983,9 @@ function getMemoryMeta(model, gpu) {
   const barPercent = total > 0 && required > 0 ? Math.min(100, Math.max(3, percent)) : 0
   return {
     value: required > 0 ? `${includesKv ? '~' : ''}${formatNumber(required)} GB${includesKv ? ' incl. KV' : ''}` : '--',
-    label: required > 0 ? `${formatNumber(required)} / ${formatNumber(total || 0)} GB` : '--',
+    label: required > 0
+      ? hasGpuCapacity(gpu) ? `${formatNumber(required)} / ${formatNumber(total)} GB` : `${formatNumber(required)} GB; capacity unavailable`
+      : '--',
     percent,
     percentLabel: total > 0 && required > 0 ? `${percent}%` : '--',
     barPercent,
@@ -1666,29 +1999,42 @@ function getMemoryMeta(model, gpu) {
   }
 }
 
-function getCompatibilityMeta(model, memory, hermesMinimumContext = 0) {
+function getCompatibilityMeta(model, memory, pixelMinimumContext = 0) {
+  if (model?.metadata?.source === 'runtime') {
+    return { label: 'Runtime managed', detail: 'Fit not verified by ODS', tone: 'purple' }
+  }
+  if (!Number.isFinite(memory.total) || memory.total <= 0) {
+    return { label: 'Fit unknown', detail: 'GPU capacity unavailable', tone: 'amber' }
+  }
   if (!model?.fitsVram) {
+    const shorterContextFits = Array.isArray(model?.contextOptions) && model.contextOptions.some(option =>
+      option?.fitsVram === true && Number(option?.contextLength || 0) >= Number(pixelMinimumContext || 16384)
+    )
+    if (shorterContextFits) {
+      return { label: 'Shorter context', detail: 'Fits GPU', tone: 'amber' }
+    }
     const nearLimit = memory.total > 0 && memory.required <= memory.total * 1.08
+    // Run stays available after an explicit tick, so this is not "incompatible".
     return {
       label: nearLimit ? 'High VRAM' : 'Too large',
-      detail: nearLimit ? 'Heavy' : 'Incompatible',
+      detail: nearLimit ? 'Heavy' : 'May not load',
       tone: nearLimit ? 'amber' : 'red',
     }
   }
   const openAiChat = getOpenAiChatCompatibility(model)
   if (isOpenAiChatBlocked(openAiChat)) {
     return {
-      label: 'Unavailable',
-      detail: 'Chat blocked',
-      tone: 'red',
+      label: 'Portal adaptive',
+      detail: 'Capability varies',
+      tone: 'purple',
     }
   }
   const agentViability = getAgentViabilityCompatibility(model)
   if (isAgentViabilityBlocked(agentViability)) {
     return {
-      label: 'Direct chat only',
-      detail: 'Agent blocked',
-      tone: 'amber',
+      label: 'Portal adaptive',
+      detail: 'Capability varies',
+      tone: 'purple',
     }
   }
   const appBlock = getBlockedAppCompatibility(model)
@@ -1699,18 +2045,33 @@ function getCompatibilityMeta(model, memory, hermesMinimumContext = 0) {
       tone: 'amber',
     }
   }
+  const pixelAgent = getPixelAgentCompatibility(model)
+  if (isAgentViabilityBlocked(pixelAgent)) {
+    return {
+      label: 'Portal adaptive',
+      detail: 'Available to use',
+      tone: 'purple',
+    }
+  }
   const contextLength = Number(model?.contextLength || 0)
-  const minimumContext = Number(hermesMinimumContext || 0)
+  const minimumContext = Number(pixelMinimumContext || 0)
   if (minimumContext > 0 && contextLength > 0 && contextLength < minimumContext) {
     return {
-      label: 'Direct chat only',
-      detail: `Needs ${formatContext(minimumContext)}`,
+      label: 'Portal compact',
+      detail: `${formatContext(contextLength)} context`,
       tone: 'amber',
+    }
+  }
+  if (!isPixelAgentVerified(pixelAgent)) {
+    return {
+      label: 'Portal adaptive',
+      detail: 'Available to use',
+      tone: 'purple',
     }
   }
   const talkCompatibility = getHermesTalkCompatibility(model)
   if (isHermesTalkVerified(talkCompatibility)) {
-    return { label: 'Talk ready', detail: model.recommended || model.status === 'loaded' ? 'Best' : 'Verified', tone: 'green' }
+    return { label: 'Portal verified', detail: model.recommended || model.status === 'loaded' ? 'Best' : 'Verified', tone: 'green' }
   }
   if (model.recommended || model.status === 'loaded') {
     return { label: model.fitLabel || 'Fits GPU', detail: 'Best', tone: 'green' }
@@ -1731,6 +2092,22 @@ function getAgentViabilityCompatibility(model) {
   return model?.appCompatibility?.agentViability || getHermesTalkCompatibility(model)
 }
 
+function getPixelAgentCompatibility(model) {
+  return model?.appCompatibility?.pixelAgent || null
+}
+
+// User copy for each blocked app. Only `userMessage` may be rendered: the
+// entry's `reason` is an internal fleet-QA note (run IDs, harness jargon).
+function getCompatibilityNotes(model) {
+  const notes = []
+  for (const entry of Object.values(model?.appCompatibility || {})) {
+    if (!entry || typeof entry !== 'object' || !isAgentViabilityBlocked(entry)) continue
+    const message = typeof entry.userMessage === 'string' ? entry.userMessage.trim() : ''
+    if (message && !notes.includes(message)) notes.push(message)
+  }
+  return notes
+}
+
 function getBlockedAppCompatibility(model) {
   const compatibility = model?.appCompatibility || {}
   for (const [key, entry] of Object.entries(compatibility)) {
@@ -1745,7 +2122,6 @@ function formatCompatibilityAppName(key) {
     litellm: 'LiteLLM',
     openWebui: 'Open WebUI',
     opencode: 'OpenCode',
-    openclaw: 'OpenClaw',
     perplexica: 'Perplexica',
     privacyShield: 'Privacy Shield',
     tokenSpy: 'Token Spy',
@@ -1779,6 +2155,7 @@ const CORE_MODEL_COMPATIBILITY_KEYS = new Set([
   'agentViability',
   'hermesTalk',
   'openaiChat',
+  'pixelAgent',
 ])
 
 function isHermesTalkBlocked(compatibility) {
@@ -1791,22 +2168,27 @@ function isHermesTalkVerified(compatibility) {
   return ['supported', 'verified'].includes(status)
 }
 
-function getSpeedDisplay(model) {
+function isPixelAgentVerified(compatibility) {
+  const status = String(compatibility?.status || '').toLowerCase()
+  return ['pixel_agent_viable', 'supported', 'verified'].includes(status)
+}
+
+function getSpeedDisplay(model, gpu) {
   const rawValue = toNumber(model?.tokensPerSec) || extractTokensPerSecond(model?.performanceLabel)
   const value = rawValue && rawValue <= MAX_SINGLE_REQUEST_TOKENS_PER_SECOND ? rawValue : null
   return {
     value,
-    label: value ? (model?.performanceLabel || `${formatNumber(value)} tok/s`) : 'Benchmark required',
+    label: value ? (model?.performanceLabel || `${formatNumber(value)} tok/s`) : hasGpuCapacity(gpu) ? 'Benchmark required' : 'Speed unavailable',
     tone: model?.fitsVram === false ? 'orange' : 'purple',
   }
 }
 
-function getPerformanceBadge(model) {
+function getPerformanceBadge(model, gpu) {
   const badges = {
     measured_local: { tone: 'green', label: 'Measured locally' },
     published_exact: { tone: 'purple', label: 'Published exact' },
     predicted_calibrated: { tone: 'purple', label: 'Calibrated estimate' },
-    benchmark_required: { tone: 'amber', label: 'Benchmark required' },
+    benchmark_required: { tone: 'amber', label: hasGpuCapacity(gpu) ? 'Benchmark required' : 'Speed unavailable' },
     incompatible: { tone: 'red', label: 'Incompatible' },
   }
   return badges[model?.performance?.source] || null
@@ -1854,8 +2236,9 @@ function getModelTags(model, hermesMinimumContext) {
 }
 
 function getIconTone(model, compatibility) {
-  if (!model?.fitsVram) return { border: 'border-orange-400/35', bg: 'bg-orange-500/10', text: 'text-orange-400' }
-  if (compatibility.tone === 'amber') return { border: 'border-amber-400/35', bg: 'bg-amber-500/10', text: 'text-amber-300' }
+  if (model?.metadata?.source === 'runtime') return { border: 'border-purple-400/35', bg: 'bg-purple-500/10', text: 'text-purple-400' }
+  if (!model?.fitsVram) return { border: 'border-theme-border', bg: 'bg-theme-text-secondary/10', text: 'text-theme-text-secondary' }
+  if (compatibility.tone === 'amber') return { border: 'border-theme-border', bg: 'bg-theme-text-secondary/10', text: 'text-theme-text-secondary' }
   if (compatibility.detail === 'Best') return { border: 'border-theme-accent/35', bg: 'bg-theme-accent/10', text: 'text-theme-accent' }
   return { border: 'border-emerald-400/30', bg: 'bg-emerald-500/10', text: 'text-emerald-400' }
 }
@@ -1924,7 +2307,7 @@ function getContextOptions(model, gpu) {
   values.add(recommended)
   values.add(maximum)
   const baseEstimate = Number(model?.estimatedRequired || model?.vramRequired || 0)
-  const capacity = Number(gpu?.vramTotal || 0)
+  const capacity = Number(gpu?.modelMemoryBudgetGb ?? gpu?.vramTotal ?? 0)
 
   return [...values]
     .sort((left, right) => left - right)

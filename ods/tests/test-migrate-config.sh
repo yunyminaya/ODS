@@ -238,6 +238,140 @@ else
 fi
 
 # ============================================================================
+# Test 13: backup captures DATA_DIR content (#2924)
+#
+# BACKUP_DIR lives inside DATA_DIR, so a wholesale `cp -r "$DATA_DIR"` asks cp
+# to copy a directory into itself; the failure used to be swallowed and the
+# backup shipped with an empty data/.
+# ============================================================================
+mkdir -p "$DATA_DIR/models"
+echo "user-payload" > "$DATA_DIR/models/marker.txt"
+
+backup13_exit=0
+backup13_output=$(bash "$MIGRATE_CONFIG_SCRIPT" backup 2>&1) || backup13_exit=$?
+if [[ $backup13_exit -ne 0 ]]; then
+    fail "Behavioral test: backup exited $backup13_exit: $backup13_output"
+else
+    latest_backup=$(ls -1d "$DATA_DIR"/backups/config-* | tail -1)
+    if [[ -f "$latest_backup/data/models/marker.txt" ]]; then
+        pass "Behavioral test: backup captures DATA_DIR content"
+    else
+        fail "Behavioral test: backup data/ is missing DATA_DIR content ($latest_backup)"
+    fi
+fi
+
+# The backups tree must not be copied into the backup it is creating.
+if [[ -e "$latest_backup/data/backups" ]]; then
+    fail "Behavioral test: backup recursed into its own backups directory"
+else
+    pass "Behavioral test: backup skips the backups directory"
+fi
+
+# Two backups created within the same second must remain separate snapshots.
+FAKE_BIN="$TEMP_DIR/fake-bin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/date" <<'SH'
+#!/bin/bash
+if [[ "${1:-}" == "+%Y%m%d-%H%M%S" ]]; then
+    printf '%s\n' '20300101-010203'
+else
+    /bin/date "$@"
+fi
+SH
+chmod +x "$FAKE_BIN/date"
+
+backup_first=$(PATH="$FAKE_BIN:$PATH" bash "$MIGRATE_CONFIG_SCRIPT" backup | tail -n 1)
+backup_second=$(PATH="$FAKE_BIN:$PATH" bash "$MIGRATE_CONFIG_SCRIPT" backup | tail -n 1)
+if [[ "$backup_first" != "$backup_second" \
+    && -d "$backup_first" && -d "$backup_second" ]]; then
+    pass "Behavioral test: same-second backups use unique directories"
+else
+    fail "Behavioral test: same-second backups collided at $backup_first"
+fi
+
+# ============================================================================
+# Test 14: compare_versions handles prerelease suffixes and zero-padded parts
+# ============================================================================
+cmp_subshell() {
+    local v1="$1"
+    local v2="$2"
+    (
+        source "$MIGRATE_CONFIG_SCRIPT" help >/dev/null 2>&1
+        compare_versions "$v1" "$v2"
+    )
+}
+
+cmp_code=0
+cmp_subshell "v2.5.0-rc1" "2.5.0" || cmp_code=$?
+if [[ $cmp_code -eq 0 ]]; then
+    pass "compare_versions: v2.5.0-rc1 equals 2.5.0"
+else
+    fail "compare_versions: v2.5.0-rc1 vs 2.5.0 exited $cmp_code"
+fi
+
+cmp_code=0
+cmp_subshell "v2.5.0-12-g975fd429b" "2.5.0" || cmp_code=$?
+if [[ $cmp_code -eq 0 ]]; then
+    pass "compare_versions: git describe version equals base release"
+else
+    fail "compare_versions: v2.5.0-12-g975fd429b vs 2.5.0 exited $cmp_code"
+fi
+
+cmp_code=0
+cmp_subshell "v2.5.0+build5" "2.5.0" || cmp_code=$?
+if [[ $cmp_code -eq 0 ]]; then
+    pass "compare_versions: build metadata suffix equals base release"
+else
+    fail "compare_versions: v2.5.0+build5 vs 2.5.0 exited $cmp_code"
+fi
+
+cmp_code=0
+cmp_subshell "2.08.0" "2.4.0" || cmp_code=$?
+if [[ $cmp_code -eq 1 ]]; then
+    pass "compare_versions: leading zero 2.08.0 > 2.4.0 without octal error"
+else
+    fail "compare_versions: 2.08.0 vs 2.4.0 exited $cmp_code"
+fi
+
+cmp_code=0
+cmp_subshell "2.08.0" "2.8.0" || cmp_code=$?
+if [[ $cmp_code -eq 0 ]]; then
+    pass "compare_versions: leading zero 2.08.0 equals 2.8.0"
+else
+    fail "compare_versions: 2.08.0 vs 2.8.0 exited $cmp_code"
+fi
+
+cmp_code=0
+cmp_subshell "unknown" "2.4.0" || cmp_code=$?
+if [[ $cmp_code -eq 3 ]]; then
+    pass "compare_versions: non-numeric string is rejected"
+else
+    fail "compare_versions: unknown vs 2.4.0 exited $cmp_code"
+fi
+
+# ============================================================================
+# Test 15: Behavioral check with suffixed .version file
+# ============================================================================
+echo "v2.5.0-12-g975fd429b" > "$INSTALL_DIR/.version"
+echo "2.4.1" > "$DATA_DIR/.migration-state"
+check_exit=0
+check_output=$(bash "$MIGRATE_CONFIG_SCRIPT" check 2>&1) || check_exit=$?
+if [[ $check_exit -eq 2 ]] && echo "$check_output" | grep -q "Migration needed"; then
+    pass "Behavioral test: check detects pending migration with git describe version"
+else
+    fail "Behavioral test: check failed with git describe version (exit $check_exit): $check_output"
+fi
+
+echo "2.5.0" > "$DATA_DIR/.migration-state"
+check_exit=0
+check_output=$(bash "$MIGRATE_CONFIG_SCRIPT" check 2>&1) || check_exit=$?
+if [[ $check_exit -eq 0 ]] && echo "$check_output" | grep -q "No migration needed"; then
+    pass "Behavioral test: check reports up-to-date with git describe version"
+else
+    fail "Behavioral test: check failed when up-to-date with git describe version (exit $check_exit): $check_output"
+fi
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo ""

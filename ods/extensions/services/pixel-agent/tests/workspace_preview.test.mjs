@@ -1,0 +1,467 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+test("writable output refusal explains narrowing permissions without changing the host", async () => {
+  const tool = createWorkspacePreviewTool({request: async () => ({
+    schemaVersion: 1, kind: 'ods-pixel-workspace-preview', status: 'failed',
+    boundary: testing.BOUNDARY, error: 'ODS workspace preview publication failed',
+    errorCode: 'writable_file',
+  })});
+  const result = await tool.execute('writable-build', {relativeDirectory: 'demo-site'});
+  assert.equal(result.isError, true);
+  assert.equal(result.details.errorCode, 'writable_file');
+  assert.match(result.content[0].text, /chmod go-w/);
+  assert.match(result.content[0].text, /Adding read or execute permission does not remove write permission/);
+  assert.match(result.content[0].text, /Do not change parent directories/);
+});
+
+// RTX Spark: the generic unsafe_directory text named no cause, so the agent
+// guessed and tried rm -r on its own hidden .harness/ folder.
+test("folder and file refusals state the host's rules and that hidden entries are skipped", async () => {
+  for (const [errorCode, expected] of [
+    ['unsafe_directory', [/every folder inside it must belong to the workspace owner, be readable, and must not be a symlink or writable by group or others/,
+      /only ASCII letters \(A-Z, a-z\), digits, '\.', '_', '-', '\[' and '\]' \(at most 128 characters\) and must not start with '-', '\]' or the reserved __ods_ prefix/,
+      /folders starting with '\.' are hidden and skipped, never published/,
+      // Each cause gets its own remedy: renaming cannot fix a mode fault, and
+      // moving a needed asset folder out would publish a site full of 404s.
+      /Rename a folder whose name breaks these rules \(for example, one with spaces in its name\) and update the references to it, or move an unrelated folder outside the site directory/,
+      /If the selected directory or a folder inside it is writable by group or others, remove only those write bits from that folder \(chmod go-w\)/,
+      /Move a symlinked or foreign-owned folder outside the site and, if the site needs its files, copy them into a real folder the workspace owner owns/,
+      /Leave folders on the path above the selected directory unchanged and tell the owner/,
+      /Never delete files, broaden permissions, or blindly change ownership/]],
+    ['unsafe_file', [/not a symlink, hard link, or special file/, /at most 4 MiB/, /index\.html must not be empty/,
+      /only ASCII letters \(A-Z, a-z\), digits, '\.', '_', '-', '\[' and '\]' \(at most 128 characters\), must not start with '-', '\]' or the reserved __ods_ prefix, and must not be exactly __pycache__/,
+      /files starting with '\.' are hidden and skipped, never published/]],
+  ]) {
+    const tool = createWorkspacePreviewTool({request: async () => ({
+      schemaVersion: 1, kind: 'ods-pixel-workspace-preview', status: 'failed',
+      boundary: testing.BOUNDARY, error: 'ODS workspace preview publication failed', errorCode,
+    })});
+    const result = await tool.execute('unsafe-entry', {relativeDirectory: 'Playground/elf-of-doom'});
+    assert.equal(result.isError, true);
+    assert.equal(result.details.errorCode, errorCode);
+    for (const pattern of expected) assert.match(result.content[0].text, pattern, errorCode);
+    // File write bits are reported as writable_file, never as unsafe_file.
+    assert.doesNotMatch(result.content[0].text, /mode 0664|blindly relax|unsafe names/, errorCode);
+  }
+});
+
+import {
+  createWorkspacePreviewTool,
+  EMPTY_PUBLISHED_FILES_PREFIX,
+  normalizeWorkspacePreviewParams,
+  PREVIEW_CARD_GUIDANCE,
+  testing,
+} from "../plugin/workspace-preview.mjs";
+
+function succeededResponse(overrides = {}) {
+  const sha256 = "a".repeat(64);
+  const siteId = `site-${sha256.slice(0, 24)}`;
+  const port = 9437;
+  return {
+    schemaVersion: 1,
+    kind: "ods-pixel-workspace-preview",
+    status: "succeeded",
+    relativeDirectory: "demo-site",
+    siteId,
+    port,
+    url: `http://${siteId}.localhost:${port}/${siteId}/`,
+    files: 3,
+    bytes: 9000,
+    sha256,
+    entryFile: "index.html",
+    entrySha256: "b".repeat(64),
+    httpStatus: 200,
+    readbackVerified: true,
+    executable: false,
+    overwritten: false,
+    boundary: testing.BOUNDARY,
+    ...overrides,
+  };
+}
+
+test('publication scopes storage guidance to the tested viewing mode', async()=>{
+  const tool=createWorkspacePreviewTool({request:async()=>succeededResponse()});
+  const result=await tool.execute('storage-expectations',{relativeDirectory:'demo-site'});
+  assert.equal(result.isError,undefined);
+  assert.match(result.content[0].text,/Inputs in the embedded preview may be lost on reload/);
+  assert.match(result.content[0].text,/Storage behavior can differ in a separate tab/);
+  assert.match(result.content[0].text,/Verify storage behavior at the exact URL and in the viewing mode/);
+  assert.doesNotMatch(result.content[0].text,/Opening the same preview in a new tab does not change this/);
+  assert.match(result.content[0].text,/try\/catch only keeps the app working when storage fails/);
+  assert.deepEqual(result.details,succeededResponse());
+});
+
+test('published feedback accepts literal framework route assets but rejects reserved routes',async()=>{
+  for(const [path,accepted] of [['_next/static/app/[slug]/page.js',true],
+    ['__ods_manifest__.json',false],['app/../file.js',false],['app/.env',false]]) {
+    const tool=createWorkspacePreviewTool({request:async()=>succeededResponse({
+      files:2,publishedPaths:[path,"index.html"].sort(),publishedPathsOmitted:0,publishedEmptyPaths:[],publishedEmptyPathsOmitted:0})});
+    const result=await tool.execute('framework-path',{relativeDirectory:'demo-site'});
+    assert.equal(!result.isError,accepted,path);
+  }
+});
+
+test('captures only an explicitly requested ancestor source directory and requires its receipt', async()=>{
+  const source={schemaVersion:1,sourceId:'source-'+ 'c'.repeat(24),sha256:'c'.repeat(64),relativeDirectory:'demo',files:2,bytes:80,omitted:{directories:1,files:0,sensitiveFiles:0}};
+  for(const directory of ['../demo','elsewhere','demo/dist/inside','demoSibling'])
+    assert.throws(()=>normalizeWorkspacePreviewParams({relativeDirectory:'demo/dist',sourceDirectory:directory}));
+  for(const override of [source,undefined,{...source,relativeDirectory:'elsewhere'},{...source,files:129},{...source,extra:true}]) {
+    const tool=createWorkspacePreviewTool({request:async request=>{
+      assert.equal(request.sourceDirectory,'demo');
+      return succeededResponse({relativeDirectory:'demo/dist',...(override?{source:override}:{})});
+    }});
+    const result=await tool.execute('capture',{relativeDirectory:'demo/dist',sourceDirectory:'demo'});
+    assert.equal(result.isError,override===source?undefined:true);
+    if(override===source)assert.deepEqual(result.details.source,source);
+  }
+});
+
+test("accepts framework asset receipts without relaxing publication roots", async () => {
+  const paths = ["__next._full.txt", "_next/static/app.js", "index.html"];
+  const tool = createWorkspacePreviewTool({request: async () => succeededResponse({
+    publishedPaths: paths, publishedPathsOmitted: 0,
+    publishedEmptyPaths: ["__next._full.txt"], publishedEmptyPathsOmitted: 0,
+  })});
+  const result = await tool.execute("framework", {relativeDirectory: "demo-site"});
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.readbackVerified, true);
+  assert.throws(() => normalizeWorkspacePreviewParams({relativeDirectory: "_private"}));
+  for (const path of ["__ods_view__.html", "_next/../secret", "_next/.hidden", "__pycache__/cache.js"]) {
+    const bad = createWorkspacePreviewTool({request: async () => succeededResponse({
+      files: 2, publishedPaths: [path, "index.html"].sort(), publishedPathsOmitted: 0,
+    })});
+    assert.equal((await bad.execute("invalid", {relativeDirectory: "demo-site"})).isError, true);
+  }
+});
+
+test("normalizes only one bounded workspace-relative directory", () => {
+  assert.deepEqual(normalizeWorkspacePreviewParams({ relativeDirectory: "demo-site" }), {
+    schemaVersion: 1,
+    action: "publish",
+    relativeDirectory: "demo-site",
+  });
+  for (const value of ["", "/tmp/site", "../site", "a\\b", "a//b", "a/./b"]) {
+    assert.throws(
+      () => normalizeWorkspacePreviewParams({ relativeDirectory: value }),
+      /invalid Pixel workspace preview request/
+    );
+  }
+});
+
+test("rejects every ODS-authored creative scaffold or extra request field", () => {
+  for (const extra of [
+    { scaffold: { title: "Demo", tagline: "Generated", theme: "aurora" } },
+    { template: "breakout" },
+    { html: "<h1>Generated</h1>" },
+  ]) {
+    assert.throws(
+      () => normalizeWorkspacePreviewParams({ relativeDirectory: "demo-site", ...extra }),
+      /invalid Pixel workspace preview request/
+    );
+  }
+});
+
+test("exposes a publish-only schema with no creative generator input", () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse() });
+  assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["relativeDirectory", "sourceDirectory"]);
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.match(tool.description, /already exists in Pixel's writable workspace, normally one created by the active model/);
+  assert.match(tool.description, /never supplies creative starter bytes/i);
+  assert.doesNotMatch(tool.description, /elf.of.doom/i, "the shipped example stays out of every turn's tools");
+  assert.doesNotMatch(tool.parameters.properties.relativeDirectory.description, /model-authored/);
+  assert.match(tool.description, /localStorage\/sessionStorage property getters, reads and writes may throw/);
+  assert.match(tool.description, /Guard every storage access\/operation with try\/catch and an in-memory fallback/);
+  assert.match(tool.description, /Saving failure must not block startup, controls or continued work/);
+  assert.match(tool.description, /Embedded previews have opaque origins; separate tabs may differ/);
+  assert.match(tool.description, /Verify persistence at the exact URL; never add allow-same-origin to bypass isolation/);
+  assert.match(tool.description, /blocks alert\(\), confirm\(\) and prompt\(\); use inline DOM controls, including date inputs/);
+  assert.match(tool.description, /remote scripts, styles, fonts, images and API requests are blocked/);
+  assert.match(tool.description, /HTTP readback proves publication, not startup or interactions/);
+  assert.doesNotMatch(JSON.stringify(tool.parameters), /scaffold|template|title|tagline|theme/);
+});
+
+test("publishes only the exact existing workspace directory", async () => {
+  const calls = [];
+  const tool = createWorkspacePreviewTool({
+    request: async (request) => {
+      calls.push(request);
+      return succeededResponse();
+    },
+  });
+  const result = await tool.execute("call-1", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.readbackVerified, true);
+  const snapshot=JSON.parse(result.content[0].text.match(/Inspection snapshot: (\{[^}]+\})\./)[1]);
+  assert.deepEqual(snapshot,{siteId:result.details.siteId,sha256:result.details.sha256});
+  assert.notEqual(snapshot.sha256,result.details.entrySha256);
+  assert.match(result.content[0].text,/pixel_ods_workspace_preview_inspect/);
+  assert.match(result.content[0].text, /independently published and read back/);
+  // RTX Spark, 2026-10-25: a dragon picture's reply ended with an embed of the
+  // site its own preview card was showing.
+  assert.ok(result.content[0].text.includes(`bytes). ${PREVIEW_CARD_GUIDANCE} Inspection snapshot:`));
+  assert.match(PREVIEW_CARD_GUIDANCE, /card .*do not add an \[embed \.\.\.\] directive or a link for it/);
+  // DGX Station: even when told not to, the model pasted "Preview is live: http://site-….localhost:9437/…"
+  // from this text; that address opens only on the ODS machine. The card and guard read details.url.
+  assert.ok(!result.content[0].text.includes(result.details.url));
+  assert.doesNotMatch(result.content[0].text, /localhost/);
+  assert.match(result.details.url, /^http:\/\/site-[0-9a-f]+\.localhost:\d+\//);
+  assert.match(result.content[0].text, /publication and HTTP readback only, not successful startup, interactions or durable browser storage/);
+  // Publication renders nothing; the palette arrives with inspection.
+  assert.match(result.content[0].text, /Publication does not render the page; the inspection result also reports its rendered colors by area\. Check them before claiming a visible color or style change\. /);
+  assert.deepEqual(calls, [{
+    schemaVersion: 1,
+    action: "publish",
+    relativeDirectory: "demo-site",
+  }]);
+});
+
+test("rejects a preview site ID that is not content-addressed to the snapshot", async () => {
+  const mismatchedSiteId = "site-0123456789abcdef01234567";
+  const tool = createWorkspacePreviewTool({
+    request: async () => succeededResponse({
+      siteId: mismatchedSiteId,
+      url: `http://${mismatchedSiteId}.localhost:9437/${mismatchedSiteId}/`,
+    }),
+  });
+  const result = await tool.execute("call-mismatched-site", {
+    relativeDirectory: "demo-site",
+  });
+  assert.equal(result.isError, true);
+});
+
+test("fails before contacting the host when creative bytes are supplied", async () => {
+  let calls = 0;
+  const tool = createWorkspacePreviewTool({
+    request: async () => {
+      calls += 1;
+      return succeededResponse();
+    },
+  });
+  const result = await tool.execute("call-generated", {
+    relativeDirectory: "demo-site",
+    scaffold: { title: "Demo", tagline: "Generated", theme: "aurora" },
+  });
+  assert.equal(result.isError, true);
+  assert.equal(calls, 0);
+});
+
+test("fails closed on a mismatched or unverified service response", async () => {
+  const tool = createWorkspacePreviewTool({
+    request: async () => succeededResponse({
+      port: 3000,
+      url: "http://localhost:3000/demo-site/",
+      readbackVerified: false,
+    }),
+  });
+  const result = await tool.execute("call-2", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, true);
+  assert.equal(result.details.status, "failed");
+  assert.match(result.content[0].text, /do not claim a localhost URL is live/);
+});
+
+test("fails closed when the host response contains an uncontracted field", async () => {
+  const tool = createWorkspacePreviewTool({
+    request: async () => succeededResponse({ redirect: "https://attacker.example/" }),
+  });
+  const result = await tool.execute("call-3", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, true);
+});
+
+test("shows actionable fixed failure categories without echoing host exception text", async () => {
+  const failure = {
+    schemaVersion: 1, kind: "ods-pixel-workspace-preview", status: "failed",
+    boundary: testing.BOUNDARY, error: "ODS workspace preview publication failed",
+    errorCode: "unsupported_file_type",
+  };
+  const tool = createWorkspacePreviewTool({ request: async () => failure });
+  const result = await tool.execute("csv-failure", { relativeDirectory: "demo-site" });
+  assert.equal(result.details.errorCode, "unsupported_file_type");
+  assert.match(result.content[0].text, /CSV and TSV/);
+  for (const value of [
+    { ...failure, error: "private exception /home/private/token" },
+    { ...failure, errorCode: "/home/private/token" },
+    { ...failure, boundary: "wrong boundary" },
+    { ...failure, relativePath: "/home/private/token" },
+  ]) {
+    const invalid = createWorkspacePreviewTool({ request: async () => value });
+    const blocked = await invalid.execute("invalid", { relativeDirectory: "demo-site" });
+    assert.equal(blocked.isError, true);
+    assert.equal(blocked.details.errorCode, "unavailable");
+    assert.doesNotMatch(JSON.stringify(blocked), /\/home\/private|wrong boundary/);
+  }
+});
+
+
+test("receipt names only delivered files when requested source copies remain outside public", async () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse({
+    publishedPaths: ["index.html", "sources.json", "test-results.txt"],
+    publishedPathsOmitted: 0,
+  }) });
+  const result = await tool.execute("missing-copies", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.details.publishedPaths, ["index.html", "sources.json", "test-results.txt"]);
+  assert.match(result.content[0].text, /\["index.html","sources.json","test-results.txt"\]/);
+  assert.doesNotMatch(result.content[0].text, /report\.py\.txt|totals\.py\.txt|readbacks are complete/);
+  assert.match(result.content[0].text, /does not determine whether requested files or checks are missing/);
+});
+
+test("invalid JSON publication requests repair from actual source bytes", async () => {
+  const tool = createWorkspacePreviewTool({request:async()=>({
+    schemaVersion:1,kind:'ods-pixel-workspace-preview',status:'failed',
+    boundary:testing.BOUNDARY,error:'ODS workspace preview publication failed',
+    errorCode:'invalid_json_artifact',artifactError:{path:'export.json',line:2,column:18},
+  })});
+  const result=await tool.execute('invalid-source-export',{relativeDirectory:'project/public'});
+  assert.equal(result.isError,true);
+  assert.equal(result.details.errorCode,'invalid_json_artifact');
+  assert.match(result.content[0].text,/actual final files.*JSON serializer.*parse it back/);
+  assert.match(result.content[0].text,/Do not hand-transcribe/);
+  assert.match(result.content[0].text,/export.json.*line 2, column 18/);
+  assert.deepEqual(result.details.artifactError,{path:'export.json',line:2,column:18});
+});
+
+test('invalid artifact diagnostics cannot reveal uncontracted host details',async()=>{
+  for(const artifactError of [
+    {path:'/etc/private.json',line:1,column:1},
+    {path:'../private.json',line:1,column:1},
+    {path:'export.json',line:1,column:1,content:'secret'},
+    {path:'export.json',line:-1,column:1},
+    {path:'export.json',line:null,column:1},
+  ]){
+    const tool=createWorkspacePreviewTool({request:async()=>({schemaVersion:1,kind:'ods-pixel-workspace-preview',status:'failed',boundary:testing.BOUNDARY,error:'ODS workspace preview publication failed',errorCode:'invalid_json_artifact',artifactError})});
+    const result=await tool.execute('invalid-diagnostic',{relativeDirectory:'project/public'});
+    assert.equal(result.details.errorCode,'unavailable');
+    assert.doesNotMatch(JSON.stringify(result),/private|secret/);
+  }
+});
+
+test("bounded lists explicitly report omitted paths and never claim completeness", async () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse({
+    publishedPaths: ["assets/app.js"], publishedPathsOmitted: 2,
+  }) });
+  const result = await tool.execute("bounded", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /2 additional published paths omitted/);
+  assert.doesNotMatch(result.content[0].text, /complete published file list/);
+});
+
+test("legacy receipts remain valid without inventing a file list", async () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse() });
+  const result = await tool.execute("legacy", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /does not include a file list/);
+  assert.match(result.content[0].text, /do not infer that every requested file was published/);
+  assert.equal(result.details.publishedPaths, undefined);
+});
+
+test("rejects unsafe, unbounded, inconsistent or incomplete file-list receipts", async () => {
+  for (const fields of [
+    { publishedPaths: ["index.html"] },
+    { publishedPathsOmitted: 2 },
+    { publishedPaths: ["index.html"], publishedPathsOmitted: 0 },
+    { publishedPaths: ["index.html"], publishedPathsOmitted: -1 },
+    { publishedPaths: ["index.html"], publishedPathsOmitted: 2.5 },
+    { publishedPaths: ["index.html", "index.html"], publishedPathsOmitted: 1 },
+    { publishedPaths: ["sources.json", "index.html"], publishedPathsOmitted: 1 },
+    { publishedPaths: ["a.txt", "b.txt", "c.txt"], publishedPathsOmitted: 0 },
+    { publishedPaths: ["../private.txt"], publishedPathsOmitted: 2 },
+    { publishedPaths: ["/private.txt"], publishedPathsOmitted: 2 },
+    { publishedPaths: ["a//b.txt"], publishedPathsOmitted: 2 },
+    { publishedPaths: ["a\\b.txt"], publishedPathsOmitted: 2 },
+    { publishedPaths: ["a\nsecret.txt"], publishedPathsOmitted: 2 },
+    { publishedPaths: [42], publishedPathsOmitted: 2 },
+    { publishedPaths: null, publishedPathsOmitted: 3 },
+    { publishedPaths: Array.from({ length: 33 }, (_, i) => `a${String(i).padStart(2, "0")}.txt`), publishedPathsOmitted: 0, files: 33 },
+    { publishedPaths: [Array(20).fill("a".repeat(120)).join("/") + ".txt"], publishedPathsOmitted: 2 },
+  ]) {
+    const tool = createWorkspacePreviewTool({ request: async () => succeededResponse(fields) });
+    const result = await tool.execute("bad-list", { relativeDirectory: "demo-site" });
+    assert.equal(result.isError, true, JSON.stringify(fields));
+    assert.equal(result.details.status, "failed");
+    assert.doesNotMatch(JSON.stringify(result), /private\.txt|secret\.txt/);
+  }
+});
+
+// tower1 7402eb38 coding journey: `2>&1 > public/test-results.txt` left the
+// published file empty and the final answer called it the unittest output.
+const FLEET_EMPTY_RECEIPT = {
+  relativeDirectory: "fleet-qualification-489210351f87-coding/public",
+  publishedPaths: ["index.html", "sources.json", "test-results.txt"], publishedPathsOmitted: 0,
+  publishedEmptyPaths: ["test-results.txt"], publishedEmptyPathsOmitted: 0,
+};
+
+test("receipt names zero-byte published files without failing publication", async () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse(FLEET_EMPTY_RECEIPT) });
+  const result = await tool.execute("fleet-empty", { relativeDirectory: FLEET_EMPTY_RECEIPT.relativeDirectory });
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.status, "succeeded");
+  assert.deepEqual(result.details.publishedEmptyPaths, ["test-results.txt"]);
+  const text = result.content[0].text;
+  assert.equal(EMPTY_PUBLISHED_FILES_PREFIX, "Published files that are empty (0 bytes): ");
+  assert.ok(text.includes("Published files that are empty (0 bytes): test-results.txt. "), text);
+  assert.equal(text.split(EMPTY_PUBLISHED_FILES_PREFIX).length, 2);
+  assert.match(text, /^ODS independently published and read back /);
+});
+
+test("empty-file note lists every shown path and counts the omitted ones", async () => {
+  const tool = createWorkspacePreviewTool({ request: async () => succeededResponse({
+    files: 40, publishedPaths: ["app.js", "index.html"], publishedPathsOmitted: 38,
+    publishedEmptyPaths: ["app.js", "logs/run.txt"], publishedEmptyPathsOmitted: 3,
+  }) });
+  const result = await tool.execute("bounded-empty", { relativeDirectory: "demo-site" });
+  assert.equal(result.isError, undefined);
+  assert.ok(result.content[0].text.includes(`${EMPTY_PUBLISHED_FILES_PREFIX}app.js, logs/run.txt, 3 more. `));
+});
+
+test("no empty-file note when nothing is empty or the host sent no empty-file list", async () => {
+  for (const fields of [
+    { publishedPaths: ["index.html", "test-results.txt"], publishedPathsOmitted: 1,
+      publishedEmptyPaths: [], publishedEmptyPathsOmitted: 0 },
+    { publishedPaths: ["index.html", "test-results.txt"], publishedPathsOmitted: 1 },
+    {},
+  ]) {
+    const tool = createWorkspacePreviewTool({ request: async () => succeededResponse(fields) });
+    const result = await tool.execute("no-empty", { relativeDirectory: "demo-site" });
+    assert.equal(result.isError, undefined, JSON.stringify(fields));
+    assert.doesNotMatch(result.content[0].text, /empty \(0 bytes\)/);
+  }
+});
+
+test("rejects empty-file lists that are unsafe, unbounded or inconsistent with the file list", async () => {
+  const paths = { publishedPaths: ["index.html", "sources.json", "test-results.txt"], publishedPathsOmitted: 0 };
+  for (const fields of [
+    { publishedEmptyPaths: ["test-results.txt"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["test-results.txt"] },
+    { ...paths, publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["index.html"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["other.txt"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["test-results.txt", "sources.json"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["sources.json", "sources.json"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["sources.json", "test-results.txt"], publishedEmptyPathsOmitted: 1 },
+    { ...paths, publishedEmptyPaths: ["test-results.txt"], publishedEmptyPathsOmitted: -1 },
+    { ...paths, publishedEmptyPaths: ["test-results.txt"], publishedEmptyPathsOmitted: 0.5 },
+    { ...paths, publishedEmptyPaths: "test-results.txt", publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["../private.txt"], publishedEmptyPathsOmitted: 0 },
+    { ...paths, publishedEmptyPaths: ["a\nsecret.txt"], publishedEmptyPathsOmitted: 0 },
+    { files: 40, publishedPaths: ["index.html"], publishedPathsOmitted: 39,
+      publishedEmptyPaths: Array.from({ length: 33 }, (_, i) => `e${String(i).padStart(2, "0")}.txt`), publishedEmptyPathsOmitted: 0 },
+  ]) {
+    const tool = createWorkspacePreviewTool({ request: async () => succeededResponse(fields) });
+    const result = await tool.execute("bad-empty-list", { relativeDirectory: "demo-site" });
+    assert.equal(result.isError, true, JSON.stringify(fields));
+    assert.equal(result.details.status, "failed");
+    assert.doesNotMatch(JSON.stringify(result), /private\.txt|secret\.txt/);
+  }
+});
+
+
+test('source capture failure codes remain actionable without exposing host details',async()=>{
+  for(const [errorCode,expected] of [['source_store_full',/128-capture or 64 MiB/],['source_capture_limit',/256 KiB/],['source_capture_changed',/writes to finish/],['no_eligible_source',/no eligible UTF-8/]]) {
+    const tool=createWorkspacePreviewTool({request:async()=>({schemaVersion:1,kind:'ods-pixel-workspace-preview',status:'failed',boundary:testing.BOUNDARY,error:'ODS workspace preview publication failed',errorCode})});
+    const result=await tool.execute('source-failure',{relativeDirectory:'demo/dist',sourceDirectory:'demo'});
+    assert.equal(result.isError,true);
+    assert.equal(result.details.errorCode,errorCode);
+    assert.match(result.content[0].text,expected);
+  }
+});

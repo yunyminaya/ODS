@@ -122,8 +122,8 @@ test_file_has_timeout \
     "NodeSource setup script"
 
 test_file_has_timeout \
-    "$ROOT_DIR/installers/phases/07-devtools.sh" \
-    "curl.*opencode.ai/install" \
+    "$ROOT_DIR/installers/lib/opencode-runtime.sh" \
+    "curl.*-fsSL" \
     "--max-time" \
     "OpenCode install script"
 
@@ -141,11 +141,13 @@ test_file_has_timeout \
     "--max-time" \
     "GGUF model download"
 
+# The SDXL Lightning model (installer phase 11 and the Extensions page) goes
+# through the shared model-pack downloader.
 test_file_has_timeout \
-    "$ROOT_DIR/installers/phases/11-services.sh" \
-    "curl.*SDXL_URL" \
-    "--max-time" \
-    "SDXL Lightning model download"
+    "$ROOT_DIR/bin/extension_assets.py" \
+    "opener(urllib.request.Request" \
+    "timeout=READ_TIMEOUT_SECONDS" \
+    "Model pack download (SDXL Lightning)"
 
 # Phase 12 - Health checks
 test_file_has_timeout \
@@ -237,8 +239,8 @@ test_file_has_timeout \
     "macOS final host-service health checks"
 
 test_file_has_timeout \
-    "$ROOT_DIR/installers/macos/install-macos.sh" \
-    "curl.*opencode.ai/install" \
+    "$ROOT_DIR/installers/lib/opencode-runtime.sh" \
+    "curl.*-fsSL" \
     "--max-time" \
     "macOS OpenCode install"
 

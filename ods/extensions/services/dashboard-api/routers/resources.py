@@ -7,7 +7,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from config import DATA_DIR, GPU_BACKEND, SERVICES
+from config import (
+    DATA_DIR, EXTENSIONS_DIR, GPU_BACKEND, LIBRARY_MANAGEABLE_BUILTINS,
+    SERVICES, load_extension_manifests,
+)
 from helpers import dir_size_gb
 from host_agent_client import (
     AgentClientError,
@@ -21,6 +24,7 @@ from security import verify_api_key
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["resources"])
 _SERVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_resource_refreshes: dict[str, asyncio.Task] = {}
 
 _DATA_DIR_MAP = {
     "models": "llama-server",
@@ -32,6 +36,21 @@ _DATA_DIR_MAP = {
     "tts": "tts",
     "whisper": "whisper",
 }
+
+
+def _current_service_configs() -> dict:
+    """Refresh qualified Library built-ins without granting auxiliary authority."""
+    services = {sid: cfg for sid, cfg in SERVICES.items() if sid not in LIBRARY_MANAGEABLE_BUILTINS}
+    try:
+        selected, _, _ = load_extension_manifests(
+            EXTENSIONS_DIR, GPU_BACKEND, only_service_ids=LIBRARY_MANAGEABLE_BUILTINS,
+        )
+    except OSError as exc:
+        # A stale startup entry must not authorize a restart when current
+        # selection cannot be read. The next request can retry after repair.
+        raise HTTPException(status_code=503, detail="Current Library service selection is unavailable") from exc
+    services.update({sid: cfg for sid, cfg in selected.items() if sid in LIBRARY_MANAGEABLE_BUILTINS})
+    return services
 
 
 def _service_restartability(config: dict) -> tuple[bool, str | None]:
@@ -51,15 +70,25 @@ def _scan_service_disk() -> dict[str, dict]:
     """Scan /data/* directories and map to services."""
     data_path = Path(DATA_DIR)
     results = {}
-    if not data_path.is_dir():
+    try:
+        if not data_path.is_dir():
+            return results
+        children = list(data_path.iterdir())
+    except (OSError, PermissionError) as exc:
+        logger.warning("Unable to scan data directory %s: %s", data_path, exc)
         return results
-    for child in data_path.iterdir():
-        if not child.is_dir():
+
+    for child in children:
+        try:
+            if not child.is_dir():
+                continue
+            service_id = _DATA_DIR_MAP.get(child.name, child.name)
+            size_gb = dir_size_gb(child)
+            if size_gb > 0:
+                results[service_id] = {"data_gb": size_gb, "path": f"data/{child.name}"}
+        except (OSError, PermissionError) as exc:
+            logger.debug("Skipping inaccessible data directory %s: %s", child, exc)
             continue
-        service_id = _DATA_DIR_MAP.get(child.name, child.name)
-        size_gb = dir_size_gb(child)
-        if size_gb > 0:
-            results[service_id] = {"data_gb": size_gb, "path": f"data/{child.name}"}
     return results
 
 
@@ -89,10 +118,46 @@ def _post_agent_json(path: str, body: dict, timeout: int = 65) -> dict:
         raise HTTPException(status_code=500, detail=f"Host agent call failed: {exc}") from exc
 
 
+def _observe_resource_refresh(task: asyncio.Task) -> None:
+    # Retrieve failures even if every HTTP waiter has disconnected. Awaiters
+    # still receive the same exception; no failed value enters the cache.
+    error = None if task.cancelled() else task.exception()
+    if error is not None:
+        logger.error("Resource collection failed", exc_info=(type(error), error, error.__traceback__))
+
+
+async def _resource_snapshot(key: str, collector, ttl: float):
+    from main import _cache  # noqa: PLC0415
+
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+    task = _resource_refreshes.get(key)
+    if task is None:
+        async def collect():
+            try:
+                value = await asyncio.to_thread(collector)
+                if _resource_refreshes.get(key) is asyncio.current_task():
+                    _cache.set(key, value, ttl)
+                return value
+            finally:
+                if _resource_refreshes.get(key) is asyncio.current_task():
+                    del _resource_refreshes[key]
+
+        task = asyncio.create_task(collect())
+        _resource_refreshes[key] = task
+        task.add_done_callback(_observe_resource_refresh)
+    # Cancelling an HTTP request cannot stop a running to_thread collector.
+    # Keep its ownership until completion so the next request can join it.
+    return await asyncio.shield(task)
+
+
 @router.get("/api/services/resources")
 async def service_resources(api_key: str = Depends(verify_api_key)):
     """Get per-service resource metrics (CPU, RAM, disk)."""
     from main import _cache  # noqa: PLC0415 — deferred import to avoid circular dependency
+
+    service_configs = await asyncio.to_thread(_current_service_configs)
 
     container_stats = _cache.get("service_resources_containers")
     disk_usage = _cache.get("service_resources_disk")
@@ -103,19 +168,17 @@ async def service_resources(api_key: str = Depends(verify_api_key)):
     if need_containers or need_disk:
         tasks = []
         if need_containers:
-            tasks.append(asyncio.to_thread(_fetch_container_stats))
+            tasks.append(_resource_snapshot("service_resources_containers", _fetch_container_stats, 20))
         if need_disk:
-            tasks.append(asyncio.to_thread(_scan_service_disk))
+            tasks.append(_resource_snapshot("service_resources_disk", _scan_service_disk, 60))
 
         results = await asyncio.gather(*tasks)
         idx = 0
         if need_containers:
             container_stats = results[idx]
             idx += 1
-            _cache.set("service_resources_containers", container_stats, 20)
         if need_disk:
             disk_usage = results[idx]
-            _cache.set("service_resources_disk", disk_usage, 60)
 
     container_stats = container_stats or []
     disk_usage = disk_usage or {}
@@ -125,7 +188,7 @@ async def service_resources(api_key: str = Depends(verify_api_key)):
     # when container_name is populated in SERVICES (by PR E's config.py change).
     # Falls back to ods-{sid} convention when container_name is missing.
     container_to_service = {}
-    for sid, svc in SERVICES.items():
+    for sid, svc in service_configs.items():
         cname = svc.get("container_name", f"ods-{sid}")
         if isinstance(cname, str) and cname.strip():
             container_to_service[cname] = sid
@@ -137,7 +200,7 @@ async def service_resources(api_key: str = Depends(verify_api_key)):
         stats_by_id[mapped_id] = stat
 
     services = []
-    for service_id, config in SERVICES.items():
+    for service_id, config in service_configs.items():
         restartable, restart_unavailable_reason = _service_restartability(config)
         entry = {
             "id": service_id,
@@ -150,18 +213,20 @@ async def service_resources(api_key: str = Depends(verify_api_key)):
         }
         services.append(entry)
 
-    # Add services with disk data but not in SERVICES dict (orphaned data)
-    known_ids = set(SERVICES.keys())
-    for sid, disk in disk_usage.items():
+    # A manifest can own multiple containers (for example LibreChat's MongoDB
+    # and Meilisearch). Keep their measured usage visible even though they do
+    # not have separate service manifests or restart authority.
+    known_ids = set(service_configs)
+    for sid in dict.fromkeys([*stats_by_id, *disk_usage]):
         if sid not in known_ids:
             services.append({
                 "id": sid,
                 "name": sid,
-                "type": "unknown",
+                "type": "docker" if sid in stats_by_id else "unknown",
                 "restartable": False,
                 "restart_unavailable_reason": "Service is not declared in the active manifest set",
-                "container": None,
-                "disk": disk,
+                "container": stats_by_id.get(sid),
+                "disk": disk_usage.get(sid),
             })
 
     total_cpu = sum(s.get("cpu_percent", 0) for s in container_stats)
@@ -186,9 +251,10 @@ async def restart_service(service_id: str, api_key: str = Depends(verify_api_key
     """Restart a single known ODS service via the host agent."""
     if not _SERVICE_ID_RE.match(service_id):
         raise HTTPException(status_code=400, detail="Invalid service_id")
-    if service_id not in SERVICES:
+    service_configs = await asyncio.to_thread(_current_service_configs)
+    if service_id not in service_configs:
         raise HTTPException(status_code=404, detail=f"Service not found: {service_id}")
-    restartable, restart_unavailable_reason = _service_restartability(SERVICES[service_id])
+    restartable, restart_unavailable_reason = _service_restartability(service_configs[service_id])
     if not restartable:
         raise HTTPException(
             status_code=400,
@@ -208,5 +274,8 @@ async def restart_service(service_id: str, api_key: str = Depends(verify_api_key
     )
 
     from main import _cache  # noqa: PLC0415 — deferred import to avoid circular dependency
+    # An older in-flight read may finish after the restart acknowledgement.
+    # Let its existing waiters finish without republishing it for new readers.
+    _resource_refreshes.pop("service_resources_containers", None)
     _cache.invalidate("service_resources_containers")
     return result

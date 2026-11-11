@@ -284,7 +284,12 @@ download_tier() {
     warn "Estimated download time: ${est_minutes}-$((est_minutes * 2)) minutes (depends on connection)"
     echo ""
     
-    read -p "Continue? [Y/n] " -n 1 -r
+    # `--tier X` is a documented non-interactive invocation but still reaches
+    # this confirmation. Under `set -euo pipefail` a closed stdin (CI, a pipe,
+    # nohup) makes read return non-zero and abort the whole script before the
+    # download; tolerate EOF and proceed, since the tier was chosen explicitly
+    # and the prompt defaults to yes ([Y/n]).
+    read -p "Continue? [Y/n] " -n 1 -r || REPLY=""
     echo
     if [[ $REPLY =~ ^[Nn]$ ]]; then
         echo "Cancelled."
@@ -327,11 +332,17 @@ interactive_menu() {
     list_models
     
     echo ""
-    read -p "Select tier to download [nano/edge/pro/cluster] ($recommended): " tier_choice
+    if ! read -p "Select tier to download [nano/edge/pro/cluster] ($recommended): " tier_choice; then
+        error "No tier selection received. For non-interactive use, pass --tier nano|edge|pro|cluster."
+        return 1
+    fi
     tier_choice="${tier_choice:-$recommended}"
     
     echo ""
-    read -p "Also download voice components (STT/TTS)? [y/N] " -n 1 -r voice_choice
+    if ! read -p "Also download voice components (STT/TTS)? [y/N] " -n 1 -r voice_choice; then
+        error "No voice selection received. For non-interactive use, pass --tier TIER and optionally --with-voice."
+        return 1
+    fi
     echo
     
     local include_voice="false"

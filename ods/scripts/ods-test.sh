@@ -25,7 +25,8 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ODS_DIR="${ODS_DIR:-$HOME/.ods}"
+# The install this script ships in: its .env sits beside scripts/.
+ODS_DIR="${ODS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 ENV_FILE="${ENV_FILE:-$ODS_DIR/.env}"
 TIMEOUT=15
 QUICK_TIMEOUT=5
@@ -37,7 +38,7 @@ if [[ -f "$_DT_DIR/lib/service-registry.sh" ]]; then
     . "$_DT_DIR/lib/service-registry.sh"
     sr_load
     [[ -f "$_DT_DIR/lib/safe-env.sh" ]] && . "$_DT_DIR/lib/safe-env.sh"
-    load_env_file "$_DT_DIR/.env"
+    load_env_file "$ENV_FILE"
     sr_resolve_ports
 fi
 
@@ -45,6 +46,20 @@ fi
 LLM_HOST="${LLM_HOST:-localhost}"
 LLM_PORT="${LLM_PORT:-${SERVICE_PORTS[llama-server]:-11434}}"
 LLM_URL="http://${LLM_HOST}:${LLM_PORT}"
+LLM_HEALTH_PATH="/health"
+LLM_ENGINE="llama-server"
+LLM_GATEWAY_KEY=""
+# LLM_BACKEND=vllm: vllm-server publishes no host port. ODS clients reach it
+# through LiteLLM as ods/current (model-router adapts the request to vLLM), so
+# the LLM checks go there too, with the gateway key (_llm_chat).
+_ods_test_backend="$(printf '%s' "${LLM_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+if [[ "$_ods_test_backend" == "vllm" ]]; then
+    LLM_URL="http://${LLM_HOST}:${LITELLM_PORT:-4000}"
+    LLM_HEALTH_PATH="/health/readiness"
+    LLM_ENGINE="vllm-server"
+    LLM_GATEWAY_KEY="${LITELLM_KEY:-${LITELLM_MASTER_KEY:-}}"
+fi
+unset _ods_test_backend
 WHISPER_HOST="${WHISPER_HOST:-localhost}"
 WHISPER_PORT="${WHISPER_PORT:-${SERVICE_PORTS[whisper]:-9000}}"
 TTS_HOST="${TTS_HOST:-localhost}"
@@ -93,11 +108,84 @@ load_env() {
 
 log() {
     [[ "$VERBOSE" == "true" ]] && echo "$@" >&2
+    # Always succeed: log is the last command of `[[ ... ]] && log` guards,
+    # and a non-zero status there aborts the run under set -e.
+    return 0
 }
 
 # Portable millisecond timestamp (macOS BSD date lacks %N)
 _now_ms() {
     python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo "$(date +%s)000"
+}
+
+# The model id llama-server serves (its --alias, the GGUF file name), read from
+# /v1/models as test_llm always has; "local" when the listing fails, and the
+# request that follows then reports the fault.
+_llm_model_id() {
+    # The gateway serves the active model under its stable alias.
+    if [[ -n "$LLM_GATEWAY_KEY" ]]; then
+        echo "ods/current"
+        return 0
+    fi
+    local model_id
+    model_id=$(curl -s --max-time 10 "$LLM_URL/v1/models" 2>/dev/null | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4) || model_id=""
+    echo "${model_id:-local}"
+}
+
+# POST one chat completion ($2) to the LLM route within $1 seconds. A gateway
+# key travels on curl's stdin (-H @-), never in argv.
+_llm_chat() {
+    local seconds="$1" payload="$2"
+    if [[ -n "$LLM_GATEWAY_KEY" ]]; then
+        printf 'Authorization: Bearer %s\n' "$LLM_GATEWAY_KEY" \
+            | curl -s --max-time "$seconds" -X POST "$LLM_URL/v1/chat/completions" \
+                -H "Content-Type: application/json" -H @- \
+                -d "$payload" 2>/dev/null
+    else
+        curl -s --max-time "$seconds" -X POST "$LLM_URL/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "$payload" 2>/dev/null
+    fi
+}
+
+# Judge a chat completion (read on stdin) by its JSON structure, not by
+# grepping for a word: a reply with "tool_calls": null and no call contains the
+# word too. $1 is "text" (an assistant answer; a thinking model may spend a
+# short budget on reasoning alone) or "tool" (a get_weather call with a city).
+_completion_ok() {
+    python3 -c '
+import json, sys
+
+def has_weather_call(message):
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        if (function.get("name") == "get_weather" and isinstance(arguments, dict)
+                and str(arguments.get("city") or "").strip()):
+            return True
+    return False
+
+try:
+    message = json.load(sys.stdin)["choices"][0]["message"]
+    if sys.argv[1] == "tool":
+        ok = has_weather_call(message)
+    else:
+        text = message.get("content") or message.get("reasoning_content")
+        ok = isinstance(text, str) and bool(text.strip())
+except (ValueError, LookupError, TypeError, AttributeError):
+    ok = False  # not a chat completion: an error body, HTML, or nothing
+sys.exit(0 if ok else 1)
+' "$1"
+}
+
+# Section banner; silent in --json mode so stdout stays one JSON document.
+print_section() {
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        echo ""
+        echo "> $1"
+    fi
 }
 
 print_header() {
@@ -165,15 +253,17 @@ test_http() {
     start_time=$(_now_ms)
 
     if [[ -n "$payload" && "$method" == "POST" ]]; then
+        # curl prints "000" itself when no response arrives, so a fallback in
+        # the substitution would append a second "000" ("HTTP 000000").
         response_code=$(curl -s -o /dev/null -w "%{http_code}" \
             --max-time "$custom_timeout" \
             -X POST "$url" \
             -H "Content-Type: application/json" \
-            -d "$payload" 2>/dev/null || echo "000")
+            -d "$payload" 2>/dev/null) || response_code="000"
     else
         response_code=$(curl -s -o /dev/null -w "%{http_code}" \
             --max-time "$custom_timeout" \
-            "$url" 2>/dev/null || echo "000")
+            "$url" 2>/dev/null) || response_code="000"
     fi
     
     end_time=$(_now_ms)
@@ -211,8 +301,7 @@ test_tcp() {
 #--------------------------------------------------------------------------
 
 test_docker() {
-    echo ""
-    echo "> Docker Infrastructure"
+    print_section "Docker Infrastructure"
     
     if ! command -v docker &>/dev/null; then
         record_result "Docker Available" "fail" "docker not installed"
@@ -233,14 +322,18 @@ test_docker() {
     print_test "Docker Daemon" "pass"
     
     local running_count
-    running_count=$(timeout 10 docker ps --format '{{.Names}}' 2>/dev/null | wc -l)
+    if ! running_count=$(timeout 10 docker ps --format '{{.Names}}' 2>/dev/null | wc -l); then
+        record_result "Running Containers" "fail" "container listing failed"
+        print_test "Running Containers" "fail" "container listing failed"
+        return 0
+    fi
     record_result "Running Containers" "pass" "$running_count containers"
     print_test "Running Containers" "pass" "$running_count containers"
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_gpu() {
-    echo ""
-    echo "> GPU Resources"
+    print_section "GPU Resources"
     
     if ! command -v nvidia-smi &>/dev/null; then
         record_result "NVIDIA GPU" "skip" "nvidia-smi not found"
@@ -249,7 +342,7 @@ test_gpu() {
     fi
     
     local gpu_info
-    gpu_info=$(timeout 10 nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null | head -1)
+    gpu_info=$(timeout 10 nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null | head -1) || gpu_info=""
     
     if [[ -n "$gpu_info" ]]; then
         local name mem_used mem_total util mem_pct
@@ -257,6 +350,11 @@ test_gpu() {
         mem_used=$(echo "$gpu_info" | cut -d',' -f2 | xargs | cut -d' ' -f1)
         mem_total=$(echo "$gpu_info" | cut -d',' -f3 | xargs | cut -d' ' -f1)
         
+        if [[ ! "$mem_used" =~ ^[0-9]+$ || ! "$mem_total" =~ ^[0-9]+$ ]] || [[ "$mem_total" -eq 0 ]]; then
+            record_result "GPU Memory" "fail" "invalid memory telemetry"
+            print_test "GPU Memory" "fail" "invalid memory telemetry"
+            return 0
+        fi
         mem_pct=$(( mem_used * 100 / mem_total ))
         
         record_result "GPU Available" "pass" "$name"
@@ -273,14 +371,20 @@ test_gpu() {
         record_result "NVIDIA GPU" "fail" "no GPU detected"
         print_test "NVIDIA GPU" "fail" "not detected"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_llm() {
-    echo ""
-    echo "> LLM Inference (llama-server)"
+    print_section "LLM Inference ($LLM_ENGINE)"
 
-    test_http "LLM Health" "$LLM_URL/health" "200" || return 1
-    test_http "LLM Models API" "$LLM_URL/v1/models" "200"
+    # A failed check is already recorded; return 0 so the short-circuit only
+    # skips this section's dependent checks instead of aborting the whole run
+    # under set -e (which lost the summary and the --json document).
+    test_http "LLM Health" "$LLM_URL$LLM_HEALTH_PATH" "200" || return 0
+    # The gateway lists only its aliases, and only with its key.
+    if [[ -z "$LLM_GATEWAY_KEY" ]]; then
+        test_http "LLM Models API" "$LLM_URL/v1/models" "200" || log "LLM models API check failed"
+    fi
 
     if [[ "$QUICK_MODE" == "true" ]]; then
         record_result "LLM Inference" "skip" "quick mode"
@@ -289,32 +393,28 @@ test_llm() {
     fi
 
     local model_id
-    model_id=$(curl -s --max-time 10 "$LLM_URL/v1/models" 2>/dev/null | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    model_id="${model_id:-local}"
+    model_id=$(_llm_model_id)
 
     local payload="{\"model\": \"$model_id\", \"messages\": [{\"role\": \"user\", \"content\": \"Say hello\"}], \"max_tokens\": 10}"
     local response
 
-    response=$(curl -s --max-time 30 \
-        -X POST "$LLM_URL/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>/dev/null)
+    response=$(_llm_chat 30 "$payload") || response=""
 
-    if echo "$response" | grep -q '"content"'; then
+    if printf '%s' "$response" | _completion_ok text; then
         local tokens_used
-        tokens_used=$(echo "$response" | grep -o '"total_tokens":[0-9]*' | cut -d: -f2)
+        tokens_used=$(echo "$response" | grep -o '"total_tokens":[0-9]*' | cut -d: -f2) || tokens_used="unknown"
         record_result "LLM Inference" "pass" "${tokens_used} tokens"
         print_test "LLM Inference" "pass" "${tokens_used} tokens"
     else
         record_result "LLM Inference" "fail" "no content in response"
         print_test "LLM Inference" "fail"
-        return 1
+        return 0
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_tool_calling() {
-    echo ""
-    echo "> Tool Calling M8 Critical"
+    print_section "Tool Calling M8 Critical"
     
     if [[ "$QUICK_MODE" == "true" ]]; then
         record_result "Tool Calling" "skip" "quick mode"
@@ -322,29 +422,28 @@ test_tool_calling() {
         return 0
     fi
     
-    local tools='[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
-    local payload="{\"model\": \"Qwen/Qwen2.5-32B-Instruct-AWQ\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the weather in Tokyo?\"}], \"tools\": $tools, \"tool_choice\": \"auto\", \"max_tokens\": 100}"
+    local model_id
+    model_id=$(_llm_model_id)
+    local tools='[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
+    local payload="{\"model\": \"$model_id\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the weather in Tokyo?\"}], \"tools\": $tools, \"tool_choice\": \"auto\", \"max_tokens\": 100}"
     
     local response
-    response=$(curl -s --max-time 30 \
-        -X POST "$LLM_URL/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>/dev/null)
-    
-    if echo "$response" | grep -q '"tool_calls"'; then
+    response=$(_llm_chat 30 "$payload") || response=""
+
+    if printf '%s' "$response" | _completion_ok tool; then
         record_result "Tool Calling" "pass" "function called"
         print_test "Tool Calling" "pass" "function called"
     else
-        record_result "Tool Calling" "fail" "no tool_calls in response"
+        record_result "Tool Calling" "fail" "no get_weather call in the reply"
         print_test "Tool Calling" "fail" "no tool call"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_whisper() {
-    echo ""
-    echo "> Whisper Speech-to-Text"
+    print_section "Whisper Speech-to-Text"
     
-    test_tcp "Whisper Port" "$WHISPER_HOST" "$WHISPER_PORT"
+    test_tcp "Whisper Port" "$WHISPER_HOST" "$WHISPER_PORT" || log "Whisper port check failed"
     
     local health_url="http://${WHISPER_HOST}:${WHISPER_PORT}/health"
     local response
@@ -363,13 +462,13 @@ test_whisper() {
         test_http "Whisper HTTP" "http://${WHISPER_HOST}:${WHISPER_PORT}/" "200" || whisper_http_exit=$?
         [[ $whisper_http_exit -ne 0 ]] && log "Whisper HTTP check failed (exit $whisper_http_exit)"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_tts() {
-    echo ""
-    echo "> Kokoro TTS Text-to-Speech"
+    print_section "Kokoro TTS Text-to-Speech"
     
-    test_tcp "TTS Port" "$TTS_HOST" "$TTS_PORT"
+    test_tcp "TTS Port" "$TTS_HOST" "$TTS_PORT" || log "TTS port check failed"
     
     local voices_url="http://${TTS_HOST}:${TTS_PORT}/v1/audio/voices"
     local response
@@ -377,7 +476,7 @@ test_tts() {
     
     if echo "$response" | grep -q '"voices"'; then
         local voice_count
-        voice_count=$(echo "$response" | grep -o '"voice_id"' | wc -l)
+        voice_count=$(echo "$response" | grep -o '"voice_id"' | wc -l) || voice_count=0
         record_result "TTS Voices" "pass" "$voice_count voices"
         print_test "TTS Voices" "pass" "$voice_count voices"
     else
@@ -385,13 +484,13 @@ test_tts() {
         test_http "TTS API" "http://${TTS_HOST}:${TTS_PORT}/" "200" || tts_api_exit=$?
         [[ $tts_api_exit -ne 0 ]] && log "TTS API check failed (exit $tts_api_exit)"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_embeddings() {
-    echo ""
-    echo "> Embeddings TEI"
+    print_section "Embeddings TEI"
     
-    test_tcp "Embeddings Port" "$EMBEDDING_HOST" "$EMBEDDING_PORT"
+    test_tcp "Embeddings Port" "$EMBEDDING_HOST" "$EMBEDDING_PORT" || log "Embeddings port check failed"
     
     local health_url="http://${EMBEDDING_HOST}:${EMBEDDING_PORT}/health"
     local response
@@ -406,11 +505,11 @@ test_embeddings() {
         test_http "Embeddings API" "http://${EMBEDDING_HOST}:${EMBEDDING_PORT}/embed" "200" "POST" "$payload" || embeddings_api_exit=$?
         [[ $embeddings_api_exit -ne 0 ]] && log "Embeddings API check failed (exit $embeddings_api_exit)"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_voice_roundtrip() {
-    echo ""
-    echo "> Voice Round-Trip M8 Critical"
+    print_section "Voice Round-Trip M8 Critical"
     
     if [[ "$QUICK_MODE" == "true" ]]; then
         record_result "Voice Round-Trip" "skip" "quick mode"
@@ -428,7 +527,7 @@ test_voice_roundtrip() {
     if curl -s --max-time 5 "http://${TTS_HOST}:${TTS_PORT}/v1/audio/voices" &>/dev/null; then
         tts_ready=true
     fi
-    if curl -s --max-time 5 "$LLM_URL/health" &>/dev/null; then
+    if curl -s --max-time 5 "$LLM_URL$LLM_HEALTH_PATH" &>/dev/null; then
         llm_ready=true
     fi
     
@@ -451,17 +550,16 @@ test_voice_roundtrip() {
     local start_time end_time duration_ms
     start_time=$(_now_ms)
 
-    local llm_payload='{"model": "Qwen/Qwen2.5-32B-Instruct-AWQ", "messages": [{"role": "user", "content": "What is the weather today?"}], "max_tokens": 50}'
+    local model_id
+    model_id=$(_llm_model_id)
+    local llm_payload="{\"model\": \"$model_id\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the weather today?\"}], \"max_tokens\": 50}"
     local llm_response
-    llm_response=$(curl -s --max-time 15 \
-        -X POST "$LLM_URL/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d "$llm_payload" 2>/dev/null)
+    llm_response=$(_llm_chat 15 "$llm_payload") || llm_response=""
     
-    if ! echo "$llm_response" | grep -q '"content"'; then
+    if ! printf '%s' "$llm_response" | _completion_ok text; then
         record_result "Voice Round-Trip" "fail" "LLM step failed"
         print_test "Voice Round-Trip" "fail" "LLM failed"
-        return 1
+        return 0
     fi
     
     local tts_text="The weather today is sunny and 75 degrees."
@@ -470,7 +568,7 @@ test_voice_roundtrip() {
     tts_response=$(curl -s --max-time 15 \
         -X POST "http://${TTS_HOST}:${TTS_PORT}/v1/audio/speech" \
         -H "Content-Type: application/json" \
-        -d "$tts_payload" 2>/dev/null)
+        -d "$tts_payload" 2>/dev/null) || tts_response=""
     
     end_time=$(_now_ms)
     duration_ms=$(( end_time - start_time ))
@@ -482,11 +580,11 @@ test_voice_roundtrip() {
         record_result "Voice Round-Trip" "fail" "TTS step failed"
         print_test "Voice Round-Trip" "fail" "TTS failed"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_privacy_shield() {
-    echo ""
-    echo "> Privacy Shield M3"
+    print_section "Privacy Shield M3"
     
     local shield_url="http://localhost:${PRIVACY_SHIELD_PORT}"
     
@@ -512,16 +610,17 @@ test_privacy_shield() {
         record_result "Privacy Shield Proxy" "fail" "no response"
         print_test "Privacy Shield Proxy" "fail"
     fi
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 test_livekit() {
-    echo ""
-    echo "> LiveKit Voice Infrastructure"
+    print_section "LiveKit Voice Infrastructure"
     
-    test_tcp "LiveKit Port" "$LIVEKIT_HOST" "$LIVEKIT_PORT"
+    test_tcp "LiveKit Port" "$LIVEKIT_HOST" "$LIVEKIT_PORT" || log "LiveKit port check failed"
     livekit_health_exit=0
     test_http "LiveKit Health" "http://${LIVEKIT_HOST}:${LIVEKIT_PORT}/" "200" || livekit_health_exit=$?
     [[ $livekit_health_exit -ne 0 ]] && log "LiveKit health check failed (exit $livekit_health_exit)"
+    return 0  # results are tallied by record_result; never surface a status to set -e
 }
 
 #--------------------------------------------------------------------------
@@ -599,19 +698,20 @@ _print_text_summary() {
         echo "Actionable fixes:"
         
         if [[ "${RESULTS_STATUS[0]:-}" == "fail" ]] && [[ "${RESULTS_NAMES[0]:-}" == *"LLM"* ]]; then
-            echo "  - LLM not responding - check: docker logs ods-llama-server"
+            echo "  - LLM not responding - check: docker logs ods-${LLM_ENGINE}"
         fi
 
         local i
         for i in "${!RESULTS_NAMES[@]}"; do
             if [[ "${RESULTS_STATUS[$i]}" == "fail" ]]; then
                 case "${RESULTS_NAMES[$i]}" in
-                    "Tool Calling") echo "  - Tool calling failed - check llama-server tool support" ;;
+                    "Tool Calling") echo "  - Tool calling failed - check $LLM_ENGINE tool support" ;;
                     "Whisper Port") echo "  - Whisper not running - start: docker compose up whisper" ;;
                     "TTS Port") echo "  - TTS not running - start: docker compose up kokoro-tts" ;;
                 esac
             fi
         done
+        echo "  Need help? Ask on the ODS Discord: https://discord.gg/4ntNp9MAwC"
     fi
     
     echo ""

@@ -29,11 +29,18 @@ error() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
 # Uses awk index() instead of sed to avoid delimiter collisions
 env_set() {
     local key="$1" val="$2"
-    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    # Probe with the same literal-prefix test awk uses below — a regex treats
+    # dots/brackets in the key as wildcards and can silently drop the update.
+    if awk -v k="$key" 'index($0, k "=") == 1 { found = 1 } END { exit !found }' "$ENV_FILE" 2>/dev/null; then
         awk -v k="$key" -v v="$val" '{
             if (index($0, k "=") == 1) print k "=" v; else print
         }' "$ENV_FILE" > "${ENV_FILE}.tmp" && cat "${ENV_FILE}.tmp" > "$ENV_FILE" && rm -f "${ENV_FILE}.tmp"
     else
+        # Appending after a last line that has no newline would join the new
+        # assignment onto that line and corrupt both keys.
+        if [[ -s "$ENV_FILE" && -n "$(tail -c 1 "$ENV_FILE")" ]]; then
+            printf '\n' >> "$ENV_FILE"
+        fi
         echo "${key}=${val}" >> "$ENV_FILE"
     fi
 }
@@ -69,17 +76,53 @@ switch_mode() {
 
     local configured_backend
     configured_backend=$(grep -m1 "^LLM_BACKEND=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"\047\r' || true)
-    if [[ "${configured_backend,,}" == "external" ]]; then
+    configured_backend=$(printf '%s' "$configured_backend" | tr '[:upper:]' '[:lower:]')
+    if [[ "$configured_backend" == "external" ]]; then
         error "External LLM routing is installer-managed. Run './install.sh --no-external-llm' first, then retry the mode switch."
+    fi
+    if [[ "$configured_backend" == "vllm" && "$mode" != "local" ]]; then
+        # Cloud mode has no local model server, and the resolver refuses the
+        # vLLM engine with it; hybrid mode was never proven with vLLM.
+        error "ODS runs this model on the vLLM engine, which works only in local mode. Nothing was changed. To use $mode mode, run the ODS installer again without the vLLM engine. Need help? Ask on the ODS Discord: https://discord.gg/4ntNp9MAwC"
     fi
 
     # Update .env
     env_set "ODS_MODE" "$mode"
 
     if [[ "$mode" == "local" ]]; then
-        env_set "LLM_API_URL" "http://llama-server:8080"
+        local switchboard_mode native_llm llama_off="false"
+        switchboard_mode=$(grep -m1 "^ODS_MODEL_SWITCHBOARD=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"\047\r' || true)
+        native_llm=$(grep -m1 "^NATIVE_LLM_BASE_URL=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"\047\r' || true)
+        # A host-native llama-server install and a vLLM install keep the
+        # in-stack llama-server off; LiteLLM is what reaches the model
+        # (06-directories.sh), through model-router for vLLM.
+        if [[ -n "$native_llm" || "$configured_backend" == "vllm" ]]; then
+            llama_off="true"
+        fi
+        if [[ "$llama_off" == "true" ]]; then
+            env_set "LLM_API_URL" "http://litellm:4000"
+        else
+            env_set "LLM_API_URL" "http://llama-server:8080"
+        fi
+        switchboard_mode=$(printf '%s' "$switchboard_mode" | tr '[:upper:]' '[:lower:]')
+        if [[ "$switchboard_mode" == "enabled" ]]; then
+            env_set "HERMES_LLM_BASE_URL" "http://model-router:9099/v1"
+            env_set "HERMES_LLM_API_KEY" "no-key"
+        elif [[ "$llama_off" == "true" ]]; then
+            env_set "HERMES_LLM_BASE_URL" "http://litellm:4000/v1"
+            local litellm_key
+            litellm_key=$(grep -m1 "^LITELLM_KEY=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"\047\r' || true)
+            [[ -z "$litellm_key" ]] || env_set "HERMES_LLM_API_KEY" "$litellm_key"
+        else
+            env_set "HERMES_LLM_BASE_URL" "http://llama-server:8080/v1"
+            env_set "HERMES_LLM_API_KEY" "sk-ods-hermes-local"
+        fi
     else
         env_set "LLM_API_URL" "http://litellm:4000"
+        env_set "HERMES_LLM_BASE_URL" "http://litellm:4000/v1"
+        local litellm_key
+        litellm_key=$(grep -m1 "^LITELLM_KEY=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"\047\r' || true)
+        [[ -z "$litellm_key" ]] || env_set "HERMES_LLM_API_KEY" "$litellm_key"
         # Auto-enable litellm extension
         local litellm_cf="$SCRIPT_DIR/extensions/services/litellm/compose.yaml"
         local litellm_disabled="${litellm_cf}.disabled"

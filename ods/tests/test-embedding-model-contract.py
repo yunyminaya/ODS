@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import SkipTest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,7 +98,7 @@ def test_installers_write_or_backfill_canonical_model() -> None:
     windows = (ROOT / "installers/windows/lib/env-generator.ps1").read_text(encoding="utf-8")
 
     assert 'EMBEDDING_MODEL_VALUE=$(_env_get EMBEDDING_MODEL "${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}")' in linux
-    assert "EMBEDDING_MODEL=${EMBEDDING_MODEL_VALUE}" in linux
+    assert 'EMBEDDING_MODEL=$(dotenv_value "${EMBEDDING_MODEL_VALUE}")' in linux
     assert 'upsert_env_value "$env_path" "EMBEDDING_MODEL" "${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}"' in macos
     assert "EMBEDDING_MODEL=${embedding_model}" in macos
     assert '$embeddingModel = Get-EnvOrNew "EMBEDDING_MODEL" $embeddingModelDefault' in windows
@@ -115,6 +116,9 @@ def test_installers_write_or_backfill_canonical_model() -> None:
 
 
 def test_windows_env_generator_renders_embedding_contract() -> None:
+    if shutil.which("pwsh") is None:
+        raise SkipTest("PowerShell is unavailable")
+
     env = os.environ.copy()
     env.update(EMBEDDING_ENV)
     env["ODS_TEST_ROOT"] = str(ROOT)
@@ -188,6 +192,9 @@ New-ODSEnv -InstallDir $env:ODS_TEST_DIR -TierConfig $tier -Tier "3" -GpuBackend
 
 
 def test_macos_env_generator_renders_embedding_contract() -> None:
+    if os.name == "nt" or shutil.which("bash") is None:
+        raise SkipTest("POSIX bash is unavailable")
+
     env = os.environ.copy()
     env.update(EMBEDDING_ENV)
 
@@ -269,18 +276,16 @@ def main() -> int:
         test_bundled_rag_inherits_canonical_model,
         test_external_rag_override_does_not_change_bundled_tei,
         test_installers_write_or_backfill_canonical_model,
+        test_windows_env_generator_renders_embedding_contract,
+        test_macos_env_generator_renders_embedding_contract,
     ]
-    if shutil.which("pwsh"):
-        tests.append(test_windows_env_generator_renders_embedding_contract)
-    else:
-        print("[SKIP] test_windows_env_generator_renders_embedding_contract (pwsh unavailable)")
-    if os.name != "nt" and shutil.which("bash"):
-        tests.append(test_macos_env_generator_renders_embedding_contract)
-    else:
-        print("[SKIP] test_macos_env_generator_renders_embedding_contract (POSIX bash unavailable)")
     for test in tests:
-        test()
-        print(f"[PASS] {test.__name__}")
+        try:
+            test()
+        except SkipTest as exc:
+            print(f"[SKIP] {test.__name__} ({exc})")
+        else:
+            print(f"[PASS] {test.__name__}")
     return 0
 
 

@@ -67,6 +67,23 @@ describe('useDownloadProgress', () => {
     expect(result.current.progress.percent).toBe(100)
   })
 
+  test('polls existing-artifact verification through completion', async () => {
+    fetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ status: 'verifying', model: 'existing.gguf', bytesTotal: 1104 }),
+    })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.isDownloading).toBe(true))
+    expect(result.current.progress.status).toBe('verifying')
+    fetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ status: 'complete', model: 'existing.gguf', updatedAt: '2026-10-04T12:00:00Z' }),
+    })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.isDownloading).toBe(false)
+    expect(result.current.progress).toBeNull()
+    expect(result.current.completedDownload.model).toBe('existing.gguf')
+  })
   test('clears progress when status is complete', async () => {
     fetch.mockResolvedValue({
       ok: true,
@@ -168,6 +185,51 @@ describe('useDownloadProgress', () => {
     })
   })
 
+  test('keeps the last progress snapshot and exposes an HTTP polling error', async () => {
+    fetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          status: 'downloading',
+          model: 'test-model',
+          bytesDownloaded: 5,
+          bytesTotal: 10,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: () => Promise.resolve({ detail: 'Download worker is restarting.' }),
+      })
+
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.progress?.percent).toBe(50))
+
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    expect(result.current.statusError).toBe('Download worker is restarting.')
+    expect(result.current.progress).toMatchObject({
+      model: 'test-model',
+      status: 'downloading',
+      percent: 50,
+    })
+  })
+
+  test('surfaces a transport failure from the initial status request', async () => {
+    fetch.mockRejectedValue(new Error('connection refused'))
+
+    const { result } = renderHook(() => useDownloadProgress())
+
+    await waitFor(() => {
+      expect(result.current.statusError).toBe(
+        'Download status unavailable: connection refused',
+      )
+    })
+    expect(result.current.progress).toBeNull()
+  })
+
   test('cancelDownload posts to the cancel endpoint and refreshes terminal status', async () => {
     let cancelled = false
     fetch.mockImplementation((url, options) => {
@@ -195,7 +257,9 @@ describe('useDownloadProgress', () => {
       await result.current.cancelDownload()
     })
 
-    expect(fetch).toHaveBeenCalledWith('/api/models/download/cancel', { method: 'POST' })
+    expect(fetch).toHaveBeenCalledWith('/api/models/download/cancel', {
+      method: 'POST', signal: expect.any(AbortSignal),
+    })
     expect(result.current.isDownloading).toBe(false)
     expect(result.current.progress).toMatchObject({
       status: 'cancelled',
@@ -247,6 +311,127 @@ describe('useDownloadProgress', () => {
     })
   })
 
+  test.each(['downloading', 'verifying'])('shows cancellation from the API idle envelope after %s, dismisses it, and permits retry', async (activeStatus) => {
+    const model = 'Qwen3.5-9B-Q4_K_M.gguf'
+    let snapshot = { status: activeStatus, model, bytesDownloaded: 0, bytesTotal: 5680522464,
+      updatedAt: '2026-10-08T03:47:47.000Z' }
+    const terminal = { status: 'cancelled', model, updatedAt: '2026-10-08T03:47:48.365Z',
+      error: 'Download cancelled by user' }
+    fetch.mockImplementation((_url, options) => {
+      if (options?.method === 'POST') {
+        snapshot = { status: 'idle', active: false, isDownloading: false, lastTerminalStatus: terminal }
+        return Promise.resolve({ ok: true })
+      }
+      return Promise.resolve({ ok: true, json: async () => snapshot })
+    })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.progress?.status).toBe(activeStatus))
+    await act(async () => { await result.current.cancelDownload() })
+    expect(result.current.isDownloading).toBe(false)
+    expect(result.current.completedDownload).toBeNull()
+    expect(result.current.progress).toMatchObject({ status: 'cancelled', model, error: terminal.error })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress?.status).toBe('cancelled')
+    act(() => result.current.clearTerminal())
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toBeNull()
+    snapshot = { status: 'verifying', model, updatedAt: '2026-10-08T03:48:00.000Z' }
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress?.status).toBe('verifying')
+    snapshot = { status: 'complete', model, updatedAt: '2026-10-08T03:48:03.000Z' }
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toBeNull()
+    expect(result.current.completedDownload).toMatchObject({ status: 'complete', model })
+    snapshot = { status: 'idle', lastTerminalStatus: terminal }
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toBeNull()
+  })
+
+  test('does not show a historical cancellation on initial mount', async () => {
+    fetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'idle', active: false,
+      lastTerminalStatus: { status: 'cancelled', model: 'old.gguf', updatedAt: '2026-01-01T00:00:00Z' } }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.isDownloading).toBe(false)
+    expect(result.current.progress).toBeNull()
+  })
+
+  test.each([
+    { status: 'cancelled', model: 'other.gguf', updatedAt: '2026-10-08T04:00:02Z' },
+    { status: 'cancelled', model: 'current.gguf', updatedAt: '2026-10-08T03:59:59Z' },
+    { status: 'cancelled', model: 'current.gguf', updatedAt: 'invalid-date' },
+    { status: 'failed', model: 'current.gguf', updatedAt: '2026-10-08T04:00:02Z' },
+    { status: 'complete', model: 'current.gguf', updatedAt: '2026-10-08T04:00:02Z' },
+  ])('does not assign unrelated or stale idle terminal data to the current transfer: %j', async (lastTerminalStatus) => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'verifying',
+      model: 'current.gguf', updatedAt: '2026-10-08T04:00:00Z' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.progress?.status).toBe('verifying'))
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle', lastTerminalStatus }) })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toBeNull()
+    expect(result.current.isDownloading).toBe(false)
+    expect(result.current.completedDownload).toBeNull()
+  })
+
+  test('normalizes the status-file canceled spelling and uses a safe fallback message', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'downloading', model: 'file.gguf' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.isDownloading).toBe(true))
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle', lastTerminalStatus: {
+      status: 'canceled', model: 'file.gguf', error: {}, message: ['invalid'],
+    } }) })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toMatchObject({ status: 'cancelled', model: 'file.gguf', error: 'Download cancelled' })
+  })
+
+  test.each([
+    'split-00001-of-00002.gguf (2 parts)',
+    'split-00002-of-00002.gguf (part 2/2)',
+    'split-00002-of-00002.gguf',
+  ])('matches cancellation of the primary artifact to active split progress %s', async (model) => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'verifying', model,
+      updatedAt: '2026-10-08T04:00:00Z' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.isDownloading).toBe(true))
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle', lastTerminalStatus: {
+      status: 'cancelled', model: 'split-00001-of-00002.gguf', updatedAt: '2026-10-08T04:00:00Z',
+      message: 'Stopped by request',
+    } }) })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toMatchObject({ status: 'cancelled', model: 'split-00001-of-00002.gguf',
+      error: 'Stopped by request' })
+  })
+
+  test('does not associate a different split set with the observed download', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'downloading',
+      model: 'split-00002-of-00003.gguf (part 2/3)' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.isDownloading).toBe(true))
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle', lastTerminalStatus: {
+      status: 'cancelled', model: 'split-00001-of-00002.gguf',
+    } }) })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.progress).toBeNull()
+  })
+
+  test.each(['model_download', 'model_activation'])('uses a canonical artifact target only for %s', async (activeOperation) => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'verifying',
+      model: 'projector.gguf', activeOperation, activeTarget: 'primary.gguf', lifecycleActive: true,
+      updatedAt: '2026-10-08T04:00:00Z' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.isDownloading).toBe(true))
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle', lastTerminalStatus: {
+      status: 'cancelled', model: 'primary.gguf', updatedAt: '2026-10-08T04:00:01Z',
+    } }) })
+    await act(async () => { await result.current.refresh() })
+    if (activeOperation === 'model_download') {
+      expect(result.current.progress).toMatchObject({ status: 'cancelled', model: 'primary.gguf' })
+    } else {
+      expect(result.current.progress).toBeNull()
+    }
+  })
+
   test('pauses idle polling while the tab is hidden and refreshes on visibilitychange', async () => {
     fetch.mockResolvedValue({
       ok: true,
@@ -290,6 +475,20 @@ describe('useDownloadProgress', () => {
     expect(result.current.formatBytes(512)).toBe('512 B')
     expect(result.current.formatBytes(0)).toBe('0 B')
     expect(result.current.formatBytes(null)).toBe('0 B')
+  })
+
+  test('retains transfer progress after an invalid JSON receipt and recovers on a fresh poll', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'downloading', model: 'current', bytesDownloaded: 1, bytesTotal: 2 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => { throw new SyntaxError('Invalid progress JSON') } })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'idle' }) })
+    const { result } = renderHook(() => useDownloadProgress())
+    await waitFor(() => expect(result.current.progress?.percent).toBe(50))
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.statusError).toBe('Download status unavailable: Invalid progress JSON')
+    expect(result.current.progress).toMatchObject({ model: 'current', percent: 50 })
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.statusError).toBeNull()
+    expect(result.current.progress).toBeNull()
   })
 
   test('formatEta formats minutes and seconds', () => {

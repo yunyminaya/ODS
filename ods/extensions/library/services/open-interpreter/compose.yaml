@@ -10,13 +10,16 @@ services:
       - no-new-privileges:true
     environment:
       - PORT=8080
-      - LLM_API_URL=${LLM_API_URL:-http://llama-server:8000}
+      # ODS's llama-server listens on 8080 inside the shared Docker network.
+      # Keep the default aligned with the platform endpoint; operators can
+      # still override it for an external or alternate inference runtime.
+      - LLM_API_URL=${LLM_API_URL:-http://llama-server:8080}
       - OPEN_INTERPRETER_API_KEY=${OPEN_INTERPRETER_API_KEY:?OPEN_INTERPRETER_API_KEY must be set}
       - OPEN_INTERPRETER_AUTO_RUN=${OPEN_INTERPRETER_AUTO_RUN:-false}
     volumes:
       - ./data/open-interpreter:/app/data:rw
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${OPEN_INTERPRETER_PORT:-7805}:8080"
+      - "127.0.0.1:${OPEN_INTERPRETER_PORT:-7805}:8080"
     working_dir: /app
     command: ["python", "server.py"]
     healthcheck:

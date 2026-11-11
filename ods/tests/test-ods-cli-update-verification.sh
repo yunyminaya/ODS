@@ -145,7 +145,7 @@ chmod +x "$bin_dir/docker" "$bin_dir/sleep"
 : > "$docker_log"
 
 PATH="$bin_dir:$PATH" \
-ODS_HOME="$install_dir" \
+INSTALL_DIR="$install_dir" ODS_HOME="$install_dir" \
 NO_COLOR=1 \
 TEST_DOCKER_LOG="$docker_log" \
 TEST_DOCKER_PULL_COUNT="$pull_count_file" \
@@ -198,6 +198,28 @@ grep -q -- 'config --services' "$docker_log" || {
 grep -q -- 'ps --services --status running' "$docker_log" || {
     cat "$docker_log" >&2
     printf '[FAIL] update did not verify running compose services\n' >&2
+    exit 1
+}
+
+token_before="$(awk -F= '/^HERMES_DASHBOARD_SESSION_TOKEN=/{print $2}' "$install_dir/.env")"
+[[ "$token_before" =~ ^[0-9a-f]{64}$ ]] || {
+    cat "$install_dir/.env" >&2
+    printf '[FAIL] update did not backfill a valid Hermes dashboard session token\n' >&2
+    exit 1
+}
+
+PATH="$bin_dir:$PATH" \
+INSTALL_DIR="$install_dir" ODS_HOME="$install_dir" \
+NO_COLOR=1 \
+TEST_DOCKER_LOG="$docker_log" \
+    "$BASH" "$ods_cli" start dashboard > "$tmp_dir/start-after-update.out" 2>&1 || {
+        cat "$tmp_dir/start-after-update.out" >&2
+        exit 1
+    }
+
+token_after="$(awk -F= '/^HERMES_DASHBOARD_SESSION_TOKEN=/{print $2}' "$install_dir/.env")"
+[[ "$token_after" == "$token_before" ]] || {
+    printf '[FAIL] later Compose lifecycle command rotated the Hermes dashboard session token\n' >&2
     exit 1
 }
 

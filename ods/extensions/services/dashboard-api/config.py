@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 import yaml
 
+from env_values import parse_env_value
+
 logger = logging.getLogger(__name__)
 
 # --- Paths ---
@@ -25,8 +27,11 @@ EXTENSIONS_DIR = Path(
 
 DEFAULT_SERVICE_HOST = os.environ.get("SERVICE_HOST", "host.docker.internal")
 GPU_BACKEND = os.environ.get("GPU_BACKEND", "nvidia")
-ODS_MODES = frozenset({"local", "cloud", "hybrid", "lemonade"})
-LOCAL_MODEL_MODES = frozenset({"local", "hybrid", "lemonade"})
+ODS_MODES = frozenset({"local", "cloud", "hybrid"})
+LOCAL_MODEL_MODES = frozenset({"local", "hybrid"})
+# Readable for one release: managed AMD installs written before round F name
+# the retired Lemonade mode until the installer migrates their .env.
+LEGACY_ODS_MODES = {"lemonade": "local"}
 LLM_CONTRACT_ROUTES = frozenset({"gateway", "direct"})
 LLM_CONTRACT_PINNING = frozenset({"none", "dynamic"})
 
@@ -34,7 +39,14 @@ LLM_CONTRACT_PINNING = frozenset({"none", "dynamic"})
 def normalize_ods_mode(value: Any) -> str:
     """Return a supported ODS mode or ``unknown`` for missing/invalid input."""
     mode = str(value or "").strip().lower()
+    mode = LEGACY_ODS_MODES.get(mode, mode)
     return mode if mode in ODS_MODES else "unknown"
+
+
+def normalize_llm_backend(value: Any) -> str:
+    """Every managed runtime is llama-server; ``lemonade`` reads as it for one release."""
+    backend = str(value or "").strip().lower()
+    return "llama-server" if backend == "lemonade" else backend
 
 
 def normalize_llm_contract(value: Any) -> dict[str, Any] | None:
@@ -89,16 +101,65 @@ def normalize_llm_contract(value: Any) -> dict[str, Any] | None:
 ODS_MODE_EFFECTIVE = normalize_ods_mode(os.environ.get("ODS_MODE"))
 
 
+_ENV_FILE_PERMISSION_ERROR: str | None = None
+_ENV_FILE_PERMISSION_ERROR_LOGGED: bool = False
+
+
+def get_env_file_read_error() -> str | None:
+    """Return the last permission error encountered when reading .env, if any."""
+    return _ENV_FILE_PERMISSION_ERROR
+
+
+def _reset_env_permission_state() -> None:
+    global _ENV_FILE_PERMISSION_ERROR, _ENV_FILE_PERMISSION_ERROR_LOGGED
+    _ENV_FILE_PERMISSION_ERROR = None
+    _ENV_FILE_PERMISSION_ERROR_LOGGED = False
+
+
+def _handle_env_permission_error(
+    env_path: Path, key_or_keys: Any, exc: PermissionError
+) -> None:
+    global _ENV_FILE_PERMISSION_ERROR, _ENV_FILE_PERMISSION_ERROR_LOGGED
+    _ENV_FILE_PERMISSION_ERROR = (
+        f"Permission denied reading {env_path}; live settings may be unavailable"
+    )
+    if not _ENV_FILE_PERMISSION_ERROR_LOGGED:
+        logger.warning(
+            "Permission denied reading environment file %s for %s: %s",
+            env_path,
+            key_or_keys,
+            exc,
+        )
+        _ENV_FILE_PERMISSION_ERROR_LOGGED = True
+
+
+def _handle_env_read_success(env_path: Path) -> None:
+    global _ENV_FILE_PERMISSION_ERROR, _ENV_FILE_PERMISSION_ERROR_LOGGED
+    if _ENV_FILE_PERMISSION_ERROR_LOGGED or _ENV_FILE_PERMISSION_ERROR is not None:
+        logger.info(
+            "Successfully read environment file %s; cleared previous permission error",
+            env_path,
+        )
+    _ENV_FILE_PERMISSION_ERROR = None
+    _ENV_FILE_PERMISSION_ERROR_LOGGED = False
+
+
 def _find_env_file_value(key: str) -> tuple[bool, str]:
     """Return the last persisted value and distinguish missing from empty."""
     env_path = Path(INSTALL_DIR) / ".env"
     found = False
     value = ""
     try:
-        for line in env_path.read_text(encoding="utf-8").splitlines():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        _handle_env_read_success(env_path)
+        for line in lines:
             if line.startswith(f"{key}="):
                 found = True
-                value = line.split("=", 1)[1].strip().strip("\"'")
+                value = parse_env_value(line.split("=", 1)[1])
+    except PermissionError as exc:
+        _handle_env_permission_error(env_path, f"key {key}", exc)
+    except FileNotFoundError:
+        _reset_env_permission_state()
     except (OSError, UnicodeError):
         pass
     return found, value
@@ -117,25 +178,78 @@ def read_live_env_value(key: str, default: str = "") -> str:
     return os.environ.get(key, "") or default
 
 
+def read_live_env_values(keys: tuple[str, ...]) -> dict[str, str]:
+    """Read one persisted snapshot so a route and its credential cannot diverge."""
+    values = {key: os.environ.get(key, "") for key in keys}
+    env_path = Path(INSTALL_DIR) / ".env"
+    try:
+        text = env_path.read_text(encoding="utf-8")
+        _handle_env_read_success(env_path)
+    except PermissionError as exc:
+        _handle_env_permission_error(env_path, f"keys {keys}", exc)
+        return values
+    except FileNotFoundError:
+        _reset_env_permission_state()
+        return values
+    except (OSError, UnicodeError):
+        return values
+    for line in text.splitlines():
+        key, separator, raw = line.partition("=")
+        if separator and key in values:
+            values[key] = parse_env_value(raw)
+    return values
+
+
 def _apply_host_native_llm_service_override(
     services: dict[str, dict[str, Any]],
     gpu_backend: str,
     environment: Mapping[str, str] | None = None,
 ) -> None:
-    """Route Windows AMD dashboard probes to the host-native LLM endpoint."""
+    """Route probes to native inference rather than the container's default port."""
     env = environment if environment is not None else os.environ
-    if str(gpu_backend).lower() != "amd":
+    if str(gpu_backend).lower() == "apple":
+        service = services.get("llama-server")
+        if not service or str(env.get("LLM_BACKEND", "")).lower() == "external":
+            return
+        # The macOS overlay supplies the Docker-reachable native endpoint.
+        # Do not substitute a general model-router/LiteLLM URL here.
+        configured_url = env.get("OLLAMA_URL", "")
+        if not configured_url:
+            return
+        try:
+            parsed = urlparse(configured_url)
+            port = parsed.port if parsed.port is not None else 80
+            if (parsed.scheme != "http" or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.query or parsed.fragment or not 1 <= port <= 65535):
+                return
+        except ValueError:
+            return
+        service["host"] = parsed.hostname
+        service["port"] = port
         return
-    if str(env.get("AMD_INFERENCE_LOCATION", "")).lower() != "host":
+    # A llama-server.exe on the Windows host: the legacy native flow (AMD), or
+    # the WSL Portal (whose WSL side may see no GPU) through host.docker.internal.
+    if str(gpu_backend).lower() not in {"amd", "cpu"}:
+        return
+    if str(env.get("AMD_INFERENCE_LOCATION", "")).strip().lower() != "host":
+        return
+    if str(env.get("LLM_BACKEND", "")).strip().lower() == "external":
         return
     service = services.get("llama-server")
     if not service:
         return
 
+    # The generic LLM URL can be LiteLLM. Its model aliases do not identify
+    # the served model; probe the server's own container-visible origin.
+    # LEMONADE_CONTAINER_BASE_URL is that origin's one-release legacy name.
+    generic_url = str(env.get("LLM_API_URL") or "")
     configured_url = (
-        env.get("OLLAMA_URL")
+        env.get("NATIVE_LLM_CONTAINER_BASE_URL")
+        or env.get("LEMONADE_CONTAINER_BASE_URL")
+        or env.get("OLLAMA_URL")
         or env.get("LLM_URL")
-        or env.get("LLM_API_URL")
+        or (generic_url if "litellm" not in generic_url.lower() else "")
         or f"http://host.docker.internal:{env.get('AMD_INFERENCE_PORT', '8080')}"
     )
     parsed = urlparse(str(configured_url).strip())
@@ -150,7 +264,9 @@ def _apply_host_native_llm_service_override(
 
     service["host"] = parsed.hostname
     service["port"] = port
-    logger.info("Host-native AMD inference detected; routing LLM probes to %s:%d", parsed.hostname, port)
+    # The in-stack container is off on this route; its sidebar link (OLLAMA_PORT, 11434) opened an error page.
+    service["external_link"] = False
+    logger.info("Host-native llama-server detected; routing LLM probes to %s:%d", parsed.hostname, port)
 
 
 def _apply_external_llm_service_override(
@@ -187,6 +303,10 @@ def _apply_external_llm_service_override(
     }
     service["host"] = parsed.hostname
     service["port"] = port
+    # The health probe reaches the API with its own scheme and Host header;
+    # an HTTPS API answered the old http://host:443 probe with an error.
+    service["scheme"] = parsed.scheme
+    service["external_api"] = True
     service["health"] = health_paths.get(provider, "/v1/models")
     service["name"] = {
         "ollama": "Ollama (External LLM)",
@@ -199,6 +319,40 @@ def _apply_external_llm_service_override(
         port,
         service["health"],
     )
+
+
+VLLM_SERVICE_HOST = "vllm-server"
+VLLM_SERVICE_PORT = 8000
+VLLM_CONTAINER = "ods-vllm-server"
+
+
+def _apply_vllm_service_override(
+    services: dict[str, dict[str, Any]],
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Route the LLM row's probes to the vLLM engine (LLM_BACKEND=vllm).
+
+    docker-compose.vllm.yml profiles the in-stack llama-server out and runs
+    vllm-server on the ODS network: /health answers 200 with an empty body once
+    the model is loaded, /v1/models lists the served id. As for a host-native
+    or external route, the row keeps the llama-server id that chat, readiness
+    and features key on; its container is ods-vllm-server, which the host
+    agent's Docker health snapshot reports (a cold start reads as starting),
+    and it publishes no host port to link to.
+    """
+    env = environment if environment is not None else os.environ
+    if str(env.get("LLM_BACKEND", "")).strip().lower() != "vllm":
+        return
+    service = services.get("llama-server")
+    if not service:
+        return
+    service["host"] = VLLM_SERVICE_HOST
+    service["port"] = VLLM_SERVICE_PORT
+    service["health"] = "/health"
+    service["container_name"] = VLLM_CONTAINER
+    service["name"] = "vLLM (LLM Inference)"
+    service["external_link"] = False
+    logger.info("vLLM engine selected; routing LLM probes to %s:%d", VLLM_SERVICE_HOST, VLLM_SERVICE_PORT)
 
 
 def _read_env_value(key: str) -> str:
@@ -279,14 +433,112 @@ def _resolve_public_service_url(
 
 # --- Manifest Loading ---
 
+MAX_MANIFEST_DEPTH = 32
+MAX_MANIFEST_NODES = 10_000
+MAX_MANIFEST_BYTES = 1_048_576
+
+
+class _ManifestLoader(yaml.SafeLoader):
+    """Bound composition before recursive parsing or YAML merge expansion."""
+
+    def __init__(self, stream):
+        super().__init__(stream)
+        self.manifest_depth = -1
+        self.manifest_nodes = 0
+
+    def compose_node(self, parent, index):
+        self.manifest_depth += 1
+        self.manifest_nodes += 1
+        try:
+            if self.manifest_depth > MAX_MANIFEST_DEPTH:
+                raise ValueError(f"Manifest nesting exceeds {MAX_MANIFEST_DEPTH} levels")
+            if self.manifest_nodes > MAX_MANIFEST_NODES:
+                raise ValueError("Manifest structure exceeds node limit")
+            return super().compose_node(parent, index)
+        finally:
+            self.manifest_depth -= 1
+
+
+def _validate_yaml_graph(root) -> None:
+    # Memoize subtree size and height, counting each alias occurrence toward
+    # expanded size without actually expanding it. Validate before constructors
+    # flatten merge keys, which can otherwise allocate exponentially many pairs.
+    memo = {}
+    active = set()
+
+    def visit(node):
+        marker = id(node)
+        if marker in active:
+            raise ValueError("Manifest contains a cyclic structure")
+        if marker in memo:
+            return memo[marker]
+        active.add(marker)
+        if isinstance(node, yaml.MappingNode):
+            children = (child for pair in node.value for child in pair)
+        elif isinstance(node, yaml.SequenceNode):
+            children = iter(node.value)
+        else:
+            children = iter(())
+        size, height = 1, 0
+        for child in children:
+            child_size, child_height = visit(child)
+            size += child_size
+            height = max(height, child_height + 1)
+            if size > MAX_MANIFEST_NODES:
+                raise ValueError("Manifest alias expansion exceeds node limit")
+            if height > MAX_MANIFEST_DEPTH:
+                raise ValueError(f"Manifest nesting exceeds {MAX_MANIFEST_DEPTH} levels")
+        active.remove(marker)
+        memo[marker] = size, height
+        return size, height
+
+    visit(root)
+
+
+def _validate_manifest_depth(value: Any, *, depth: int = 0, active: set[int] | None = None) -> None:
+    """Reject pathological nested or cyclic YAML/JSON structures early."""
+    if depth > MAX_MANIFEST_DEPTH:
+        raise ValueError(f"Manifest nesting exceeds {MAX_MANIFEST_DEPTH} levels")
+    if not isinstance(value, (dict, list)):
+        return
+    active = active if active is not None else set()
+    marker = id(value)
+    if marker in active:
+        raise ValueError("Manifest contains a cyclic structure")
+    active.add(marker)
+    try:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                _validate_manifest_depth(key, depth=depth + 1, active=active)
+                _validate_manifest_depth(item, depth=depth + 1, active=active)
+        else:
+            for item in value:
+                _validate_manifest_depth(item, depth=depth + 1, active=active)
+    finally:
+        active.remove(marker)
+
 
 def _read_manifest_file(path: Path) -> dict[str, Any]:
     """Load a JSON or YAML extension manifest file."""
-    text = path.read_text()
-    if path.suffix.lower() == ".json":
-        data = json.loads(text)
-    else:
-        data = yaml.safe_load(text)
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_MANIFEST_BYTES + 1)
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ValueError("Manifest exceeds size limit")
+    text = raw.decode("utf-8")
+    try:
+        if path.suffix.lower() == ".json":
+            data = json.loads(text)
+        else:
+            loader = _ManifestLoader(text)
+            try:
+                node = loader.get_single_node()
+                _validate_yaml_graph(node)
+                data = loader.construct_document(node) if node is not None else None
+            finally:
+                loader.dispose()
+    except RecursionError as exc:
+        raise ValueError(f"Manifest nesting exceeds {MAX_MANIFEST_DEPTH} levels") from exc
+    _validate_manifest_depth(data)
     if not isinstance(data, dict):
         raise ValueError("Manifest root must be an object")
     return data
@@ -294,6 +546,7 @@ def _read_manifest_file(path: Path) -> dict[str, Any]:
 
 def load_extension_manifests(
     manifest_dir: Path, gpu_backend: str,
+    *, only_service_ids: frozenset[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
     """Load service and feature definitions from extension manifests.
 
@@ -313,6 +566,8 @@ def load_extension_manifests(
 
     manifest_files: list[Path] = []
     for item in sorted(manifest_dir.iterdir()):
+        if only_service_ids is not None and item.name not in only_service_ids:
+            continue
         if item.is_dir():
             for name in ("manifest.yaml", "manifest.yml", "manifest.json"):
                 candidate = item / name
@@ -389,6 +644,7 @@ def load_extension_manifests(
                     "depends_on": service.get("depends_on", []),
                     "category": service.get("category", "optional"),
                     "host_network": bool(service.get("host_network", False)),
+                    "socket_only": bool(service.get("socket_only", False)),
                     "setup_hook": service.get("setup_hook", ""),
                     "hooks": service.get("hooks", {}),
                     "gpu_backends": service.get("gpu_backends", []),
@@ -430,14 +686,10 @@ SERVICES = MANIFEST_SERVICES
 if not SERVICES:
     logger.error("No services loaded from manifests in %s — dashboard will have no services", EXTENSIONS_DIR)
 
-# Lemonade serves at /api/v1 instead of llama.cpp's /v1. Override the
-# health path so the dashboard poll loop hits the correct endpoint.
-LLM_BACKEND = os.environ.get("LLM_BACKEND", "")
+LLM_BACKEND = normalize_llm_backend(os.environ.get("LLM_BACKEND", ""))
 _apply_host_native_llm_service_override(SERVICES, GPU_BACKEND)
 _apply_external_llm_service_override(SERVICES)
-if LLM_BACKEND == "lemonade" and "llama-server" in SERVICES:
-    SERVICES["llama-server"]["health"] = "/api/v1/health"
-    logger.info("Lemonade backend detected — overriding llama-server health to /api/v1/health")
+_apply_vllm_service_override(SERVICES)
 
 # --- Features ---
 
@@ -454,7 +706,13 @@ def resolve_workflow_dir() -> Path:
     if env_dir:
         return Path(env_dir)
     canonical = Path(INSTALL_DIR) / "config" / "n8n"
-    if canonical.exists():
+    try:
+        if canonical.exists():
+            return canonical
+    except PermissionError:
+        # Optional host configuration may belong to a different UID. Keep
+        # the canonical path so the workflow endpoint can report unavailable
+        # access, rather than crashing startup or selecting an empty fallback.
         return canonical
     return Path(INSTALL_DIR) / "workflows"
 
@@ -470,7 +728,6 @@ def _default_n8n_url() -> str:
     return f"http://{host}:{port}"
 
 N8N_URL = os.environ.get("N8N_URL", _default_n8n_url())
-N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
 
 # --- Setup / Personas ---
 
@@ -499,7 +756,6 @@ PERSONAS = {
 SIDEBAR_ICONS = {
     "open-webui": "MessageSquare",
     "n8n": "Network",
-    "openclaw": "Bot",
     "hermes": "Bot",
     "hermes-proxy": "Shield",
     "opencode": "Code",
@@ -536,7 +792,7 @@ def _load_core_service_ids() -> frozenset:
     # Fallback to hardcoded list
     return frozenset({
         "dashboard-api", "dashboard", "llama-server", "model-router", "open-webui",
-        "litellm", "langfuse", "hermes", "hermes-proxy", "n8n", "openclaw", "opencode",
+        "litellm", "langfuse", "hermes", "hermes-proxy", "n8n", "opencode",
         "perplexica", "searxng", "qdrant", "remote-provider-egress",
         "remote-provider-ssh-tunnel", "tts", "whisper",
         "embeddings", "token-spy", "comfyui", "ape", "privacy-shield",
@@ -552,6 +808,20 @@ ALWAYS_ON_SERVICES: frozenset = frozenset({
     "remote-provider-ssh-tunnel", "open-webui", "dashboard", "dashboard-api",
 })
 
+# Built-ins qualified for Dashboard Library Add/Disable. The live health poll
+# must refresh this same set after a fragment changes without an API restart.
+# A lean install adds the original stack back from here, one click each; every
+# entry was enabled live from a lean fleet install and proved working. Token
+# Spy and APE build app source locally and wait for a reviewed source recipe.
+LIBRARY_MANAGEABLE_BUILTINS: frozenset = frozenset({
+    "n8n", "perplexica", "searxng",
+    "hermes", "hermes-proxy", "qdrant", "embeddings", "tts", "whisper",
+    "comfyui", "langfuse",
+})
+
+
+_CATALOG_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
 
 def load_extension_catalog() -> list[dict]:
     """Load the static extensions catalog JSON. Returns empty list on failure."""
@@ -560,10 +830,19 @@ def load_extension_catalog() -> list[dict]:
         return []
     try:
         data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
-        return data.get("extensions", [])
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Failed to load extensions catalog: %s", e)
         return []
+    # Catalog ids name folders (progress files, library receipts, installed
+    # trees), so an entry whose id is not a plain extension id is dropped.
+    entries = []
+    for entry in data.get("extensions", []):
+        identifier = entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(identifier, str) and _CATALOG_ID_RE.fullmatch(identifier):
+            entries.append(entry)
+        else:
+            logger.warning("Ignoring extensions catalog entry with invalid id %r", identifier)
+    return entries
 
 
 EXTENSION_CATALOG = load_extension_catalog()
@@ -579,6 +858,15 @@ def _running_inside_container() -> bool:
     except OSError:
         return False
     return any(marker in cgroup for marker in ("docker", "containerd", "kubepods", "podman"))
+
+
+def _running_under_wsl(release_path: str = "/proc/sys/kernel/osrelease") -> bool:
+    """Return whether the dashboard container shares a WSL Linux kernel."""
+    try:
+        release = Path(release_path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "microsoft" in release.casefold()
 
 
 def _detect_container_default_gateway(route_path: str = "/proc/net/route") -> str:
@@ -625,9 +913,10 @@ def _resolve_agent_host() -> str:
 
     Priority:
       1. ODS_AGENT_HOST env (explicit operator override)
-      2. The container's own default-gateway IP (works regardless of which
-         Docker network the container is on)
-      3. host.docker.internal (legacy fallback — broken on custom networks
+      2. host.docker.internal under WSL/Docker Desktop, whose compose gateway
+         belongs to Docker Desktop and is not an address the WSL host can bind
+      3. The container's own default-gateway IP on native Linux
+      4. host.docker.internal (legacy fallback — broken on custom networks
          under default Docker iptables, but kept so explicit operator setups
          relying on it don't silently change)
     """
@@ -635,6 +924,9 @@ def _resolve_agent_host() -> str:
     if explicit:
         return explicit
     if _running_inside_container():
+        if _running_under_wsl():
+            logger.info("Resolved ODS_AGENT_HOST=host.docker.internal for WSL")
+            return "host.docker.internal"
         gw = _detect_container_default_gateway()
         if gw:
             logger.info("Resolved ODS_AGENT_HOST=%s via /proc/net/route", gw)

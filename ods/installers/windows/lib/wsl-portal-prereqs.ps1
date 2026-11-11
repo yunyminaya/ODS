@@ -1,0 +1,401 @@
+# Windows-side prerequisites for the Portal setup: host capacity, Docker
+# Desktop, Docker's WSL integration, the first Ubuntu account and resuming
+# after a restart. Each step asks first, changes only its own prerequisite and
+# stops with instructions when it cannot finish. ODS itself is still installed
+# only by install-core.sh inside Ubuntu.
+# Requires wsl-portal-spark.ps1 (Test-ODSSparkWindowsArm64) in scope;
+# wsl-portal-setup.ps1 loads both.
+
+$script:ODSPortalMinimumFreeGB = 40
+# Docker Desktop's first engine start can take several minutes.
+$script:ODSPortalDockerWaitSeconds = 600
+# Docker Desktop attaches its WSL integration a few seconds after a distro
+# starts, so a fresh Ubuntu may not see docker yet.
+$script:ODSPortalIntegrationWaitSeconds = 60
+$script:ODSPortalResumeValue = 'ODSPortalSetup'
+
+# ---------------------------------------------------------------- pure helpers
+
+function Test-ODSPortalLinuxUsername([string]$Name) {
+    # Debian adduser's default NAME_REGEX, minus names that would shadow
+    # system accounts the installer relies on.
+    return ($Name -cmatch '^[a-z][a-z0-9_-]{0,31}$') -and ($Name -notin @('root', 'docker', 'ods', 'ods-pixel', 'nobody', 'daemon', 'sys', 'bin', 'admin', 'sudo', 'users'))
+}
+
+function Get-ODSPortalDistroLauncherName([string]$Distro) {
+    # Store-packaged Ubuntu launchers: Ubuntu -> ubuntu.exe, Ubuntu-24.04 -> ubuntu2404.exe.
+    if ($Distro -notmatch '^Ubuntu(?:-(\d{2})\.(\d{2}))?$') { return $null }
+    if ($Matches[1]) { return ('ubuntu' + $Matches[1] + $Matches[2] + '.exe') }
+    return 'ubuntu.exe'
+}
+
+function ConvertTo-ODSPortalPowerShellLiteral([string]$Value) {
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function New-ODSPortalResumeScript([string]$EntryScript, [System.Collections.IDictionary]$Options) {
+    # Re-invokes the same entry point with the same validated options.
+    $arguments = @()
+    foreach ($key in @($Options.Keys | Sort-Object)) {
+        if ($key -notmatch '^[A-Za-z]+$' -or $key -eq 'DryRun') { continue }
+        $value = $Options[$key]
+        if ($value -is [System.Management.Automation.SwitchParameter] -or $value -is [bool]) {
+            if ([bool]$value) { $arguments += "-$key" }
+        } elseif ($null -ne $value -and [string]$value -ne '') {
+            $arguments += "-$key " + (ConvertTo-ODSPortalPowerShellLiteral ([string]$value))
+        }
+    }
+    $entry = ConvertTo-ODSPortalPowerShellLiteral $EntryScript
+    $folder = ConvertTo-ODSPortalPowerShellLiteral (Split-Path -Parent $EntryScript)
+    return @(
+        '# Written by the ODS Windows setup to continue after a restart. Safe to delete.',
+        "`$host.UI.RawUI.WindowTitle = 'ODS setup (continuing after restart)'",
+        "if (-not (Test-Path -LiteralPath $entry)) {",
+        "    Write-Host 'The downloaded ODS setup files are no longer available. Paste the install command from https://github.com/Osmantic/ODS again.' -ForegroundColor Yellow",
+        '    return',
+        '}',
+        "Set-Location -LiteralPath $folder",
+        "Write-Host 'Continuing ODS setup after the restart...' -ForegroundColor Cyan",
+        ("& $entry " + ($arguments -join ' ')).TrimEnd()
+    ) -join "`r`n"
+}
+
+# ----------------------------------------------------------- host inspection
+
+function Test-ODSPortalVirtualization {
+    # A running hypervisor (Hyper-V/VMP already on) hides the firmware flag,
+    # so either signal is enough.
+    $system = Get-CimInstance -ClassName Win32_ComputerSystem
+    if ($system.HypervisorPresent) { return $true }
+    $processors = @(Get-CimInstance -ClassName Win32_Processor)
+    return [bool](@($processors | Where-Object { $_.VirtualizationFirmwareEnabled }).Count -gt 0)
+}
+
+function Get-ODSPortalFreeSystemGB {
+    # WSL disks and Docker Desktop data live under the user's profile drive.
+    $root = [IO.Path]::GetPathRoot($env:LOCALAPPDATA)
+    return [math]::Floor(([IO.DriveInfo]::new($root)).AvailableFreeSpace / 1GB)
+}
+
+function Get-ODSPortalWslRegistrations {
+    # One subkey per WSL distribution: its name, and in BasePath the folder
+    # that holds its virtual disk (ext4.vhdx). A missing or unreadable key is
+    # no registration, never a setup stop: setup then says it could not find
+    # the drive, and the host agent reports that drive as not checked.
+    $lxss = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    return @(Get-ChildItem -LiteralPath $lxss -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue })
+}
+
+function Get-ODSPortalDistroDrive([string]$Distro) {
+    # Inside Ubuntu the virtual disk reports its growth limit (about 1 TB) as
+    # free space; the Windows drive that stores it is what downloads fill.
+    # Returns that drive (C:), or '' when WSL records no drive-letter path.
+    $entries = @(Get-ODSPortalWslRegistrations | Where-Object { [string]$_.DistributionName -ieq $Distro })
+    if ($entries.Count -ne 1) { return '' }
+    # Newer registrations prefix the path with \\?\.
+    if ([string]$entries[0].BasePath -match '^(?:\\\\\?\\)?([A-Za-z]):\\') { return $Matches[1].ToUpperInvariant() + ':' }
+    return ''
+}
+
+function Assert-ODSPortalHostCapacity([bool]$WslReady) {
+    $free = Get-ODSPortalFreeSystemGB
+    if ($free -lt $script:ODSPortalMinimumFreeGB) {
+        $need = "Ubuntu, Docker images and the AI model need about $($script:ODSPortalMinimumFreeGB) GB"
+        # With WSL already present this may be a rerun whose data is already
+        # on disk, so only warn; a missing model download still fails later.
+        if (-not $WslReady) { throw "Only $free GB is free on the Windows drive that stores Ubuntu and Docker data. $need. Free space, then rerun this command. Nothing was installed." }
+        Write-Host "Only $free GB is free on the Windows drive. $need; setup continues because WSL is already installed. If a download fails, free space and rerun." -ForegroundColor Yellow
+    }
+    if (-not $WslReady -and -not (Test-ODSPortalVirtualization)) {
+        throw (Get-ODSPortalVirtualizationOffMessage (Test-ODSSparkWindowsArm64))
+    }
+}
+
+function Get-ODSPortalVirtualizationOffMessage([bool]$Arm64) {
+    # Arm PCs have no Intel VT-x or AMD SVM setting to look for.
+    if ($Arm64) {
+        return 'Hardware virtualization is turned off, and WSL2 cannot run without it. Turn on virtualization in your PC''s firmware (UEFI) settings, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+    }
+    return 'Hardware virtualization is turned off, and WSL2 cannot run without it. Restart into your BIOS/UEFI settings, enable Intel VT-x (Intel Virtualization Technology) or AMD SVM, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+}
+
+# --------------------------------------------------------------- Docker Desktop
+
+function Get-ODSPortalDockerDesktopRoots {
+    # Desktop supports per-user, all-user and custom InstallLocation paths.
+    # Inspect only its fixed uninstall keys; never execute UninstallString or
+    # mistake an unrelated Docker CLI on PATH for a Desktop installation.
+    $roots = @()
+    foreach ($key in @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop')) {
+        # Each registration is optional; most hosts have only one of these keys.
+        $registration = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        # Some registrations quote the value or keep surrounding spaces.
+        $location = if ($registration) { ([string]$registration.InstallLocation).Trim().Trim('"') } else { '' }
+        if ($location) { $roots += $location }
+    }
+    if ($env:LOCALAPPDATA) { $roots += Join-Path $env:LOCALAPPDATA 'Programs\DockerDesktop' }
+    if ($env:ProgramW6432) { $roots += Join-Path $env:ProgramW6432 'Docker\Docker' }
+    if ($env:ProgramFiles) { $roots += Join-Path $env:ProgramFiles 'Docker\Docker' }
+    return @($roots | Where-Object {
+        # Do not resolve relative paths or contact a remote share during discovery.
+        if ([IO.Path]::DirectorySeparatorChar -eq '\') { $_ -match '^[A-Za-z]:[\\/]' }
+        else { [IO.Path]::IsPathRooted($_) -and $_ -notmatch '^[\\/]{2}' }
+    } | Select-Object -Unique)
+}
+
+function Get-ODSPortalDockerDesktop {
+    $partial = @()
+    foreach ($root in @(Get-ODSPortalDockerDesktopRoots)) {
+        $exe = Join-Path $root 'Docker Desktop.exe'
+        $cli = Join-Path $root 'resources\bin\docker.exe'
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { continue }
+        if (Test-Path -LiteralPath $cli -PathType Leaf) {
+            return [pscustomobject]@{ Installed = $true; Exe = $exe; Cli = $cli }
+        }
+        $partial += $root
+    }
+    if ($partial.Count -gt 0) {
+        throw "Docker Desktop installation is incomplete: the bundled Docker CLI is missing under $($partial -join ', '). Repair that Docker Desktop installation, then rerun ODS setup."
+    }
+    return [pscustomobject]@{ Installed = $false; Exe = ''; Cli = '' }
+}
+
+function Invoke-ODSPortalDockerCli([string]$Cli, [string[]]$Arguments) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Cli @Arguments 2>&1
+        return [pscustomobject]@{ Code = $LASTEXITCODE; Output = (($output | Out-String).Trim()) }
+    } finally { $ErrorActionPreference = $previousPreference }
+}
+
+function Test-ODSPortalDockerEngine($Desktop) {
+    if (-not (Test-Path -LiteralPath $Desktop.Cli)) { return $false }
+    return (Invoke-ODSPortalDockerCli $Desktop.Cli @('version', '--format', '{{.Server.Version}}')).Code -eq 0
+}
+
+function Install-ODSPortalDockerDesktop {
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $winget) {
+        throw 'Docker Desktop is required, and this Windows has no winget to install it automatically. Install Docker Desktop from https://docs.docker.com/desktop/setup/install/windows-install/ (keep "Use WSL 2" selected), restart Windows, then rerun this command.'
+    }
+    # Docker's documented installer flags: quiet, WSL 2 backend, license accepted
+    # (the user agreed in the prompt). winget asks Windows for elevation.
+    $arguments = @('install', '--id', 'Docker.DockerDesktop', '--exact', '--source', 'winget',
+        '--accept-package-agreements', '--accept-source-agreements',
+        '--override', 'install --quiet --accept-license --backend=wsl-2')
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $winget.Source @arguments | Out-Host
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    # winget return codes that mean Docker Desktop is already present. Each is
+    # trusted only after the complete rediscovery below. Do not classify
+    # localized console text or ignore any other installation error.
+    $alreadyInstalled = $code -in @(
+        -1978335189,  # 0x8A15002B UPDATE_NOT_APPLICABLE (install upgrades by default)
+        -1978335135,  # 0x8A150061 PACKAGE_ALREADY_INSTALLED
+        -1978334963,  # 0x8A15010D INSTALL_ALREADY_INSTALLED
+        -1978334962)  # 0x8A15010E INSTALL_DOWNGRADE (a newer version is installed)
+    # 0x8A150109 INSTALL_REBOOT_REQUIRED_TO_FINISH: installed; it finishes with
+    # the Windows restart setup already requests for a new Desktop.
+    $restartPending = $code -eq -1978334967
+    if ($code -ne 0 -and -not $alreadyInstalled -and -not $restartPending) {
+        throw "Docker Desktop installation did not finish (winget exit $code). Install it from https://docs.docker.com/desktop/setup/install/windows-install/ , restart Windows, then rerun this command."
+    }
+    $desktop = Get-ODSPortalDockerDesktop
+    if (-not $desktop.Installed) {
+        if ($alreadyInstalled) {
+            throw "winget reports Docker Desktop is already installed (exit $code), but ODS could not locate its application and bundled CLI. Open Docker Desktop from Start and share its installation folder with ODS support. Keep your existing Docker data."
+        }
+        throw 'winget finished, but ODS could not locate the Docker Desktop application and bundled CLI. Open Docker Desktop from Start and check its installation folder before rerunning ODS setup.'
+    }
+    return [pscustomobject]@{ AlreadyInstalled = $alreadyInstalled; Desktop = $desktop }
+}
+
+function Wait-ODSPortalDockerEngine($Desktop) {
+    # Bounded readiness wait for a service that was just started; not a retry.
+    $deadline = [DateTime]::UtcNow.AddSeconds($script:ODSPortalDockerWaitSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-ODSPortalDockerEngine $Desktop) { return }
+        Start-Sleep -Seconds 5
+    }
+    throw "Docker Desktop is still not ready after $($script:ODSPortalDockerWaitSeconds / 60) minutes. Open Docker Desktop and accept any prompt it shows. If it stays on Starting the Docker Engine, restart Windows, open Docker Desktop, wait until it shows Engine running, then rerun this command."
+}
+
+function Wait-ODSPortalDistroDocker([string]$Distro, [int]$Seconds) {
+    # Bounded readiness wait, not a retry: docker appears inside the distro
+    # once Docker Desktop has attached its WSL integration.
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ($true) {
+        if ((Invoke-ODSPortalWsl -Arguments @('--distribution', $Distro, '--exec', 'docker', 'info')).Code -eq 0) { return $true }
+        if ([DateTime]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Seconds 5
+    }
+}
+
+function Start-ODSPortalDockerDesktop($Desktop) {
+    Write-Host '         Starting Docker Desktop (the first start can take a few minutes)...'
+    Start-Process -FilePath $Desktop.Exe | Out-Null
+    Wait-ODSPortalDockerEngine $Desktop
+}
+
+# ------------------------------------------------------ Ubuntu first account
+
+function Read-ODSPortalLinuxAccount {
+    Write-Host ''
+    Write-Host '         Create the Linux account for your Ubuntu workspace.'
+    Write-Host '         Use lowercase letters, numbers, - or _ (for example: maria). This is separate from your Windows login.'
+    do {
+        $name = (Read-Host '         Ubuntu username').Trim()
+        $valid = Test-ODSPortalLinuxUsername $name
+        if (-not $valid) { Write-Host '         Start with a lowercase letter; use only a-z, 0-9, - or _ (max 32 characters).' -ForegroundColor Yellow }
+    } until ($valid)
+    Write-Host '         Choose a password. Nothing appears on screen while you type; that is normal.'
+    do {
+        $first = Read-Host '         Ubuntu password' -AsSecureString
+        $second = Read-Host '         Type the password again' -AsSecureString
+        $a = ConvertFrom-ODSPortalSecureString $first
+        $b = ConvertFrom-ODSPortalSecureString $second
+        $valid = $a.Length -ge 1 -and $a -ceq $b
+        if (-not $valid) { Write-Host '         The passwords were empty or did not match. Try again.' -ForegroundColor Yellow }
+    } until ($valid)
+    Write-Host '         Remember this password: Ubuntu asks for it once during installation.'
+    return [pscustomobject]@{ Name = $name; Password = $a }
+}
+
+function ConvertFrom-ODSPortalSecureString([Security.SecureString]$Value) {
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+}
+
+function Get-ODSPortalDistroLauncher([string]$Distro) {
+    $name = Get-ODSPortalDistroLauncherName $Distro
+    if (-not $name -or -not $env:LOCALAPPDATA) { return $null }
+    $launcher = Join-Path $env:LOCALAPPDATA ('Microsoft\WindowsApps\' + $name)
+    if (Test-Path -LiteralPath $launcher) { return $launcher }
+    return $null
+}
+
+function Register-ODSPortalDistro([string]$Distro) {
+    # Store-packaged releases installed with --no-launch stay unregistered
+    # until their launcher runs; "install --root" registers without the
+    # interactive account wizard, which this setup replaces.
+    $launcher = Get-ODSPortalDistroLauncher $Distro
+    if (-not $launcher) {
+        throw "$Distro was downloaded but Windows has not registered it yet. Open $Distro once from the Start menu, finish its setup, close it, then rerun this command."
+    }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $launcher install --root | Out-Host
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($code -ne 0) { throw "$Distro could not finish its first start (exit $code). Open $Distro once from the Start menu, then rerun this command." }
+}
+
+function ConvertTo-ODSPortalProcessArgument([string]$Value) {
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    # Win32 command-line quoting also works with Windows PowerShell 5.1,
+    # where ProcessStartInfo.ArgumentList is unavailable.
+    return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+
+function Invoke-ODSPortalWslInput([string]$Distro, [string[]]$Command, [string]$Text) {
+    # Runs a fixed root command in the distro with $Text on stdin. Bytes are
+    # written directly: Windows PowerShell pipes add CRLF and use the console
+    # code page, which would change passwords.
+    $info = [Diagnostics.ProcessStartInfo]::new((Get-Command wsl.exe -CommandType Application | Select-Object -First 1).Source)
+    $target = @('--distribution', $Distro, '--user', 'root', '--exec') + $Command
+    $info.Arguments = ($target | ForEach-Object { ConvertTo-ODSPortalProcessArgument $_ }) -join ' '
+    $info.UseShellExecute = $false
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Text -replace "`r`n", "`n") + "`n")
+        $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $output = (($stdout.Result + $stderr.Result) -replace "`0", '').Trim()
+        return [pscustomobject]@{ Code = $process.ExitCode; Output = $output }
+    } finally { $process.Dispose() }
+}
+
+function New-ODSPortalLinuxAccount([string]$Distro, $Account) {
+    $exists = Invoke-ODSPortalWsl -Arguments @('--distribution', $Distro, '--user', 'root', '--exec', 'id', '-u', $Account.Name)
+    if ($exists.Code -ne 0) {
+        # --exec bypasses the login shell; its PATH need not include /usr/sbin.
+        # Ubuntu's account tools must also work before the first interactive boot.
+        $created = Invoke-ODSPortalWsl -Arguments @('--distribution', $Distro, '--user', 'root', '--exec', '/usr/sbin/useradd', '--create-home', '--shell', '/bin/bash', '--groups', 'sudo', '--', $Account.Name)
+        if ($created.Code -ne 0) { throw "Could not create the Ubuntu user $($Account.Name): $($created.Output) $($created.Error)" }
+    }
+    # The password travels only on chpasswd's stdin, never in arguments or logs.
+    $password = Invoke-ODSPortalWslInput $Distro @('/usr/sbin/chpasswd') ($Account.Name + ':' + $Account.Password)
+    if ($password.Code -ne 0) { throw "Could not set the Ubuntu password for $($Account.Name). Open $Distro, run: sudo passwd $($Account.Name), then rerun this command." }
+    $written = Set-ODSPortalWslConf $Distro @('user', 'default', $Account.Name, 'boot', 'systemd', 'true')
+    if ($written.Code -ne 0) { throw "Could not make $($Account.Name) the default Ubuntu user: $($written.Output)" }
+    $stopped = Invoke-ODSPortalWsl -Arguments @('--terminate', $Distro)
+    if ($stopped.Code -ne 0) { throw "Could not restart $Distro to apply the new default user: $($stopped.Output) $($stopped.Error)" }
+}
+
+function Set-ODSPortalWslConf([string]$Distro, [string[]]$Settings) {
+    # $Settings is section, key, value triples. Other /etc/wsl.conf settings
+    # are kept. Fresh Ubuntu has not passed ODS preflight yet, so Python must
+    # not be a prerequisite for creating its first normal Linux account.
+    if ($Settings.Count -eq 0 -or $Settings.Count % 3 -ne 0) { throw 'Invalid WSL settings.' }
+    for ($index = 0; $index -lt $Settings.Count; $index += 3) {
+        $userSetting = $Settings[$index] -ceq 'user' -and $Settings[$index + 1] -ceq 'default' -and (Test-ODSPortalLinuxUsername $Settings[$index + 2])
+        $bootSetting = $Settings[$index] -ceq 'boot' -and $Settings[$index + 1] -ceq 'systemd' -and $Settings[$index + 2] -ceq 'true'
+        if (-not ($userSetting -or $bootSetting)) { throw 'Unsupported WSL account or boot setting.' }
+    }
+    $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'wsl-conf.sh') -Raw
+    return (Invoke-ODSPortalWslInput $Distro (@('/bin/sh', '-s', '--', '/etc/wsl.conf') + $Settings) $config)
+}
+
+function Enable-ODSPortalSystemd([string]$Distro) {
+    $written = Set-ODSPortalWslConf $Distro @('boot', 'systemd', 'true')
+    if ($written.Code -ne 0) { throw "Could not turn on systemd in $Distro ($($written.Output)). Add systemd=true under [boot] in /etc/wsl.conf inside Ubuntu, run wsl --terminate $Distro, then rerun this command." }
+    $stopped = Invoke-ODSPortalWsl -Arguments @('--terminate', $Distro)
+    if ($stopped.Code -ne 0) { throw "Could not restart $Distro after turning on systemd: $($stopped.Output) $($stopped.Error)" }
+}
+
+# ------------------------------------------------------ continue after restart
+
+function Get-ODSPortalEntryScript([string]$InstallerRoot) {
+    $root = Join-Path (Split-Path -Parent (Split-Path -Parent $InstallerRoot)) 'install.ps1'
+    if (Test-Path -LiteralPath $root) { return $root }
+    return (Join-Path $InstallerRoot 'windows-portal.ps1')
+}
+
+function Register-ODSPortalResume([string]$InstallerRoot, [System.Collections.IDictionary]$Options) {
+    # RunOnce is per user, needs no elevation and Windows deletes the entry
+    # before running it, so it can never loop.
+    $folder = Join-Path $env:LOCALAPPDATA 'ODS'
+    $null = New-Item -ItemType Directory -Path $folder -Force
+    $resume = Join-Path $folder 'portal-setup-resume.ps1'
+    [IO.File]::WriteAllText($resume, (New-ODSPortalResumeScript (Get-ODSPortalEntryScript $InstallerRoot) $Options), [Text.UTF8Encoding]::new($true))
+    $shell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $command = '"' + $shell + '" -NoExit -NoProfile -ExecutionPolicy Bypass -File "' + $resume + '"'
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    if (-not (Test-Path -LiteralPath $key)) { $null = New-Item -Path $key -Force }
+    Set-ItemProperty -LiteralPath $key -Name $script:ODSPortalResumeValue -Value $command
+}
+
+function Request-ODSPortalRestart([string]$InstallerRoot, [System.Collections.IDictionary]$Options, [string]$Reason) {
+    Register-ODSPortalResume $InstallerRoot $Options
+    Write-Host ''
+    Write-Host "  $Reason" -ForegroundColor Yellow
+    Write-Host '  Save your work and restart Windows. After you sign in again, ODS setup continues automatically in a new window.'
+    Write-Host '  ODS has not been installed yet.'
+    return 3010
+}

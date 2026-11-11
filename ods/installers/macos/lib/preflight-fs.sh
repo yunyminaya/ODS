@@ -10,7 +10,8 @@
 # Provides:
 #   test_install_dir_filesystem() -- sets INSTALL_FS_TYPE, INSTALL_FS_FATAL,
 #                                    INSTALL_FS_NETWORKED
-#   test_docker_desktop_sharing() -- sets DOCKER_SHARE_OK, DOCKER_SHARE_ERR
+#   test_docker_desktop_sharing() -- sets DOCKER_SHARE_OK, DOCKER_SHARE_ERR,
+#                                    DOCKER_SHARE_REASON
 #
 # shellcheck disable=SC2034  # vars are read by install-macos.sh after sourcing
 #
@@ -32,10 +33,33 @@ _resolve_existing_parent() {
     printf '%s' "$p"
 }
 
-# Detect filesystem type at INSTALL_DIR's parent (where .env will live).
-# BSD `stat -f %T` returns short personality strings (apfs, hfs, msdos, exfat,
-# ntfs). diskutil gives a richer "File System Personality" line we fall back
-# to when stat returns something unexpected.
+# BSD stat's %T is a file-type marker ("/" for directories), not a
+# filesystem type. Read the kernel mount table and choose the nearest
+# containing mount after resolving existing symlinked path components.
+_macos_mount_filesystem_type() {
+    local probe="$1" candidate mounts line suffix prefix fs_type
+    candidate="$(cd "$probe" && pwd -P)" || return 1
+    mounts="$(LC_ALL=C mount 2>/dev/null)" || return 1
+    while :; do
+        while IFS= read -r line; do
+            [[ "$line" == *" ("*")" ]] || continue
+            suffix="${line##* (}"
+            prefix="${line%" ($suffix"}"
+            [[ "$prefix" == *" on $candidate" ]] || continue
+            fs_type="${suffix%%,*}"
+            fs_type="${fs_type%)}"
+            [[ "$fs_type" =~ ^[A-Za-z0-9_]+$ ]] || continue
+            printf '%s\n' "$fs_type"
+            return 0
+        done <<< "$mounts"
+        [[ "$candidate" == / ]] && break
+        candidate="${candidate%/*}"
+        [[ -n "$candidate" ]] || candidate=/
+    done
+    return 1
+}
+
+# Detect the filesystem containing the nearest existing installation parent.
 test_install_dir_filesystem() {
     local install_dir="${1:-$INSTALL_DIR}"
     INSTALL_FS_TYPE=""
@@ -45,24 +69,15 @@ test_install_dir_filesystem() {
     probe="$(_resolve_existing_parent "$install_dir")"
 
     local fs_type=""
-    fs_type=$(stat -f %T "$probe" 2>/dev/null || true)
+    fs_type="$(_macos_mount_filesystem_type "$probe" || true)"
 
-    # `stat -f %T` on macOS sometimes returns just a short tag; cross-check
-    # with diskutil for stable personality identification.
-    if command -v diskutil >/dev/null 2>&1; then
-        # `diskutil info` only accepts mount points or device IDs. Subpaths
-        # (e.g. /Volumes/X/ods) make it exit non-zero, which under
-        # `set -euo pipefail` would silently kill the entire installer. The
-        # personality lookup is an optional refinement on top of `stat -f %T`,
-        # so swallow non-zero — empty personality just means we keep the stat
-        # value.
-        local personality=""
-        personality=$(diskutil info "$probe" 2>/dev/null \
+    # Retain diskutil as an optional fallback if the mount table is unavailable.
+    # A subdirectory may not be accepted by diskutil; never treat an error as a
+    # filesystem name or let an optional probe abort a strict-shell installer.
+    if [[ -z "$fs_type" ]] && command -v diskutil >/dev/null 2>&1; then
+        fs_type=$(LC_ALL=C diskutil info "$probe" 2>/dev/null \
             | awk -F': *' '/File System Personality/ {print $2; exit}' \
             | tr '[:upper:]' '[:lower:]' || true)
-        if [[ -n "$personality" ]]; then
-            fs_type="$personality"
-        fi
     fi
 
     INSTALL_FS_TYPE="${fs_type:-unknown}"
@@ -84,13 +99,16 @@ test_install_dir_filesystem() {
 # Smoke-test Docker Desktop's file-sharing allowlist by trying to bind-mount
 # the install dir into a throwaway alpine container. Docker Desktop responds
 # with a recognisable error when the path is not in the shared list.
+# REASON is ok, cli_missing, denied (recognized sharing error), or probe_failed.
+# All nonzero Docker exits fail closed; callers receive only bounded diagnostics.
 test_docker_desktop_sharing() {
     local install_dir="${1:-$INSTALL_DIR}"
-    DOCKER_SHARE_OK=true
+    DOCKER_SHARE_OK=false
     DOCKER_SHARE_ERR=""
+    DOCKER_SHARE_REASON="probe_failed"
 
     if ! command -v docker >/dev/null 2>&1; then
-        DOCKER_SHARE_OK=false
+        DOCKER_SHARE_REASON="cli_missing"
         DOCKER_SHARE_ERR="docker CLI not found"
         return
     fi
@@ -98,11 +116,22 @@ test_docker_desktop_sharing() {
     local probe
     probe="$(_resolve_existing_parent "$install_dir")"
 
-    local out=""
-    out=$(docker run --rm -v "${probe}:/check:ro" alpine true 2>&1) || true
+    local out="" probe_status=0
+    # Keep the failure status under errexit; text alone cannot prove success.
+    if out=$(docker run --rm -v "${probe}:/check:ro" alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 true 2>&1); then
+        DOCKER_SHARE_OK=true
+        DOCKER_SHARE_REASON="ok"
+        return
+    else
+        probe_status=$?
+    fi
 
-    if echo "$out" | grep -qiE "not shared from the host|Mounts denied|file sharing|filesharing"; then
-        DOCKER_SHARE_OK=false
-        DOCKER_SHARE_ERR="$out"
+    # Return bounded diagnostics, never raw Docker output (which may contain
+    # private paths, registry credentials, or terminal control characters).
+    if grep -qiE "not shared from the host|Mounts denied|file sharing|filesharing" <<< "$out"; then
+        DOCKER_SHARE_REASON="denied"
+        DOCKER_SHARE_ERR="Docker Desktop reported a File Sharing denial for the bind-mount probe."
+    else
+        DOCKER_SHARE_ERR="Docker bind-mount probe failed (exit ${probe_status}). Check Docker Desktop, the selected Docker context, and access to the probe image, then retry."
     fi
 }

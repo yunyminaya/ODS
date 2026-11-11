@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,6 +22,11 @@ from main import (
 # --- get_allowed_origins ---
 
 
+@pytest.fixture(autouse=True)
+def no_remote_provider_network(monkeypatch):
+    monkeypatch.setattr("main.async_request_agent_json", AsyncMock(return_value={}))
+
+
 def test_read_installed_version_parses_json_version_file(tmp_path, monkeypatch):
     version_file = tmp_path / ".version"
     version_file.write_text(json.dumps({"version": "3.1.4"}), encoding="utf-8")
@@ -38,6 +44,13 @@ def test_read_installed_version_ignores_empty_env_override(tmp_path, monkeypatch
     monkeypatch.setattr("main._resolve_install_root", lambda: tmp_path)
 
     assert _read_installed_version() == "3.1.4"
+
+
+def test_read_installed_version_preserves_unmatched_quote(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("ODS_VERSION=3.1.4'\n", encoding="utf-8")
+    monkeypatch.setattr("main._resolve_install_root", lambda: tmp_path)
+
+    assert _read_installed_version() == "3.1.4'"
 
 
 class TestGetAllowedOrigins:
@@ -214,7 +227,8 @@ class TestPreflightDisk:
 class TestBuildApiStatus:
 
     @pytest.mark.asyncio
-    async def test_returns_full_structure(self, monkeypatch):
+    @pytest.mark.parametrize("tps", [25.5, 0.0, None], ids=["measured", "idle", "unavailable"])
+    async def test_returns_full_structure(self, monkeypatch, tps):
         from models import GPUInfo, BootstrapStatus, ModelInfo
 
         gpu = GPUInfo(
@@ -228,7 +242,8 @@ class TestBuildApiStatus:
         monkeypatch.setattr("main.get_bootstrap_status", lambda: BootstrapStatus(active=False))
         monkeypatch.setattr("main.get_loaded_model", AsyncMock(return_value="Test-32B"))
         monkeypatch.setattr("main.get_llama_metrics", AsyncMock(return_value={
-            "tokens_per_second": 25.5,
+            "tokens_per_second": tps,
+            "throughput_model": "Test-32B",
             "lifetime_tokens": 10000,
             "token_count_mode": "cumulative",
         }))
@@ -248,9 +263,80 @@ class TestBuildApiStatus:
         assert result["model"]["currentModel"] == "Test-32B"
         assert result["model"]["loadedModel"] == "Test-32B"
         assert result["model"]["configuredModel"] == "Test-32B"
-        assert result["inference"]["tokensPerSecond"] == 25.5
+        assert result["inference"]["tokensPerSecond"] == tps
+        assert result["model"]["tokensPerSecond"] == tps
         assert result["inference"]["tokenCountMode"] == "cumulative"
         assert result["inference"]["loadedModel"] == "Test-32B"
+
+    @pytest.mark.asyncio
+    async def test_live_runtime_model_overrides_stale_configured_model(self, monkeypatch):
+        from models import BootstrapStatus, ModelInfo
+
+        monkeypatch.setattr("main.get_gpu_info", lambda: None)
+        monkeypatch.setattr("main.get_all_services", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            "main.get_model_info",
+            lambda: ModelInfo(name="Configured-Qwen", size_gb=16.0, context_length=65536),
+        )
+        monkeypatch.setattr("main.get_bootstrap_status", lambda: BootstrapStatus(active=False))
+        monkeypatch.setattr("main.get_loaded_model", AsyncMock(return_value="Live-Ministral"))
+        monkeypatch.setattr(
+            "main.get_llama_metrics",
+            AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}),
+        )
+        monkeypatch.setattr("main.get_llama_context_size", AsyncMock(return_value=20480))
+        monkeypatch.setattr("main.get_uptime", lambda: 0)
+        monkeypatch.setattr("main.get_cpu_metrics", lambda: {"percent": 0, "temp_c": None})
+        monkeypatch.setattr("main.get_ram_metrics", lambda: {"used_gb": 0, "total_gb": 0, "percent": 0})
+
+        result = await _build_api_status()
+
+        assert result["currentModel"] == "Live-Ministral"
+        assert result["loadedModel"] == "Live-Ministral"
+        assert result["configuredModel"] == "Configured-Qwen"
+        assert result["model"]["name"] == "Live-Ministral"
+        assert result["model"]["currentModel"] == "Live-Ministral"
+        assert result["model"]["configuredModel"] == "Configured-Qwen"
+        assert result["model"]["contextLength"] == 20480
+        assert result["inference"]["contextSize"] == 20480
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("served,display_name", [
+        ("Qwen3.8-27B-UD-IQ4_XS.gguf", "Qwen 3.8 27B"),
+        ("community-Q4_K_M.gguf", "community-model · Q4_K_M"),
+        ("Uncatalogued-12B-NVFP4-6c01ac37.pack", None),
+    ], ids=["catalog", "hub-import", "uncatalogued"])
+    async def test_names_the_served_model_as_the_models_page_does(self, monkeypatch, tmp_path, served, display_name):
+        import routers.models as models_router
+        from models import BootstrapStatus, ModelInfo
+
+        # The runtime serves the file name; the Models page shows the catalog name.
+        library = tmp_path / "model-library.json"
+        library.write_text(json.dumps({"models": [
+            {"id": "qwen3.8-27b-iq4-xs", "name": "Qwen 3.8 27B", "gguf_file": "Qwen3.8-27B-UD-IQ4_XS.gguf"},
+        ]}), encoding="utf-8")
+        (tmp_path / "model-imports.json").write_text(json.dumps({"models": [
+            {"id": "hf-community", "name": "community-model · Q4_K_M", "gguf_file": "community-Q4_K_M.gguf",
+             "source": "huggingface"},
+        ]}), encoding="utf-8")
+        monkeypatch.setattr(models_router, "_LIBRARY_PATH", library)
+        monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr("main.get_gpu_info", lambda: None)
+        monkeypatch.setattr("main.get_all_services", AsyncMock(return_value=[]))
+        monkeypatch.setattr("main.get_model_info", lambda: ModelInfo(name="qwen3.8-27b-iq4-xs", size_gb=14.0, context_length=65536))
+        monkeypatch.setattr("main.get_bootstrap_status", lambda: BootstrapStatus(active=False))
+        monkeypatch.setattr("main.get_loaded_model", AsyncMock(return_value=served))
+        monkeypatch.setattr("main.get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}))
+        monkeypatch.setattr("main.get_llama_context_size", AsyncMock(return_value=65536))
+        monkeypatch.setattr("main.get_uptime", lambda: 0)
+        monkeypatch.setattr("main.get_cpu_metrics", lambda: {"percent": 0, "temp_c": None})
+        monkeypatch.setattr("main.get_ram_metrics", lambda: {"used_gb": 0, "total_gb": 0, "percent": 0})
+
+        result = await _build_api_status()
+
+        # Identity stays the served id; only the display name is added.
+        assert result["loadedModel"] == result["inference"]["loadedModel"] == served
+        assert result["inference"]["loadedModelDisplayName"] == display_name
 
     def test_detected_gpu_count_overrides_stale_compose_default(self, monkeypatch):
         from main import _serialize_gpu
@@ -270,6 +356,29 @@ class TestBuildApiStatus:
         )
 
         assert _serialize_gpu(gpu)["gpu_count"] == 2
+
+    @pytest.mark.parametrize("backend,memory_type,label", [
+        ("apple", "unified", "Unified Memory"),
+        ("amd", "unified", "VRAM Partition"),
+        ("nvidia", "discrete", "VRAM"),
+    ])
+    def test_live_adapter_survives_zero_install_count(self, monkeypatch, backend, memory_type, label):
+        from main import _serialize_gpu
+        from models import GPUInfo
+
+        # A WSL install can begin with GPU_COUNT=0 and later discover its native
+        # adapter. Its live memory/utilization must not accompany a zero count.
+        monkeypatch.setenv("GPU_COUNT", "0")
+        info = GPUInfo(name="Native adapter", memory_used_mb=8192,
+                       memory_total_mb=16384, memory_percent=50,
+                       utilization_percent=22, temperature_c=0,
+                       gpu_backend=backend, memory_type=memory_type,
+                       temperature_available=False)
+        result = _serialize_gpu(info)
+        assert result["gpu_count"] == 1
+        assert result["memoryLabel"] == label
+        assert result["vramUsed"] == 8 and result["utilization"] == 22
+        assert result["temperature"] is None
 
     @pytest.mark.asyncio
     async def test_tier_professional(self, monkeypatch):
@@ -346,6 +455,55 @@ class TestReadinessPayload:
         assert result["canChat"] is True
         assert result["canUseVoice"] is False
         assert any(check["id"] == "voice" and check["status"] == "disabled" for check in result["checks"])
+
+    def test_switched_off_open_webui_is_disabled_not_blocking(self):
+        # Workstation06 (10-27): a fresh Pixel install leaves Open WebUI out
+        # (ENABLE_OPEN_WEBUI=false), and readiness read "blocked" with the
+        # repair "ods restart open-webui" while chat was ready.
+        from models import BootstrapStatus, ServiceStatus
+
+        statuses = [
+            ServiceStatus(id="llama-server", name="LLM", port=8080, external_port=8080, status="healthy"),
+            ServiceStatus(id="open-webui", name="Open WebUI", port=3000, external_port=3000, status="not_deployed"),
+        ]
+
+        result = _build_readiness_payload(
+            service_statuses=statuses,
+            loaded_model="Test-32B",
+            context_size=32768,
+            bootstrap_info=BootstrapStatus(active=False),
+            host_agent={"available": True},
+            stt_model_cached=None,
+            stt_model_name="Systran/faster-whisper-base",
+        )
+
+        webui = next(check for check in result["checks"] if check["id"] == "open-webui")
+        assert result["ready"] is True and result["status"] == "ready"
+        assert webui["status"] == "disabled" and webui["required"] is False
+        assert webui.get("repair") is None
+        assert "ods restart open-webui" not in result.get("repairHints", [])
+
+    def test_unhealthy_deployed_open_webui_still_blocks(self):
+        from models import BootstrapStatus, ServiceStatus
+
+        statuses = [
+            ServiceStatus(id="llama-server", name="LLM", port=8080, external_port=8080, status="healthy"),
+            ServiceStatus(id="open-webui", name="Open WebUI", port=3000, external_port=3000, status="unhealthy"),
+        ]
+
+        result = _build_readiness_payload(
+            service_statuses=statuses,
+            loaded_model="Test-32B",
+            context_size=32768,
+            bootstrap_info=BootstrapStatus(active=False),
+            host_agent={"available": True},
+            stt_model_cached=None,
+            stt_model_name="Systran/faster-whisper-base",
+        )
+
+        webui = next(check for check in result["checks"] if check["id"] == "open-webui")
+        assert result["ready"] is False
+        assert webui["status"] == "blocked" and webui["required"] is True
 
     def test_missing_model_blocks_chat(self):
         from models import BootstrapStatus, ServiceStatus
@@ -441,29 +599,13 @@ class TestReadinessPayload:
         assert "checks" in data
 
 
-# --- /api/service-tokens ---
+# --- /api/service-tokens (removed) ---
 
 
-class TestServiceTokens:
-
-    def test_returns_token_from_env(self, test_client, monkeypatch):
-        monkeypatch.setenv("OPENCLAW_TOKEN", "my-secret-token")
-
-        resp = test_client.get("/api/service-tokens", headers=test_client.auth_headers)
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data.get("openclaw") == "my-secret-token"
-
-    def test_returns_empty_when_no_token(self, test_client, monkeypatch):
-        monkeypatch.delenv("OPENCLAW_TOKEN", raising=False)
-        # The file-based fallback paths (/data/openclaw/..., /ods/.env)
-        # won't exist in test environment, so all fallbacks fail gracefully.
-
-        resp = test_client.get("/api/service-tokens", headers=test_client.auth_headers)
-        assert resp.status_code == 200
-        data = resp.json()
-        # Either empty dict or no openclaw key
-        assert "openclaw" not in data
+def test_service_tokens_endpoint_is_removed(test_client):
+    """The endpoint only served the removed legacy OpenClaw gateway token."""
+    resp = test_client.get("/api/service-tokens", headers=test_client.auth_headers)
+    assert resp.status_code == 404
 
 
 # --- /api/external-links ---
@@ -537,6 +679,44 @@ class TestExternalLinks:
         link_ids = [link["id"] for link in data]
         assert "open-webui" in link_ids
         assert "litellm" not in link_ids
+
+    def test_hermes_proxy_link_is_labelled_hermes(self, test_client, monkeypatch):
+        """The proxy's manifest name describes plumbing; the link opens Hermes."""
+        monkeypatch.setattr("main.SERVICES", {
+            "hermes-proxy": {
+                "name": "Hermes Auth Proxy",
+                "port": 9120,
+                "external_port": 9120,
+                "health": "/health",
+                "host": "hermes-proxy",
+                "ui_path": "/auth/ods",
+            },
+        })
+
+        resp = test_client.get("/api/external-links", headers=test_client.auth_headers)
+
+        assert resp.status_code == 200
+        [link] = resp.json()
+        assert link["label"] == "Hermes"
+        assert link["ui_path"] == "/auth/ods"
+        # Health still matches the proxy's own status row, never Hermes Agent's.
+        assert link["healthNeedles"] == ["hermes-proxy", "hermes auth proxy"]
+
+    def test_shipped_token_spy_manifest_has_no_sidebar_link(self, test_client, monkeypatch):
+        """Its page asks for Token Spy's own API key; the Usage page reads it server-side."""
+        import config
+        shipped, _, errors = config.load_extension_manifests(
+            Path(__file__).resolve().parents[2], "nvidia",
+            only_service_ids=frozenset({"token-spy"}),
+        )
+        assert errors == []
+        assert shipped["token-spy"]["external_link"] is False
+        monkeypatch.setattr("main.SERVICES", shipped)
+
+        resp = test_client.get("/api/external-links", headers=test_client.auth_headers)
+
+        assert resp.status_code == 200
+        assert resp.json() == []
 
 
 # --- /api/storage ---
@@ -824,6 +1004,20 @@ class TestModelReadiness:
         assert result["context"]["meetsHermesTarget"] is False
         assert any("Full model is still downloading" in issue for issue in result["issues"])
 
+    def test_verifying_phase_is_reported_without_download_copy(self):
+        from models import BootstrapStatus, ModelInfo
+
+        result = _build_model_readiness_payload(
+            model_info=ModelInfo(name="qwen3.5-2b", size_gb=1.5, context_length=65536, quantization="GGUF"),
+            bootstrap_info=BootstrapStatus(active=True, phase="verifying", model_name="full-model.gguf", percent=100.0),
+            loaded_model="qwen3.5-2b",
+            runtime_context=65536,
+        )
+
+        assert result["bootstrap"]["phase"] == "verifying"
+        assert any("Full model is being verified" in issue for issue in result["issues"])
+        assert all("still downloading" not in issue for issue in result["issues"])
+
     def test_context_below_hermes_minimum_blocks_readiness(self):
         from models import BootstrapStatus, ModelInfo
 
@@ -1049,8 +1243,8 @@ class TestApiStatusServiceSerialization:
             "swap_safe": False,
         }
         monkeypatch.setattr("main.SERVICES", {
-            "openclaw": {
-                "name": "OpenClaw",
+            "sample-agent": {
+                "name": "Sample Agent",
                 "port": 18789,
                 "external_port": 7860,
                 "category": "optional",
@@ -1068,9 +1262,17 @@ class TestApiStatusServiceSerialization:
 
 class TestApiStatusFallback:
 
-    def test_fallback_on_oserror(self, test_client, monkeypatch):
+    @pytest.mark.parametrize("prior", [None, 25.0], ids=["no-measurement", "held-measurement"])
+    def test_fallback_on_oserror(self, test_client, monkeypatch, prior):
         """Narrow exception class (OSError) falls through to the safe-fallback dict."""
         monkeypatch.setattr("main._build_api_status", AsyncMock(side_effect=OSError("network down")))
+        import helpers
+        monkeypatch.setattr(helpers, "_llama_metrics_sample", {"result": {
+            "tokens_per_second": prior, "lifetime_tokens": 100 if prior else None,
+            "throughput_state": "measured", "throughput_sampled_at": 123.0 if prior else None,
+            "throughput_model": "known-model" if prior else None,
+            "throughput_mode": "generation_interval", "token_count_mode": "cumulative",
+        }})
 
         resp = test_client.get("/api/status", headers=test_client.auth_headers)
         assert resp.status_code == 200
@@ -1078,6 +1280,13 @@ class TestApiStatusFallback:
         assert data["gpu"] is None
         assert data["tier"] == "Unknown"
         assert data["services"] == []
+        assert data["cpu"]["percent"] is None
+        assert data["ram"]["percent"] is None
+        assert data["ram"]["total_gb"] is None
+        assert data["inference"]["tokensPerSecond"] == prior
+        assert data["inference"]["throughputState"] == "unavailable"
+        assert data["inference"]["throughputModel"] == ("known-model" if prior else None)
+        assert data["inference"]["throughputSampledAt"] == (123.0 if prior else None)
 
     def test_runtime_error_propagates_as_500(self, test_client, monkeypatch):
         """Programming errors (RuntimeError) inside _build_api_status must
@@ -1215,7 +1424,7 @@ class TestBuildApiStatusTiers:
             gpu_backend="nvidia",
         )
         bs = BootstrapStatus(
-            active=True, model_name="Qwen-32B", percent=50.0,
+            active=True, phase="downloading", model_name="Qwen-32B", percent=50.0,
             downloaded_gb=8.0, total_gb=16.0, eta_seconds=120, speed_mbps=100.0,
         )
         monkeypatch.setattr("main.get_gpu_info", lambda: gpu)
@@ -1233,6 +1442,7 @@ class TestBuildApiStatusTiers:
         assert result["bootstrap"]["active"] is True
         assert result["bootstrap"]["model"] == "Qwen-32B"
         assert result["bootstrap"]["percent"] == 50.0
+        assert result["bootstrap"]["phase"] == "downloading"
 
 
 def test_serialize_gpu_preserves_unavailable_sensor_state(monkeypatch):

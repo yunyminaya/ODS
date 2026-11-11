@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Behavioral tests for the durable Pixel model transition."""
+import contextlib
+import json
+import os
+import pathlib
+import select
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bin"))
+
+import pixel_access_protocol as protocol  # noqa: E402
+from pixel_access_bridge import AccessError, SystemdAccessBridge  # noqa: E402
+from pixel_model_transition import execute, main  # noqa: E402
+
+
+HEX_A = "a" * 64
+HEX_B = "b" * 64
+HEX_C = "c" * 64
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux coordinator flock contract')
+class SourceLockWaitTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def bridge(self):
+        # Only root ownership is modelled for unprivileged CI. Lock modes,
+        # links, file types and flock contention use the real filesystem.
+        with tempfile.TemporaryDirectory() as root:
+            state = pathlib.Path(root)
+            bridge = object.__new__(SystemdAccessBridge)
+            bridge.state = state
+            real_lstat, real_fstat = pathlib.Path.lstat, os.fstat
+
+            def root_stat(value):
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            def lstat(path, *args, **kwargs):
+                value = real_lstat(path, *args, **kwargs)
+                return root_stat(value) if path == state else value
+
+            with patch.object(pathlib.Path, 'lstat', lstat), patch(
+                    'os.fstat', side_effect=lambda fd: root_stat(real_fstat(fd))):
+                yield bridge
+
+    @contextlib.contextmanager
+    def holder(self, state):
+        program = (
+            'import fcntl,os,sys\n'
+            'fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR,0o600)\n'
+            'fcntl.flock(fd,fcntl.LOCK_EX)\n'
+            'print("held",flush=True)\n'
+            'sys.stdin.readline()\n'
+        )
+        with subprocess.Popen([sys.executable, '-c', program, str(state / 'lock')],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0])
+                self.assertEqual(child.stdout.readline(), 'held\n')
+                yield child
+            finally:
+                if child.poll() is None:
+                    child.stdin.write('\n')
+                    child.stdin.flush()
+                child.wait(timeout=5)
+
+    def test_source_begin_waits_for_real_competing_lock_before_inspection(self):
+        with self.bridge() as bridge, self.holder(bridge.state) as child:
+            real_sleep = time.sleep
+            def release(_delay):
+                child.stdin.write('\n')
+                child.stdin.flush()
+                with patch('pixel_access_bridge.time.sleep', real_sleep):
+                    child.wait(timeout=5)
+
+            with patch('pixel_access_bridge.time.sleep', side_effect=release) as sleep, patch.object(
+                    bridge, 'inspect', side_effect=AccessError('inspection-reached')) as inspect:
+                with self.assertRaisesRegex(AccessError, '^inspection-reached$'):
+                    bridge.model_begin(installer_source=True)
+                inspect.assert_called_once_with(allow_installing=True)
+                sleep.assert_called_once()
+            self.assertFalse((bridge.state / 'transition.json').exists())
+
+    def test_normal_model_begin_remains_immediate_under_contention(self):
+        with self.bridge() as bridge, self.holder(bridge.state), patch(
+                'pixel_access_bridge.time.sleep') as sleep, patch.object(bridge, 'inspect') as inspect:
+            with self.assertRaisesRegex(AccessError, '^transition-busy$'):
+                bridge.model_begin()
+            sleep.assert_not_called()
+            inspect.assert_not_called()
+            self.assertFalse((bridge.state / 'transition.json').exists())
+
+    def test_wait_is_bounded_by_own_and_outer_deadlines(self):
+        for outer, requested, expected in [(10, 0.5, 0.5), (0.4, 120, 0.4)]:
+            with self.subTest(outer=outer), self.bridge() as bridge:
+                clock = [0.0]
+                def advance(seconds):
+                    clock[0] += seconds
+                with patch('pixel_access_bridge.time.monotonic', side_effect=lambda: clock[0]), patch(
+                        'pixel_access_bridge.time.sleep', side_effect=advance), patch(
+                        'fcntl.flock', side_effect=BlockingIOError):
+                    with self.assertRaisesRegex(AccessError, '^transition-busy$'):
+                        with bridge.bounded(outer), bridge.locked(wait_seconds=requested):
+                            self.fail('contended lock entered its protected body')
+                self.assertAlmostEqual(clock[0], expected)
+                self.assertFalse((bridge.state / 'transition.json').exists())
+
+    def test_unsafe_lock_and_state_are_rejected_without_waiting(self):
+        for unsafe in ('lock-mode', 'lock-hardlink', 'state-mode'):
+            with self.subTest(unsafe=unsafe), self.bridge() as bridge:
+                lock = bridge.state / 'lock'
+                lock.touch(mode=0o600)
+                if unsafe == 'lock-mode':
+                    lock.chmod(0o644)
+                elif unsafe == 'lock-hardlink':
+                    os.link(lock, bridge.state / 'other')
+                else:
+                    bridge.state.chmod(0o755)
+                with patch('pixel_access_bridge.time.sleep') as sleep:
+                    with self.assertRaisesRegex(AccessError, '^unsafe-host-(lock|state)$'):
+                        with bridge.locked(wait_seconds=120):
+                            self.fail('unsafe custody was admitted')
+                    sleep.assert_not_called()
+
+    def test_protected_body_error_is_never_retried(self):
+        for error in (AccessError('transition-busy'), BlockingIOError('body')):
+            with self.subTest(error=type(error).__name__), self.bridge() as bridge:
+                count = 0
+                with patch('pixel_access_bridge.time.sleep') as sleep:
+                    with self.assertRaises(type(error)) as caught:
+                        with bridge.locked(wait_seconds=120):
+                            count += 1
+                            raise error
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(count, 1)
+                    sleep.assert_not_called()
+                with bridge.locked():
+                    pass  # The failed body's descriptor released the lock.
+
+    def test_existing_source_journal_still_uses_validated_resume(self):
+        with self.bridge() as bridge, patch.object(bridge, 'pending', return_value={'pending': True}), patch.object(
+                bridge, 'resume_source_begin', side_effect=AccessError('source-plan-mismatch')) as resume:
+            with self.assertRaisesRegex(AccessError, '^source-plan-mismatch$'):
+                bridge.model_begin(installer_source=True)
+            resume.assert_called_once_with()
+
+    def test_darwin_override_keeps_no_argument_lock_contract(self):
+        with self.bridge() as bridge, patch('pixel_access_bridge.platform.system', return_value='Darwin'):
+            original = bridge.locked
+            @contextlib.contextmanager
+            def no_argument_lock():
+                with original():
+                    yield
+            with patch.object(bridge, 'locked', no_argument_lock), patch.object(
+                    bridge, 'inspect', side_effect=AccessError('inspection-reached')):
+                with self.assertRaisesRegex(AccessError, '^inspection-reached$'):
+                    bridge.model_begin()
+
+
+class FakeBridge(SystemdAccessBridge):
+    def __init__(self, root):
+        self.state = pathlib.Path(root)
+        self.state.mkdir(exist_ok=True)
+        self.calls = []
+        self.edge_state = {"capability": "available", "phase": "idle",
+                           "revision": HEX_B, "streams": 0}
+        self.native_state = {"available": True, "phase": "idle", "revision": HEX_C,
+                             "active": 0, "pid": 123, "proof": None, "stopped": False}
+        self.config = {"configured_status": "sandboxed", "config_sha256": HEX_A}
+        self.edge_streams = []
+        self.native_active = []
+        self.fail_edge = None
+        self.fail_native = None
+        self.fail_edge_after = None
+        self.fail_native_after = None
+        self.fail_verify = False
+        self.available = True
+        self.scope = "owner-host"
+        self.runtime_verified = True
+        self.effective_mode = "sandboxed"
+        self.reason = None
+
+    @contextlib.contextmanager
+    def locked(self, *, wait_seconds=0):
+        self.calls.append("lock")
+        yield
+
+    @contextlib.contextmanager
+    def bounded(self, _seconds):
+        yield
+
+    def pending(self):
+        path = self.state / "transition.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def remove_model_journal(self):
+        (self.state / "transition.json").unlink()
+
+    def inspect(self, *, allow_installing=False):
+        self.discover(allow_installing=allow_installing)
+        return {"available": self.available, "configured_mode": "sandboxed",
+                "effective_mode": self.effective_mode,
+                "runtime_verified": self.runtime_verified,
+                "revision": HEX_A, "busy": bool(self.edge_state["streams"] or self.native_state["active"]),
+                "pending": False, "reason": self.reason, "scope": self.scope,
+                "_config": dict(self.config), "_native": dict(self.native_state),
+                "_edge": dict(self.edge_state)}
+
+    def discover(self, *, allow_installing=False):
+        self.calls.append("discover-installing" if allow_installing else "discover")
+
+    def edge(self, operation=None, token=None, revision=None):
+        self.calls.append("edge:" + (operation or "status"))
+        if operation and not (self.state / "transition.json").exists():
+            raise AssertionError("edge operation preceded durable journal")
+        if self.fail_edge is not None and self.fail_edge == operation:
+            raise AccessError("edge-test-failure")
+        if operation in ("acquire", "drain", "recover"):
+            self.edge_state["phase"] = "held"
+            if self.edge_streams:
+                self.edge_state["streams"] = self.edge_streams.pop(0)
+        elif operation == "release":
+            self.edge_state["phase"] = "idle"
+            self.edge_state["streams"] = 0
+            self.edge_state["revision"] = HEX_C
+        if self.fail_edge_after is not None and self.fail_edge_after == operation:
+            raise AccessError("edge-reply-lost")
+        return dict(self.edge_state)
+
+    def native(self, operation=None, token=None, *, timeout=60):
+        self.calls.append("native:" + (operation or "status"))
+        if operation and not (self.state / "transition.json").exists():
+            raise AssertionError("native operation preceded durable journal")
+        if self.fail_native is not None and self.fail_native == operation:
+            raise AccessError("native-test-failure")
+        if operation is None and self.native_active:
+            self.native_state["active"] = self.native_active.pop(0)
+            if self.native_state["active"] == 0:
+                self.native_state["phase"] = "idle"
+        if operation == "acquire":
+            if self.native_state["active"]:
+                raise AccessError("native-transition-busy-active-run")
+            self.native_state["phase"] = "held"
+        elif operation == "release":
+            self.native_state["phase"] = "idle"
+            self.native_state["active"] = 0
+        if self.fail_native_after is not None and self.fail_native_after == operation:
+            raise AccessError("native-reply-lost")
+        return dict(self.native_state)
+
+    def worker(self, operation="status", **_kwargs):
+        self.calls.append("worker")
+        return dict(self.config)
+
+    def verify_held_mode(self, token, mode):
+        self.calls.append("verify:" + mode)
+        if self.fail_verify:
+            raise AccessError("runtime-proof-failed")
+        if mode != "sandboxed" or len(token) != 64:
+            raise AccessError("verification-test-failure")
+
+
+def model_journal(phase="held"):
+    return {"kind": "model", "transaction_id": HEX_A, "token": HEX_B,
+            "phase": phase, "edge_revision": HEX_B,
+            "configured_mode": "sandboxed", "start_config_sha256": HEX_C}
+
+
+class ModelTransitionTests(unittest.TestCase):
+    def test_public_model_hold_does_not_claim_access_recovery_or_release_gates(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.model_begin()
+            original_calls = list(bridge.calls)
+            for phase in ("acquiring", "draining", "held", "finishing", "releasing", "native-released"):
+                journal = bridge.pending()
+                journal["phase"] = phase
+                (bridge.state / "transition.json").write_text(json.dumps(journal))
+                self.assertEqual(bridge.pending_reason(journal), "model-transition-pending")
+                with patch.object(bridge, "inspect", side_effect=AccessError("gateway-process-mismatch")):
+                    status = bridge.status()
+                self.assertFalse(status["available"])
+                self.assertFalse(status["runtime_verified"])
+                self.assertTrue(status["pending"])
+                self.assertEqual(status["reason"], "gateway-process-mismatch")
+            journal["phase"] = "error"
+            (bridge.state / "transition.json").write_text(json.dumps(journal))
+            self.assertEqual(bridge.pending_reason(journal), "model-transition-recovery-required")
+            self.assertEqual(bridge.pending_reason({"kind":"access"}), "transition-recovery-required")
+            journal.pop("token")
+            (bridge.state / "transition.json").write_text(json.dumps(journal))
+            self.assertEqual(bridge.pending_reason(journal), "transition-recovery-required")
+            self.assertEqual(bridge.calls, original_calls)
+
+    def test_abandoned_valid_journal_identifies_only_a_hold_and_preserves_inspection_failures(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.surface = "linux-systemd"
+            bridge.gateway_service = SimpleNamespace(pid=lambda: 123)
+            bridge.native_state["phase"] = bridge.edge_state["phase"] = "held"
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()))
+            # A journal left after its coordinator dies has no liveness proof.
+            with patch.object(bridge, "inspect", side_effect=lambda: SystemdAccessBridge.inspect(bridge)):
+                status = bridge.status()
+            self.assertTrue(status["available"])
+            self.assertTrue(status["pending"])
+            self.assertFalse(status["busy"])
+            self.assertFalse(status["runtime_verified"])
+            self.assertEqual(status["reason"], "model-transition-pending")
+            self.assertEqual(bridge.pending()["phase"], "held")
+            for reason in ("unsafe-host-lock", "gateway-process-mismatch", "admission-gate-unavailable"):
+                with patch.object(bridge, "inspect", side_effect=AccessError(reason)):
+                    failed = bridge.status()
+                self.assertFalse(failed["available"])
+                self.assertIsNone(failed["revision"])
+                self.assertEqual(failed["reason"], reason)
+            self.assertFalse(any(call in bridge.calls for call in ("edge:release", "native:release")))
+
+    def setUp(self):
+        def portable_atomic(path, value):
+            pathlib.Path(path).write_text(json.dumps(value), encoding="utf-8")
+        def portable_private(path, _uid, _maximum=1048576):
+            return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        self.atomic = patch("pixel_access_bridge.atomic_json", side_effect=portable_atomic)
+        self.private = patch("pixel_access_bridge.private_json", side_effect=portable_private)
+        self.atomic.start()
+        self.private.start()
+        self.addCleanup(self.atomic.stop)
+        self.addCleanup(self.private.stop)
+
+    def test_begin_journals_before_both_gates_and_drains(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.edge_streams = [1, 1, 0]
+            bridge.native_active = [1, 1, 0]
+            with patch("pixel_access_bridge.time.sleep", return_value=None):
+                result = bridge.model_begin()
+            pending = bridge.model_journal(result["transaction_id"])
+            self.assertEqual(result["status"], "held")
+            self.assertEqual(set(result), {"status", "transaction_id"})
+            self.assertNotEqual(result["transaction_id"], pending["token"])
+            self.assertEqual(pending["phase"], "held")
+            self.assertFalse(any(key in pending for key in ("ttl", "expires", "expires_at")))
+            self.assertIn("discover-installing", bridge.calls)
+            self.assertLess(bridge.calls.index("edge:drain"), bridge.calls.index("native:acquire"))
+            self.assertGreaterEqual(bridge.calls.count("edge:acquire"), 3)
+            self.assertGreater(
+                bridge.calls.index("verify:sandboxed"),
+                max(index for index, call in enumerate(bridge.calls)
+                    if call in ("edge:acquire", "native:acquire")),
+            )
+
+    def test_begin_closes_admission_and_drains_ordinary_busy_portal_turns(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.edge_state.update(phase="busy", streams=1)
+            bridge.native_state.update(phase="busy", active=1)
+            bridge.edge_streams = [1, 1, 0]
+            bridge.native_active = [1, 1, 0]
+            with patch("pixel_access_bridge.time.sleep", return_value=None):
+                result = bridge.model_begin()
+            self.assertEqual(result["status"], "held")
+            self.assertEqual(bridge.pending()["phase"], "held")
+            self.assertEqual(bridge.edge_state["streams"], 0)
+            self.assertEqual(bridge.native_state["active"], 0)
+            self.assertGreaterEqual(bridge.calls.count("edge:acquire"), 3)
+            self.assertGreaterEqual(bridge.calls.count("native:status"), 3)
+            self.assertLess(bridge.calls.index("edge:drain"), bridge.calls.index("native:acquire"))
+            self.assertNotIn("edge:release", bridge.calls)
+            self.assertNotIn("native:release", bridge.calls)
+
+    def test_busy_admission_does_not_adopt_held_or_interrupted_gates(self):
+        for surface in ("edge_state", "native_state"):
+            for phase in ("held", "interrupted"):
+                with self.subTest(surface=surface, phase=phase), tempfile.TemporaryDirectory() as root:
+                    bridge = FakeBridge(root)
+                    getattr(bridge, surface)["phase"] = phase
+                    with self.assertRaisesRegex(AccessError, "transition-recovery-required"):
+                        bridge.model_begin()
+                    self.assertIsNone(bridge.pending())
+                    self.assertNotIn("edge:acquire", bridge.calls)
+                    self.assertNotIn("native:acquire", bridge.calls)
+
+    def test_begin_reproofs_exact_stale_runtime_under_held_gates(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.runtime_verified = False
+            bridge.effective_mode = "unknown"
+            bridge.reason = "runtime-proof-required"
+            result = bridge.model_begin()
+            pending = bridge.model_journal(result["transaction_id"])
+            self.assertEqual(pending["phase"], "held")
+            self.assertEqual(bridge.edge_state["phase"], "held")
+            self.assertEqual(bridge.native_state["phase"], "held")
+            self.assertGreater(
+                bridge.calls.index("verify:sandboxed"),
+                max(bridge.calls.index("edge:acquire"),
+                    bridge.calls.index("native:acquire")),
+            )
+
+    def test_begin_rejects_ambiguous_missing_runtime_proof(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.runtime_verified = False
+            bridge.effective_mode = "unknown"
+            bridge.reason = "inspection-failed"
+            with self.assertRaisesRegex(AccessError, "runtime-proof-required"):
+                bridge.model_begin()
+            self.assertIsNone(bridge.pending())
+            self.assertNotIn("edge:acquire", bridge.calls)
+            self.assertNotIn("native:acquire", bridge.calls)
+
+    def test_begin_rejects_every_stale_runtime_shape_mismatch(self):
+        mismatches = {
+            "available": False,
+            "scope": "unknown",
+            "configured_mode": "unknown",
+            "effective_mode": "sandboxed",
+            "runtime_verified": True,
+            "busy": True,
+            "pending": True,
+            "reason": None,
+            "revision": "not-a-revision",
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as root:
+                bridge = FakeBridge(root)
+                snapshot = bridge.inspect()
+                snapshot.update({
+                    "effective_mode": "unknown",
+                    "runtime_verified": False,
+                    "reason": "runtime-proof-required",
+                })
+                snapshot[field] = value
+                with patch.object(bridge, "inspect", return_value=snapshot):
+                    with self.assertRaisesRegex(AccessError, "runtime-proof-required"):
+                        bridge.model_begin()
+                self.assertIsNone(bridge.pending())
+                self.assertNotIn("edge:acquire", bridge.calls)
+                self.assertNotIn("native:acquire", bridge.calls)
+
+    def test_begin_reproof_failure_keeps_both_gates_held(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.runtime_verified = False
+            bridge.effective_mode = "unknown"
+            bridge.reason = "runtime-proof-required"
+            bridge.fail_verify = True
+            with self.assertRaisesRegex(AccessError, "runtime-proof-failed"):
+                bridge.model_begin()
+            pending = bridge.pending()
+            self.assertEqual(pending["phase"], "error")
+            self.assertEqual(pending["error"], "runtime-proof-failed")
+            self.assertEqual(bridge.edge_state["phase"], "held")
+            self.assertEqual(bridge.native_state["phase"], "held")
+
+    def test_begin_failure_retains_root_journal(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            bridge.fail_edge = "drain"
+            with self.assertRaisesRegex(AccessError, "edge-test-failure"):
+                bridge.model_begin()
+            pending = bridge.pending()
+            self.assertEqual(pending["kind"], "model")
+            self.assertEqual(pending["phase"], "error")
+            self.assertEqual(pending["error"], "edge-test-failure")
+
+    def test_finish_reacquires_reproofs_and_releases(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result, {"status": "released", "outcome": "applied"})
+            self.assertFalse((bridge.state / "transition.json").exists())
+            self.assertTrue((bridge.state / "model-promotion-completed.json").exists())
+            self.assertIn("discover-installing", bridge.calls)
+            self.assertLess(bridge.calls.index("verify:sandboxed"), bridge.calls.index("native:release"))
+            self.assertLess(bridge.calls.index("native:release"), bridge.calls.index("edge:release"))
+
+    def test_promotion_completion_ignores_legacy_browser_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            legacy = bridge.state / "model-completed.json"
+            legacy.write_text(json.dumps({"transactionId": HEX_A, "outcome": "commit",
+                                          "configSha256": HEX_B}), encoding="utf-8")
+            self.assertIsNone(bridge.model_completion())
+            legacy.write_text(json.dumps({"transactionId": "bad", "outcome": "commit",
+                                          "configSha256": HEX_B}), encoding="utf-8")
+            with self.assertRaisesRegex(AccessError, "model-recovery-required"):
+                bridge.model_completion()
+
+    def test_promotion_completion_reads_legacy_and_prefers_namespaced_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            legacy = {"kind": "model-completion", "transaction_id": HEX_A,
+                      "outcome": "applied", "config_sha256": HEX_B}
+            (bridge.state / "model-completed.json").write_text(json.dumps(legacy), encoding="utf-8")
+            self.assertEqual(bridge.model_completion(), legacy)
+            current = {**legacy, "transaction_id": HEX_C}
+            (bridge.state / "model-promotion-completed.json").write_text(json.dumps(current), encoding="utf-8")
+            self.assertEqual(bridge.model_completion(), current)
+
+    def test_finish_replays_exact_root_completion_after_lost_socket_reply(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            expected = {"status": "released", "outcome": "applied"}
+            self.assertEqual(bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"}), expected)
+            releases = (bridge.calls.count("native:release"), bridge.calls.count("edge:release"))
+            self.assertEqual(bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"}), expected)
+            self.assertEqual((bridge.calls.count("native:release"), bridge.calls.count("edge:release")), releases)
+            with self.assertRaisesRegex(AccessError, "model-recovery-required"):
+                bridge.model_finish({"transaction_id": HEX_A, "outcome": "rolled-back"})
+
+    def test_finish_rejects_wrong_transaction_without_release(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            with self.assertRaisesRegex(AccessError, "model-transaction-mismatch"):
+                bridge.model_finish({"transaction_id": HEX_C, "outcome": "applied"})
+            self.assertTrue((bridge.state / "transition.json").exists())
+            self.assertNotIn("edge:release", bridge.calls)
+
+    def test_partial_release_failure_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            bridge.config["config_sha256"] = HEX_C
+            bridge.fail_native = "release"
+            with self.assertRaisesRegex(AccessError, "native-test-failure"):
+                bridge.model_finish({"transaction_id": HEX_A, "outcome": "rolled-back"})
+            pending = bridge.pending()
+            self.assertEqual(pending["phase"], "error")
+            self.assertEqual(bridge.native_state["phase"], "held")
+            self.assertEqual(bridge.edge_state["phase"], "held")
+            self.assertTrue((bridge.state / "transition.json").exists())
+
+    def test_cli_loads_the_root_custodied_client_only_at_runtime(self):
+        request = lambda *args: (200, {"status": "held", "transaction_id": HEX_A})
+        with patch("pixel_model_transition._load_request_access", return_value=request), \
+                patch("builtins.print") as output:
+            self.assertEqual(main(["begin"]), 0)
+        output.assert_called_once_with(HEX_A)
+
+    def test_model_status_is_read_only_and_never_discloses_gate_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            self.assertEqual(bridge.model_status(), {"pending": False})
+            journal = model_journal("error")
+            journal["error"] = "model-transition-failed"
+            path = bridge.state / "transition.json"
+            path.write_text(json.dumps(journal), encoding="utf-8")
+            before = path.read_bytes()
+            disclosed = bridge.model_status()
+            self.assertEqual(disclosed, {"pending": True, "kind": "model",
+                                         "transaction_id": HEX_A, "phase": "error",
+                                         "configured_mode": "sandboxed",
+                                         "start_config_sha256": HEX_C,
+                                         "error": "model-transition-failed"})
+            self.assertNotIn("token", disclosed)
+            self.assertNotIn("edge_revision", disclosed)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(bridge.calls, [])
+            journal["token"] = "not-a-token"
+            path.write_text(json.dumps(journal), encoding="utf-8")
+            with self.assertRaisesRegex(AccessError, "model-recovery-required"):
+                bridge.model_status()
+
+    def test_finish_recovers_native_released_error_before_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            journal = model_journal("error")
+            journal["error"] = "edge-test-failure"
+            (bridge.state / "transition.json").write_text(json.dumps(journal), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "idle"
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result["status"], "released")
+            self.assertIn("native:acquire", bridge.calls)
+            self.assertLess(bridge.calls.index("native:acquire"), bridge.calls.index("native:release"))
+
+    def test_finish_recovers_interrupted_edge(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "interrupted"
+            bridge.native_state["phase"] = "held"
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result["status"], "released")
+            self.assertIn("edge:recover", bridge.calls)
+
+    def test_finish_reacquires_interrupted_native_with_native_acquire(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "interrupted"
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result["status"], "released")
+            self.assertIn("native:acquire", bridge.calls)
+
+    def test_lost_release_replies_are_reconciled_from_idle_gates(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            bridge.fail_native_after = "release"
+            bridge.fail_edge_after = "release"
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result, {"status": "released", "outcome": "applied"})
+            self.assertFalse((bridge.state / "transition.json").exists())
+
+    def test_cleanup_failure_cannot_reclassify_verified_apply(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            bridge.remove_model_journal = lambda: (_ for _ in ()).throw(OSError("test cleanup"))
+            result = bridge.model_finish({"transaction_id": HEX_A, "outcome": "applied"})
+            self.assertEqual(result, {"status": "released", "outcome": "applied"})
+            self.assertEqual(bridge.pending()["error"], "journal-cleanup-failed")
+            self.assertEqual(bridge.native_state["phase"], "idle")
+            self.assertEqual(bridge.edge_state["phase"], "idle")
+
+    def test_rolled_back_finish_requires_original_config(self):
+        with tempfile.TemporaryDirectory() as root:
+            bridge = FakeBridge(root)
+            (bridge.state / "transition.json").write_text(json.dumps(model_journal()), encoding="utf-8")
+            bridge.edge_state["phase"] = "held"
+            bridge.native_state["phase"] = "held"
+            with self.assertRaisesRegex(AccessError, "rollback-config-mismatch"):
+                bridge.model_finish({"transaction_id": HEX_A, "outcome": "rolled-back"})
+            self.assertEqual(bridge.edge_state["phase"], "held")
+            self.assertEqual(bridge.native_state["phase"], "held")
+            self.assertTrue((bridge.state / "transition.json").exists())
+
+    def test_control_and_cli_contracts_are_bounded(self):
+        self.assertEqual(protocol.control_request({"operation": "model-status"}),
+                         {"operation": "model-status"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.control_request({"operation": "model-status", "request": {}})
+        self.assertEqual(protocol.control_request({"operation": "model-begin"}),
+                         {"operation": "model-begin"})
+        self.assertEqual(protocol.control_request({"operation": "model-route-status"}),
+                         {"operation": "model-route-status"})
+        route_begin = {"operation": "model-route-begin", "request": {
+            "revision": HEX_C, "transactionId": HEX_A}}
+        self.assertEqual(protocol.control_request(route_begin), route_begin)
+        route_finish = {"operation": "model-route-finish", "request": {
+            "transactionId": HEX_A, "outcome": "commit"}}
+        self.assertEqual(protocol.control_request(route_finish), route_finish)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.control_request({"operation": "model-route-begin"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.control_request({"operation": "model-route-finish", "request": {
+                "transaction_id": HEX_A, "outcome": "applied"}})
+        value = {"operation": "model-finish", "request": {
+            "transaction_id": HEX_A, "outcome": "applied"}}
+        self.assertEqual(protocol.control_request(value), value)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.control_request({"operation": "model-finish", "request": {
+                "transaction_id": HEX_A, "outcome": "release"}})
+        calls = []
+        self.assertEqual(execute("begin", request=lambda *args: (
+            calls.append(args) or (200, {"status": "held", "transaction_id": HEX_A}))), HEX_A)
+        self.assertEqual(calls, [("model-begin",)])
+        self.assertEqual(execute("finish", HEX_A, "applied", request=lambda *args: (
+            calls.append(args) or (200, {"status": "released", "outcome": "applied"}))), "released")
+        self.assertNotIn(HEX_B, repr(calls))
+        status_body = {"pending": True, "kind": "model", "transaction_id": HEX_A,
+                       "phase": "held", "configured_mode": "sandboxed",
+                       "start_config_sha256": HEX_C}
+        self.assertEqual(execute("status", request=lambda operation: (
+            200, status_body if operation == "model-status" else {})), status_body)
+        with self.assertRaisesRegex(RuntimeError, "model-transition-status-failed"):
+            execute("status", request=lambda _operation: (200, dict(status_body, token=HEX_B)))
+        with self.assertRaisesRegex(RuntimeError, "model-transition-status-failed") as failed:
+            execute("status", request=lambda _operation: (
+                200, dict(status_body, token=HEX_B, error=HEX_B)))
+        self.assertNotIn(HEX_B, str(failed.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

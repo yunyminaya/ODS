@@ -4,6 +4,7 @@ import {
   AlertCircle, CheckCircle2, Loader2, Mic, Paperclip, RefreshCw,
   Send, Volume2, VolumeX,
 } from 'lucide-react'
+import HelpLink from '../components/HelpLink'
 
 // Hermes likes to format with markdown (bold, lists, code). Rendering it as
 // HTML keeps the chat bubbles readable instead of showing raw `**` and `-`.
@@ -12,7 +13,9 @@ import {
 const MARKDOWN_COMPONENTS = {
   p: ({ children }) => <p className="break-words [&:not(:first-child)]:mt-3">{children}</p>,
   ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
-  ol: ({ children }) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
+  // Keep the list's start number: a reply of exactly "144." is a list that
+  // starts at 144 with an empty item, and dropping it showed a bare "1.".
+  ol: ({ children, start }) => <ol start={start} className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
   li: ({ children }) => <li className="break-words">{children}</li>,
   strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
   em: ({ children }) => <em className="italic">{children}</em>,
@@ -39,6 +42,56 @@ const welcomeMessage = {
 
 const TALK_STATUS_RETRY_MS = 1000
 
+// Known, expected state: the active model is not supported in Talk. The
+// catalog's per-entry `reason` is an internal fleet-QA note and is never
+// rendered here; the API's top-level `reason` is user copy only when
+// `reasonCode` says so, otherwise this fallback is shown.
+const MODEL_NOT_SUPPORTED_CODE = 'model_not_supported'
+const MODEL_NOT_SUPPORTED_MESSAGE = "This model isn't supported in ODS Talk yet. Switch to a recommended model to use ODS Talk."
+// A model that failed the tool check gets an advisory, never a block: no
+// probe result may lock an owner out of chat. Unknown codes are ignored.
+const TALK_TOOLS_ADVISORY_CODE = 'tools-unavailable'
+const TALK_TOOLS_ADVISORY_MESSAGE = 'This model failed the tool-call check. Talk can still chat, but actions that need tools may fail.'
+const TALK_BLOCKING_COMPATIBILITY_STATUSES = new Set([
+  'blocked',
+  'incompatible',
+  'not_agent_viable',
+  'not_recommended',
+  'not_supported',
+  'unsupported',
+  'unsupported_until_revalidated',
+])
+
+function getModelCompatibilityNotice(data) {
+  const compatibility = data?.modelCompatibility || {}
+  const coded = data?.reasonCode === MODEL_NOT_SUPPORTED_CODE
+  const blocked = coded
+    // Older APIs sent a compatibility block as a bare `reason` string.
+    || (!data?.reasonCode && Boolean(data?.reason))
+    || ['hermesTalk', 'agentViability'].some(key =>
+      TALK_BLOCKING_COMPATIBILITY_STATUSES.has(String(compatibility[key]?.status || '').toLowerCase()))
+  if (!blocked) return null
+  const message = coded && typeof data.reason === 'string' && data.reason.trim()
+    ? data.reason.trim()
+    : MODEL_NOT_SUPPORTED_MESSAGE
+  const recommended = compatibility.recommendedModel
+  return {
+    message,
+    recommendedModel: typeof recommended?.name === 'string' && recommended.name.trim()
+      ? recommended.name.trim()
+      : null,
+  }
+}
+
+// Talk can be served from talk.<device>.local, where every path renders Talk;
+// the model picker lives on the matching dashboard host.
+function modelsPageUrl() {
+  if (typeof window === 'undefined') return '/models'
+  const { protocol, hostname, port } = window.location
+  if (!hostname.startsWith('talk.')) return '/models'
+  return `${protocol}//dashboard.${hostname.slice('talk.'.length)}${port ? `:${port}` : ''}/models`
+}
+
 function makeId(prefix) {
   if (globalThis.crypto?.randomUUID) return `${prefix}-${globalThis.crypto.randomUUID()}`
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -49,11 +102,23 @@ async function parseError(resp, fallback) {
   return body.detail || fallback || `Request failed: ${resp.status}`
 }
 
+// Hermes ends failed and interrupted turns with the same terminal reply as
+// answers; its status tells them apart. No status keeps the legacy
+// successful-completion contract. Returns the error text, or null on success.
+function failedOutcomeMessage(status) {
+  if (status == null || status === '' || status === 'ok' || status === 'complete') return null
+  if (status === 'interrupted') return 'The response was interrupted before it finished.'
+  if (status === 'error') return 'Hermes reported an error before finishing the response.'
+  return 'The response ended with an unrecognized outcome.'
+}
+
 export default function ODSTalk() {
   const [messages, setMessages] = useState([welcomeMessage])
   const [input, setInput] = useState('')
   const [status, setStatus] = useState('loading')
   const [statusText, setStatusText] = useState('Connecting to ODS Talk...')
+  const [compatibilityNotice, setCompatibilityNotice] = useState(null)
+  const [toolsAdvisory, setToolsAdvisory] = useState(false)
   const [retryStatusRefresh, setRetryStatusRefresh] = useState(false)
   // Advances after every offline retry so the polling effect re-arms; a
   // repeated failure otherwise leaves every dependency unchanged.
@@ -81,8 +146,10 @@ export default function ODSTalk() {
   const bottomRef = useRef(null)
   const fileInputRef = useRef(null)
   const recorderRef = useRef(null)
-  const recordingChunksRef = useRef([])
   const streamControllerRef = useRef(null)
+  // React state disables the buttons visibly; this synchronous guard closes
+  // the smaller window before that state update paints.
+  const approvalRequestsRef = useRef(new Set())
   // Track the currently-playing TTS state so we can shut down whatever
   // is in flight before starting the next reply's audio.
   const activeSpeechRef = useRef(null)
@@ -127,19 +194,31 @@ export default function ODSTalk() {
       }
       if (!resp.ok) throw new Error(await parseError(resp, 'ODS Talk is not ready.'))
       const data = await resp.json()
+      // Shown only while Talk is ready; it never changes the status.
+      setToolsAdvisory(data.modelCompatibility?.hermesTalkAdvisory?.code === TALK_TOOLS_ADVISORY_CODE)
       const capabilities = data.capabilities || {}
-      const compatibilityReason = data.reason || data.modelCompatibility?.hermesTalk?.reason || ''
       setVoiceState({
         tts: Boolean(capabilities.tts),
         audioMessage: Boolean(capabilities.audio_message),
         liveMic: Boolean(liveMicSupported && capabilities.audio_message),
       })
       if (!capabilities.text_chat) {
+        const notice = getModelCompatibilityNotice(data)
+        if (notice) {
+          // Expected, known state rather than an outage: no polling, no alarm.
+          setCompatibilityNotice(notice)
+          setStatus('unsupported')
+          setStatusText('Model not supported in Talk')
+          setRetryStatusRefresh(false)
+          return
+        }
+        setCompatibilityNotice(null)
         setStatus('offline')
-        setStatusText(compatibilityReason || 'ODS Talk text chat is not available.')
-        setRetryStatusRefresh(!compatibilityReason)
+        setStatusText('ODS Talk text chat is not available.')
+        setRetryStatusRefresh(true)
         return
       }
+      setCompatibilityNotice(null)
       setStatus('ready')
       setStatusText('Ready')
       setRetryStatusRefresh(false)
@@ -364,13 +443,59 @@ export default function ODSTalk() {
     }
   }, [spokenReplies, voiceState.tts, stopActiveSpeech])
 
+  const submitApproval = useCallback(async (messageId, choice) => {
+    if (!['once', 'deny'].includes(choice) || approvalRequestsRef.current.has(messageId)) return
+    approvalRequestsRef.current.add(messageId)
+    setMessages(items => items.map(item =>
+      item.id === messageId && item.approval
+        ? { ...item, approval: { ...item.approval, responding: true, error: null } }
+        : item,
+    ))
+
+    try {
+      const resp = await fetch('/api/talk/approval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ choice }),
+      })
+      if (resp.status === 401) {
+        setStatus('expired')
+        setStatusText('Session expired. Scan the owner card again.')
+        throw new Error('Session expired.')
+      }
+      if (!resp.ok) throw new Error(await parseError(resp, 'Approval response failed.'))
+
+      setMessages(items => items.map(item =>
+        item.id === messageId
+          ? { ...item, approval: null, statusLabel: null, statusTool: null, statusDetail: null }
+          : item,
+      ))
+    } catch (err) {
+      setMessages(items => items.map(item =>
+        item.id === messageId && item.approval
+          ? {
+              ...item,
+              approval: {
+                ...item.approval,
+                responding: false,
+                error: err.message || 'Approval response failed.',
+              },
+            }
+          : item,
+      ))
+    } finally {
+      approvalRequestsRef.current.delete(messageId)
+    }
+  }, [])
+
   const sendText = useCallback(async (text, { transcriptId = null, attachment = null } = {}) => {
     const clean = text.trim()
     // Allow an attachment with no text — the backend supplies a default
     // prompt for images ("Describe what you see in this image."). Without
     // either a caption or an attachment, there's nothing to send.
     if (!clean && !attachment) return
-    if (sending || status !== 'ready') return
+    if (sending || recorderRef.current || status !== 'ready') return
     setSending(true)
 
     const userId = transcriptId || makeId('user')
@@ -405,6 +530,9 @@ export default function ODSTalk() {
     let assembled = ''
     let finalWarning = null
     let errorDetail = null
+    let completed = false
+    let streamDone = false
+    let reader
 
     // AbortController so navigating away / re-sending mid-flight cancels the
     // in-flight stream. Server-side the bridge stops pulling from llama-server
@@ -444,17 +572,20 @@ export default function ODSTalk() {
         throw new Error('Session expired.')
       }
       if (!resp.ok || !resp.body) {
+        // 409: the active model changed and is not supported in Talk. The
+        // detail is user copy; refresh so the notice replaces the composer.
+        if (resp.status === 409) refreshStatus()
         throw new Error(await parseError(resp, 'Hermes did not answer.'))
       }
 
-      const reader = resp.body.getReader()
+      reader = resp.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
       // SSE frames are separated by a blank line (\n\n). Buffer partial frames
       // across reads — chunked transport can split mid-frame. Lines starting
       // with ``:`` are SSE comments (keepalives); we discard them by filtering
       // for ``data:`` only below.
-      while (true) {
+      while (!streamDone) {
         const { value, done } = await reader.read()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
@@ -480,7 +611,7 @@ export default function ODSTalk() {
             // render the accumulated text rather than a spinner.
             setMessages(items => items.map(item =>
               item.id === assistantId
-                ? { ...item, text: snapshot, status: 'pending', statusLabel: null, statusTool: null, statusDetail: null }
+                ? { ...item, text: snapshot, status: 'pending', statusLabel: null, statusTool: null, statusDetail: null, approval: null }
                 : item,
             ))
           } else if (payload.type === 'status') {
@@ -495,20 +626,52 @@ export default function ODSTalk() {
                 ? { ...item, statusLabel: label, statusTool: tool, statusDetail: detail }
                 : item,
             ))
+          } else if (payload.type === 'done') {
+            streamDone = true
+            break
           } else if (payload.type === 'complete') {
-            if (typeof payload.text === 'string' && payload.text) assembled = payload.text
+            // Hermes uses this terminal event for failed/interrupted turns too.
+            const failure = failedOutcomeMessage(payload.status)
+            if (typeof payload.text === 'string' && payload.text && (!failure || !assembled)) {
+              assembled = payload.text
+            }
             finalWarning = payload.warning || null
+            if (failure) {
+              // Terminal cancellation metadata must not replace useful deltas.
+              errorDetail = failure
+            } else {
+              completed = true
+            }
           } else if (payload.type === 'error') {
             errorDetail = payload.detail || 'Hermes did not finish the response.'
+          } else if (payload.type === 'approval') {
+            const command = typeof payload.command === 'string' ? payload.command : ''
+            const description = typeof payload.description === 'string' ? payload.description : ''
+            setMessages(items => items.map(item =>
+              item.id === assistantId
+                ? {
+                    ...item,
+                    approval: {
+                      command,
+                      description,
+                      responding: false,
+                      error: null,
+                    },
+                  }
+                : item,
+            ))
           }
         }
       }
 
       if (errorDetail) throw new Error(errorDetail)
+      // A closed connection is not a completion receipt. Keep received text
+      // for recovery, but never announce or speak an interrupted answer.
+      if (!completed) throw new Error('The response ended before it was complete. Retry the message when the connection is available.')
       const reply = assembled || 'I did not get a response back.'
       setMessages(items => items.map(item =>
         item.id === assistantId
-          ? { ...item, text: reply, status: 'done', warning: finalWarning }
+          ? { ...item, text: reply, status: 'done', warning: finalWarning, approval: null }
           : item,
       ))
       speak(reply)
@@ -519,17 +682,23 @@ export default function ODSTalk() {
       } else {
         setMessages(items => items.map(item =>
           item.id === assistantId
-            ? { ...item, text: err.message || 'Something went wrong.', status: 'error' }
+            ? { ...item, text: assembled, errorDetail: err.message || 'Something went wrong.', status: 'error', approval: null }
             : item,
         ))
       }
     } finally {
+      // `done` is the protocol boundary even if the HTTP socket stays open.
+      // Cancel unread bytes and release the lock on success and failure.
+      if (reader) {
+        void reader.cancel?.().catch(() => {})
+        reader.releaseLock?.()
+      }
       if (streamControllerRef.current === controller) {
         streamControllerRef.current = null
       }
       setSending(false)
     }
-  }, [sending, speak, status])
+  }, [refreshStatus, sending, speak, status])
 
   const sendAudioFile = useCallback(async (file) => {
     if (!file || sending || status === 'expired') return
@@ -555,11 +724,27 @@ export default function ODSTalk() {
         setStatusText('Session expired. Scan the owner card again.')
         throw new Error('Session expired.')
       }
-      if (!resp.ok) throw new Error(await parseError(resp, 'Voice message could not be sent.'))
+      if (!resp.ok) {
+        if (resp.status === 409) refreshStatus()
+        throw new Error(await parseError(resp, 'Voice message could not be sent.'))
+      }
       const data = await resp.json()
+      const transcript = data.transcript || 'Voice message'
+      // The bridge passes Hermes' turn status through, as on the text path.
+      // A failed or interrupted turn keeps what Hermes returned, is never
+      // spoken, and offers Retry, which resends the transcript as text.
+      const failure = failedOutcomeMessage(data.status)
+      if (failure) {
+        setMessages(items => items.map(item => {
+          if (item.id === userId) return { ...item, text: transcript, status: 'done' }
+          if (item.id === assistantId) return { ...item, text: data.text || '', errorDetail: failure, status: 'error' }
+          return item
+        }))
+        return
+      }
       const reply = data.text || 'I did not get a response back.'
       setMessages(items => items.map(item => {
-        if (item.id === userId) return { ...item, text: data.transcript || 'Voice message', status: 'done' }
+        if (item.id === userId) return { ...item, text: transcript, status: 'done' }
         if (item.id === assistantId) return { ...item, text: reply, status: 'done', warning: data.warning || null }
         return item
       }))
@@ -573,38 +758,71 @@ export default function ODSTalk() {
     } finally {
       setSending(false)
     }
-  }, [sending, speak, status])
+  }, [refreshStatus, sending, speak, status])
+
+  // Each permission request owns its recorder, tracks and callbacks. Removing
+  // that identity cancels capture even when browser permission resolves later.
+  useEffect(() => () => {
+    const capture = recorderRef.current
+    recorderRef.current = null
+    if (!capture) return
+    if (capture.recorder) {
+      capture.recorder.ondataavailable = null
+      capture.recorder.onstop = null
+      if (capture.recorder.state !== 'inactive') {
+        try { capture.recorder.stop() } catch { /* tracks still need releasing */ }
+      }
+    }
+    capture.stream?.getTracks().forEach(track => track.stop())
+  }, [])
 
   const startRecording = async () => {
-    if (!voiceState.liveMic || recording || sending) return
+    if (!voiceState.liveMic || recorderRef.current || sending) return
+    const capture = { stream: null, recorder: null, chunks: [] }
+    recorderRef.current = capture
+    setRecording(true)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (recorderRef.current !== capture) {
+        stream.getTracks().forEach(track => track.stop())
+        return
+      }
+      capture.stream = stream
       const recorder = new MediaRecorder(stream)
-      recordingChunksRef.current = []
+      capture.recorder = recorder
       recorder.ondataavailable = event => {
-        if (event.data?.size) recordingChunksRef.current.push(event.data)
+        if (recorderRef.current === capture && event.data?.size) capture.chunks.push(event.data)
       }
       recorder.onstop = () => {
         stream.getTracks().forEach(track => track.stop())
-        const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+        if (recorderRef.current !== capture) return
+        recorderRef.current = null
+        setRecording(false)
+        const blob = new Blob(capture.chunks, { type: recorder.mimeType || 'audio/webm' })
         if (blob.size > 0) {
           sendAudioFile(new File([blob], 'recording.webm', { type: blob.type || 'audio/webm' }))
         }
       }
-      recorderRef.current = recorder
       recorder.start()
-      setRecording(true)
     } catch {
+      capture.stream?.getTracks().forEach(track => track.stop())
+      if (recorderRef.current !== capture) return
+      recorderRef.current = null
+      setRecording(false)
       setVoiceState(current => ({ ...current, liveMic: false }))
     }
   }
 
   const stopRecording = () => {
-    const recorder = recorderRef.current
-    if (!recorder || recorder.state === 'inactive') return
-    recorder.stop()
-    recorderRef.current = null
-    setRecording(false)
+    const capture = recorderRef.current
+    if (!capture) return
+    if (!capture.recorder) {
+      // Permission is still pending; its eventual stream must be discarded.
+      recorderRef.current = null
+      setRecording(false)
+      return
+    }
+    if (capture.recorder.state !== 'inactive') capture.recorder.stop()
   }
 
   const handleAttachmentPicked = useCallback((file) => {
@@ -642,19 +860,19 @@ export default function ODSTalk() {
 
   // Send is enabled either with text OR an attachment (an image alone is a
   // valid message — the model gets a default "describe this" prompt).
-  const canSend = (input.trim().length > 0 || pendingAttachment) && !sending && status === 'ready'
+  const canSend = (input.trim().length > 0 || pendingAttachment) && !sending && !recording && status === 'ready'
 
   return (
-    <div className="min-h-dvh bg-[#f8faf8] text-zinc-950 antialiased">
+    <div className="pixel-app ods-talk min-h-dvh bg-theme-bg text-theme-text antialiased">
       <div className="mx-auto flex min-h-dvh w-full max-w-2xl flex-col">
-        <header className="sticky top-0 z-10 border-b border-zinc-200 bg-[#f8faf8]/95 px-4 py-3 backdrop-blur">
+        <header className="sticky top-0 z-10 border-b border-theme-border bg-theme-bg px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h1 className="text-base font-semibold leading-tight tracking-normal">ODS Talk</h1>
               <div className="mt-1 flex items-center gap-1.5 text-xs text-zinc-500">
                 {status === 'ready' ? <CheckCircle2 size={13} className="text-emerald-600" /> : null}
                 {status === 'loading' ? <Loader2 size={13} className="animate-spin" /> : null}
-                {status === 'offline' || status === 'expired' ? <AlertCircle size={13} className="text-amber-600" /> : null}
+                {status === 'offline' || status === 'expired' || status === 'unsupported' ? <AlertCircle size={13} className="text-theme-text-secondary" /> : null}
                 <span>{statusText}</span>
               </div>
             </div>
@@ -686,15 +904,59 @@ export default function ODSTalk() {
         <main className="flex-1 overflow-y-auto px-4 py-4">
           <div className="space-y-3">
             {messages.map(message => (
-              <MessageBubble key={message.id} message={message} />
+              <MessageBubble
+                key={message.id}
+                message={message}
+                onApproval={choice => submitApproval(message.id, choice)}
+              />
             ))}
             <div ref={bottomRef} />
           </div>
         </main>
 
         {status === 'expired' && (
-          <div className="mx-4 mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          <div className="mx-4 mb-3 rounded-lg border border-theme-border bg-theme-card/80 px-3 py-2 text-sm text-theme-text-secondary">
             This owner session ended. Scan the owner card again to continue.
+          </div>
+        )}
+
+        {status === 'unsupported' && compatibilityNotice && (
+          <div
+            role="status"
+            data-testid="talk-model-notice"
+            className="mx-4 mb-3 rounded-lg border border-theme-border bg-theme-card/80 px-3 py-2 text-sm text-theme-text-secondary"
+          >
+            <p>{compatibilityNotice.message}</p>
+            {compatibilityNotice.recommendedModel && (
+              <p className="mt-1">
+                Recommended: <span className="font-medium text-theme-text">{compatibilityNotice.recommendedModel}</span>
+              </p>
+            )}
+            <a
+              href={modelsPageUrl()}
+              className="mt-2 inline-block font-medium text-theme-text underline decoration-zinc-400 underline-offset-2"
+            >
+              Choose a model
+            </a>
+          </div>
+        )}
+
+        {status === 'ready' && toolsAdvisory && (
+          <div
+            role="status"
+            data-testid="talk-tools-notice"
+            className="mx-4 mb-3 rounded-lg border border-theme-border bg-theme-card/80 px-3 py-2 text-sm text-theme-text-secondary"
+          >
+            <p>{TALK_TOOLS_ADVISORY_MESSAGE}</p>
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+              <a
+                href={modelsPageUrl()}
+                className="inline-block font-medium text-theme-text underline decoration-zinc-400 underline-offset-2"
+              >
+                Choose a model
+              </a>
+              <HelpLink className="text-xs" />
+            </div>
           </div>
         )}
 
@@ -710,7 +972,7 @@ export default function ODSTalk() {
           </div>
         )}
 
-        <form onSubmit={submit} className="sticky bottom-0 border-t border-zinc-200 bg-[#f8faf8]/95 p-3 backdrop-blur">
+        <form onSubmit={submit} className="sticky bottom-0 bg-theme-bg p-3">
           {/* Attachment preview strip — appears above the input bar between
               pick and send. Shows a thumbnail for images, a generic icon for
               text/code files, with an X to discard. */}
@@ -756,7 +1018,7 @@ export default function ODSTalk() {
               onKeyDown={event => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
-                  if (canSend) sendText(input)
+                  if (canSend) submit(event)
                 }
               }}
               rows={1}
@@ -801,7 +1063,7 @@ export default function ODSTalk() {
   )
 }
 
-function MessageBubble({ message }) {
+function MessageBubble({ message, onApproval }) {
   const user = message.role === 'user'
   return (
     <div className={`flex ${user ? 'justify-end' : 'justify-start'}`}>
@@ -814,7 +1076,47 @@ function MessageBubble({ message }) {
               : 'rounded-bl-md border border-zinc-200 bg-white text-zinc-900'
         }`}
       >
-        {message.status === 'pending' && !message.text ? (
+        {message.approval ? (
+          <div className="space-y-3" aria-live="polite">
+            {message.text && (
+              <div className="space-y-0 text-[15px] leading-6">
+                <ReactMarkdown components={MARKDOWN_COMPONENTS}>{message.text}</ReactMarkdown>
+              </div>
+            )}
+            <div>
+              <p className="font-medium text-zinc-900">Permission required</p>
+              {message.approval.description && (
+                <p className="mt-1 text-sm text-zinc-600">{message.approval.description}</p>
+              )}
+              {message.approval.command && (
+                <code className="mt-2 block whitespace-pre-wrap break-all rounded-lg bg-zinc-100 px-2.5 py-2 text-xs text-zinc-800">
+                  {message.approval.command}
+                </code>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => onApproval('once')}
+                disabled={message.approval.responding}
+                className="rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-white disabled:cursor-wait disabled:opacity-50"
+              >
+                Allow once
+              </button>
+              <button
+                type="button"
+                onClick={() => onApproval('deny')}
+                disabled={message.approval.responding}
+                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 disabled:cursor-wait disabled:opacity-50"
+              >
+                Deny
+              </button>
+            </div>
+            {message.approval.error && (
+              <p className="text-xs text-red-600" role="alert">{message.approval.error}</p>
+            )}
+          </div>
+        ) : message.status === 'pending' && !message.text ? (
           // While the assistant is working but hasn't streamed any tokens
           // yet, the spinner shows a dynamic caption sourced from the
           // bridge's tool events ("Searching the web…", "Running code…",
@@ -855,8 +1157,13 @@ function MessageBubble({ message }) {
             <ReactMarkdown components={MARKDOWN_COMPONENTS}>{message.text}</ReactMarkdown>
           </div>
         )}
+        {message.errorDetail && (
+          <p className="mt-2 whitespace-pre-wrap break-words" role="alert">
+            {message.errorDetail} <HelpLink className="text-xs" />
+          </p>
+        )}
         {message.warning && (
-          <p className="mt-2 text-xs text-amber-600">{message.warning}</p>
+          <p className="mt-2 text-xs text-theme-text-secondary">{message.warning}</p>
         )}
       </div>
     </div>

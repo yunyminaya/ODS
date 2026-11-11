@@ -5,9 +5,10 @@
 # Part of: installers/lib/
 # Purpose: Map hardware tier to model name, GGUF file, URL, and context size
 #
-# Expects: TIER (set by detection phase), error()
+# Expects: TIER (set by detection phase), error(), jq (compute image map)
 # Provides: resolve_tier_config() → sets TIER_NAME, LLM_MODEL, GGUF_FILE,
-#           GGUF_URL, MAX_CONTEXT
+#           GGUF_URL, MAX_CONTEXT;
+#           ods_nvidia_llama_image_for_compute(), ods_llama_image_for_compute_cap()
 #
 # Modder notes:
 #   Add new tiers or change model assignments here.
@@ -46,17 +47,55 @@ configure_llama_runtime_defaults() {
             # Gemma 4 GGUFs require a newer llama.cpp than the legacy ODS pin.
             # Keep this aligned with docker-compose.nvidia.yml so the installer
             # pre-pulls the same image compose will start.
-            LLAMA_SERVER_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda-b9014"
+            LLAMA_SERVER_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda-b11429@sha256:883915ea20a4b350e98f7284098f4d400c21e9b366e248d397cd42d90602a84c"
+            # Native installers remain on their separately pinned release.
             LLAMA_CPP_RELEASE_TAG_OVERRIDE="b9014"
             ;;
     esac
+}
+
+# llama.cpp's NVIDIA images server-cuda-* and server-cuda12-* are CUDA 12
+# builds. They have no kernels for compute capability 12.1 (DGX Spark GB10,
+# RTX Spark N1X): llama-server loads there and answers with "????". The CUDA
+# 13 build (server-cuda13-*) has them. config/backends/nvidia.json
+# runtime.llama_server.container_images_by_compute pins the image such a GPU
+# runs; the host agent applies the same map on Models-page switches.
+
+# ods_nvidia_llama_image_for_compute <compute_cap> <nvidia.json>
+# Prints the image pinned for that compute capability, or nothing.
+ods_nvidia_llama_image_for_compute() {
+    local compute_cap="$1" contract="$2"
+    [[ -n "$compute_cap" ]] || return 0
+    jq -r --arg cc "$compute_cap" \
+        '.runtime.llama_server.container_images_by_compute[$cc] // empty' "$contract"
+}
+
+# ods_llama_image_for_compute_cap <image> <compute image>
+# Prints the image llama-server runs. A non-empty <compute image> replaces a
+# CUDA 12 llama.cpp build and the empty value (the Compose default is a CUDA
+# 12 build). A CUDA 13 build, another backend's image and an owner's own
+# image are kept.
+ods_llama_image_for_compute_cap() {
+    local image="$1" compute_image="$2"
+    # The repository stays a variable so the pin contract does not read
+    # these patterns as unpinned image references.
+    local repo="ghcr.io/ggml-org/llama.cpp"
+    if [[ -n "$compute_image" ]]; then
+        case "$image" in
+            ""|"$repo":server-cuda-*|"$repo":server-cuda12-*)
+                printf '%s\n' "$compute_image"
+                return 0
+                ;;
+        esac
+    fi
+    printf '%s\n' "$image"
 }
 
 set_qwen_tier_config() {
     case $TIER in
         CLOUD)
             TIER_NAME="Cloud (API)"
-            LLM_MODEL="anthropic/claude-sonnet-4-5-20250514"
+            LLM_MODEL="anthropic/claude-sonnet-4-6"
             GGUF_FILE=""
             GGUF_URL=""
             GGUF_SHA256=""
@@ -69,7 +108,7 @@ set_qwen_tier_config() {
             TIER_NAME="Intel Arc"
             LLM_MODEL="qwen3.5-9b"
             GGUF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf"
             GGUF_SHA256="03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
             MAX_CONTEXT=32768
             LLM_MODEL_SIZE_MB=5760    # Qwen3.5-9B-Q4_K_M (5.68 GB)
@@ -82,7 +121,7 @@ set_qwen_tier_config() {
             TIER_NAME="Intel Arc Lite"
             LLM_MODEL="qwen3.5-4b"
             GGUF_FILE="Qwen3.5-4B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf"
             GGUF_SHA256="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
             MAX_CONTEXT=16384
             LLM_MODEL_SIZE_MB=2870    # Qwen3.5-4B-Q4_K_M (2.74 GB)
@@ -93,7 +132,7 @@ set_qwen_tier_config() {
             TIER_NAME="NVIDIA Ultra (90GB+)"
             LLM_MODEL="qwen3-coder-next"
             GGUF_FILE="qwen3-coder-next-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/ce09c67b53bc8739eef83fe67b2f5d293c270632/Qwen3-Coder-Next-Q4_K_M.gguf"
             GGUF_SHA256="9e6032d2f3b50a60f17ce8bf5a1d85c71af9b53b89c7978020ae7c660f29b090"
             MAX_CONTEXT=131072
             LLM_MODEL_SIZE_MB=48500   # 48.5 GB per HF file listing
@@ -110,7 +149,7 @@ set_qwen_tier_config() {
                 TIER_NAME="NVIDIA Ultra (90GB+, aarch64 — A3B substitution)"
                 LLM_MODEL="qwen3.6-35b-a3b"
                 GGUF_FILE="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-                GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+                GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
                 GGUF_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
                 MAX_CONTEXT=131072
                 LLM_MODEL_SIZE_MB=21110
@@ -131,26 +170,28 @@ set_qwen_tier_config() {
             TIER_NAME="Strix Halo 90+"
             LLM_MODEL="qwen3.6-35b-a3b"
             GGUF_FILE="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
             GGUF_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
             MAX_CONTEXT=131072
             LLM_MODEL_SIZE_MB=21110   # 21.1 GB UD-Q4_K_M per HF file listing
             ;;
         SH_COMPACT)
+            # Qwen3-30B-A3B was served here at 131K against a native 40,960;
+            # Qwen3.6-35B-A3B needs about 23.8 GiB at 128K.
             TIER_NAME="Strix Halo Compact"
-            LLM_MODEL="qwen3-30b-a3b"
-            GGUF_FILE="Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_SHA256="9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48"
+            LLM_MODEL="qwen3.6-35b-a3b"
+            GGUF_FILE="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
             MAX_CONTEXT=131072
-            LLM_MODEL_SIZE_MB=18600   # 18.6 GB per HF file listing
+            LLM_MODEL_SIZE_MB=21110   # 21.1 GB UD-Q4_K_M per HF file listing
             ;;
         0)
             TIER_NAME="Lightweight"
             LLM_MODEL="qwen3.5-2b"
             GGUF_FILE="Qwen3.5-2B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf"
+            GGUF_SHA256="aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
             MAX_CONTEXT=8192
             LLM_MODEL_SIZE_MB=1221    # Qwen3.5-2B-Q4_K_M (1,280,835,840 bytes)
             ;;
@@ -158,7 +199,7 @@ set_qwen_tier_config() {
             TIER_NAME="Entry Level"
             LLM_MODEL="qwen3.5-9b"
             GGUF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf"
             GGUF_SHA256="03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
             MAX_CONTEXT=16384
             LLM_MODEL_SIZE_MB=5760    # Qwen3.5-9B-Q4_K_M (5.68 GB)
@@ -167,28 +208,28 @@ set_qwen_tier_config() {
             TIER_NAME="Prosumer"
             LLM_MODEL="qwen3.5-9b"
             GGUF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf"
             GGUF_SHA256="03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
             MAX_CONTEXT=32768
             LLM_MODEL_SIZE_MB=5760    # Qwen3.5-9B-Q4_K_M (5.68 GB)
             ;;
         3)
             TIER_NAME="Pro"
-            LLM_MODEL="qwen3-30b-a3b"
-            GGUF_FILE="Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_SHA256="9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48"
-            MAX_CONTEXT=32768
-            LLM_MODEL_SIZE_MB=18600   # Qwen3-30B-A3B-Q4_K_M MoE (18.6 GB)
+            LLM_MODEL="qwen3.5-27b"
+            GGUF_FILE="Qwen3.5-27B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/3221f178a6b842d04f1fb42f1c413534adcc0a6a/Qwen3.5-27B-Q4_K_M.gguf"
+            GGUF_SHA256="84b5f7f112156d63836a01a69dc3f11a6ba63b10a23b8ca7a7efaf52d5a2d806"
+            MAX_CONTEXT=65536
+            LLM_MODEL_SIZE_MB=16700   # Qwen3.5-27B-Q4_K_M (16.7 GB), the fleet 24-32 GB default
             ;;
         4)
             TIER_NAME="Enterprise"
-            LLM_MODEL="qwen3-30b-a3b"
-            GGUF_FILE="Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
-            GGUF_SHA256="9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48"
+            LLM_MODEL="qwen3.6-35b-a3b"
+            GGUF_FILE="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_SHA256="ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
             MAX_CONTEXT=131072
-            LLM_MODEL_SIZE_MB=18600   # 18.6 GB per HF file listing
+            LLM_MODEL_SIZE_MB=21110   # 21.1 GB UD-Q4_K_M per HF file listing
             ;;
         *)
             error "Invalid tier: $TIER. Valid tiers: 0, 1, 2, 3, 4, CLOUD, NV_ULTRA, SH_LARGE, SH_COMPACT, ARC, ARC_LITE"
@@ -201,7 +242,7 @@ set_gemma4_tier_config() {
     case $TIER in
         CLOUD)
             TIER_NAME="Cloud (API)"
-            LLM_MODEL="anthropic/claude-sonnet-4-5-20250514"
+            LLM_MODEL="anthropic/claude-sonnet-4-6"
             GGUF_FILE=""
             GGUF_URL=""
             GGUF_SHA256=""
@@ -212,10 +253,10 @@ set_gemma4_tier_config() {
             TIER_NAME="Intel Arc"
             LLM_MODEL="gemma-4-e4b-it"
             GGUF_FILE="gemma-4-E4B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3/gemma-4-E4B-it-Q4_K_M.gguf"
+            GGUF_SHA256="85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"
             MAX_CONTEXT=32768
-            LLM_MODEL_SIZE_MB=5340
+            LLM_MODEL_SIZE_MB=4747
             GPU_BACKEND="sycl"
             N_GPU_LAYERS=99
             ;;
@@ -223,10 +264,10 @@ set_gemma4_tier_config() {
             TIER_NAME="Intel Arc Lite"
             LLM_MODEL="gemma-4-e2b-it"
             GGUF_FILE="gemma-4-E2B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf"
+            GGUF_SHA256="740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"
             MAX_CONTEXT=16384
-            LLM_MODEL_SIZE_MB=2810
+            LLM_MODEL_SIZE_MB=2963
             GPU_BACKEND="sycl"
             N_GPU_LAYERS=99
             ;;
@@ -234,36 +275,36 @@ set_gemma4_tier_config() {
             TIER_NAME="NVIDIA Ultra (90GB+)"
             LLM_MODEL="gemma-4-31b-it"
             GGUF_FILE="gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/c1ac76e99d5513b141e8adde7288b85c3f9c32ec/gemma-4-31B-it-Q4_K_M.gguf"
+            GGUF_SHA256="38bd64c852c4b460434cc7162fa9bdcf242faf86502581a754cb72956bb17f84"
             MAX_CONTEXT=131072
-            LLM_MODEL_SIZE_MB=19800
+            LLM_MODEL_SIZE_MB=17475
             ;;
         SH_LARGE)
             TIER_NAME="Strix Halo 90+"
             LLM_MODEL="gemma-4-31b-it"
             GGUF_FILE="gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/c1ac76e99d5513b141e8adde7288b85c3f9c32ec/gemma-4-31B-it-Q4_K_M.gguf"
+            GGUF_SHA256="38bd64c852c4b460434cc7162fa9bdcf242faf86502581a754cb72956bb17f84"
             MAX_CONTEXT=131072
-            LLM_MODEL_SIZE_MB=19800
+            LLM_MODEL_SIZE_MB=17475
             ;;
         SH_COMPACT)
             TIER_NAME="Strix Halo Compact"
             LLM_MODEL="gemma-4-26b-a4b-it"
-            GGUF_FILE="gemma-4-26B-A4B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_FILE="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/c099eb48e663fd284577b04978a94ffccb261841/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+            GGUF_SHA256="f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f"
             MAX_CONTEXT=65536
-            LLM_MODEL_SIZE_MB=18000
+            LLM_MODEL_SIZE_MB=16162
             ;;
         0)
             # Keep the current tiny bootstrap-friendly Qwen path for the absolute minimum tier.
             TIER_NAME="Lightweight"
             LLM_MODEL="qwen3.5-2b"
             GGUF_FILE="Qwen3.5-2B-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf"
+            GGUF_SHA256="aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
             MAX_CONTEXT=8192
             LLM_MODEL_SIZE_MB=1221
             ;;
@@ -271,37 +312,37 @@ set_gemma4_tier_config() {
             TIER_NAME="Entry Level"
             LLM_MODEL="gemma-4-e2b-it"
             GGUF_FILE="gemma-4-E2B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf"
+            GGUF_SHA256="740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"
             MAX_CONTEXT=16384
-            LLM_MODEL_SIZE_MB=2810
+            LLM_MODEL_SIZE_MB=2963
             ;;
         2)
             TIER_NAME="Prosumer"
             LLM_MODEL="gemma-4-e4b-it"
             GGUF_FILE="gemma-4-E4B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3/gemma-4-E4B-it-Q4_K_M.gguf"
+            GGUF_SHA256="85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"
             MAX_CONTEXT=32768
-            LLM_MODEL_SIZE_MB=5340
+            LLM_MODEL_SIZE_MB=4747
             ;;
         3)
             TIER_NAME="Pro"
             LLM_MODEL="gemma-4-26b-a4b-it"
-            GGUF_FILE="gemma-4-26B-A4B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_FILE="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/c099eb48e663fd284577b04978a94ffccb261841/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+            GGUF_SHA256="f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f"
             MAX_CONTEXT=16384
-            LLM_MODEL_SIZE_MB=18000
+            LLM_MODEL_SIZE_MB=16162
             ;;
         4)
             TIER_NAME="Enterprise"
             LLM_MODEL="gemma-4-31b-it"
             GGUF_FILE="gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_URL="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"
-            GGUF_SHA256=""
+            GGUF_URL="https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/c1ac76e99d5513b141e8adde7288b85c3f9c32ec/gemma-4-31B-it-Q4_K_M.gguf"
+            GGUF_SHA256="38bd64c852c4b460434cc7162fa9bdcf242faf86502581a754cb72956bb17f84"
             MAX_CONTEXT=65536
-            LLM_MODEL_SIZE_MB=19800
+            LLM_MODEL_SIZE_MB=17475
             ;;
         *)
             error "Invalid tier: $TIER. Valid tiers: 0, 1, 2, 3, 4, CLOUD, NV_ULTRA, SH_LARGE, SH_COMPACT, ARC, ARC_LITE"
@@ -342,7 +383,7 @@ tier_to_model() {
     case "$effective" in
         gemma4)
             case "$t" in
-                CLOUD)          model="anthropic/claude-sonnet-4-5-20250514" ;;
+                CLOUD)          model="anthropic/claude-sonnet-4-6" ;;
                 NV_ULTRA)       model="gemma-4-31b-it" ;;
                 SH_LARGE)       model="gemma-4-31b-it" ;;
                 SH_COMPACT|SH)  model="gemma-4-26b-a4b-it" ;;
@@ -358,7 +399,7 @@ tier_to_model() {
             ;;
         *)
             case "$t" in
-                CLOUD)          model="anthropic/claude-sonnet-4-5-20250514" ;;
+                CLOUD)          model="anthropic/claude-sonnet-4-6" ;;
                 NV_ULTRA)
                     if [[ "${HOST_ARCH:-}" == "arm64" ]]; then
                         model="qwen3.6-35b-a3b"
@@ -370,14 +411,14 @@ tier_to_model() {
                 # memory reason as NV_ULTRA on aarch64 (see the SH_LARGE
                 # block in select_tier_model() above for the rationale).
                 SH_LARGE)       model="qwen3.6-35b-a3b" ;;
-                SH_COMPACT|SH)  model="qwen3-30b-a3b" ;;
+                SH_COMPACT|SH)  model="qwen3.6-35b-a3b" ;;
                 ARC)            model="qwen3.5-9b" ;;
                 ARC_LITE)       model="qwen3.5-4b" ;;
                 0|T0)           model="qwen3.5-2b" ;;
                 1|T1)           model="qwen3.5-9b" ;;
                 2|T2)           model="qwen3.5-9b" ;;
-                3|T3)           model="qwen3-30b-a3b" ;;
-                4|T4)           model="qwen3-30b-a3b" ;;
+                3|T3)           model="qwen3.5-27b" ;;
+                4|T4)           model="qwen3.6-35b-a3b" ;;
                 *)              model="" ;;
             esac
             ;;

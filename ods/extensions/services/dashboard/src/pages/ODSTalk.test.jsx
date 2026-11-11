@@ -51,6 +51,9 @@ const sseResponse = (frames, { status = 200, chunks, holdOpen = false } = {}) =>
   }
 }
 
+const TALK_NOT_SUPPORTED_COPY = "This model isn't supported in ODS Talk yet. Switch to a recommended model to use ODS Talk."
+const FLEET_NOTE = 'Fleet model-UI run 2026-07-16T18-10Z on windows-laptop loaded this model successfully and the runtime reported granite3.3-2b-instruct-q4, but ODS Talk returned a Hermes websocket closed error and then fetch failed during the streamed verification prompt; keep it out of agent-required release coverage until revalidated.'
+
 describe('ODSTalk', () => {
   beforeEach(() => {
     Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
@@ -98,16 +101,16 @@ describe('ODSTalk', () => {
     expect(await screen.findByText('I can help from this ODS.')).toBeInTheDocument()
   })
 
-  test('shows model compatibility reason and disables send when text chat is blocked', async () => {
+  test('shows a neutral model notice instead of the internal fleet note and disables send', async () => {
     const fetchMock = vi.fn(async (url) => {
       if (url === '/api/talk/status') {
         return response({
-          reason: 'Phi direct chat works, but ODS Talk is not revalidated.',
+          reason: TALK_NOT_SUPPORTED_COPY,
+          reasonCode: 'model_not_supported',
           modelCompatibility: {
-            hermesTalk: {
-              status: 'unsupported_until_revalidated',
-              reason: 'Phi direct chat works, but ODS Talk is not revalidated.',
-            },
+            agentViability: { status: 'not_agent_viable', reason: FLEET_NOTE, userMessage: 'Not verified for agent tasks.' },
+            hermesTalk: { status: 'unsupported_until_revalidated', reason: FLEET_NOTE, userMessage: TALK_NOT_SUPPORTED_COPY },
+            recommendedModel: { id: 'qwen3.5-9b-q4', name: 'Qwen 3.5 9B' },
           },
           capabilities: {
             text_chat: false,
@@ -122,12 +125,198 @@ describe('ODSTalk', () => {
 
     render(<ODSTalk />)
 
-    expect((await screen.findAllByText('Phi direct chat works, but ODS Talk is not revalidated.')).length).toBeGreaterThan(0)
+    const notice = await screen.findByTestId('talk-model-notice')
+    expect(notice).toHaveTextContent(TALK_NOT_SUPPORTED_COPY)
+    expect(notice).toHaveTextContent('Recommended: Qwen 3.5 9B')
+    expect(notice.className).not.toMatch(/red/)
+    expect(screen.getByRole('link', { name: 'Choose a model' })).toHaveAttribute('href', '/models')
+    expect(screen.getByText('Model not supported in Talk')).toBeInTheDocument()
+    expect(screen.queryByText(/Fleet model-UI run/)).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(/revalidated|release coverage|windows-laptop/)
+
     fireEvent.change(screen.getByPlaceholderText('Message ODS'), {
       target: { value: 'hello' },
     })
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+    // A known compatibility state is not an outage: no status polling.
+    await new Promise(resolve => setTimeout(resolve, 1200))
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('never renders an older API\'s internal compatibility reason', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          reason: FLEET_NOTE,
+          modelCompatibility: {
+            hermesTalk: { status: 'unsupported_until_revalidated', reason: FLEET_NOTE },
+          },
+          capabilities: { text_chat: false, tts: false, audio_message: false },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByTestId('talk-model-notice')).toHaveTextContent(TALK_NOT_SUPPORTED_COPY)
+    expect(screen.queryByText(/Recommended:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Fleet model-UI run/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+  })
+
+  const TALK_TOOLS_ADVISORY_COPY = 'This model failed the tool-call check. Talk can still chat, but actions that need tools may fail.'
+
+  test('advises, never blocks, when the model failed the tool check', async () => {
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/talk/status') {
+        return response({
+          modelCompatibility: { hermesTalkAdvisory: { code: 'tools-unavailable' } },
+          capabilities: { text_chat: true, tts: false, audio_message: false },
+        })
+      }
+      if (url === '/api/talk/message/stream' && options.method === 'POST') {
+        return sseResponse([
+          { type: 'delta', text: 'Still chatting.' },
+          { type: 'complete', text: 'Still chatting.', status: 'ok' },
+          { type: 'done' },
+        ])
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    const notice = screen.getByTestId('talk-tools-notice')
+    expect(notice).toHaveTextContent(TALK_TOOLS_ADVISORY_COPY)
+    expect(notice.className).not.toMatch(/red/)
+    expect(screen.getByRole('link', { name: 'Choose a model' })).toHaveAttribute('href', '/models')
+    expect(screen.getByRole('link', { name: 'Get help on Discord' })).toHaveAttribute('href', 'https://discord.gg/4ntNp9MAwC')
+    expect(screen.queryByTestId('talk-model-notice')).not.toBeInTheDocument()
+    expect(screen.queryByText('Model not supported in Talk')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'hello' } })
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Still chatting.')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith('/api/talk/message/stream', expect.objectContaining({ method: 'POST' }))
+    expect(screen.getByText('Ready')).toBeInTheDocument()
+  })
+
+  test.each([
+    { code: 'something-new' },
+    { code: null },
+    {},
+    'tools-unavailable',
+    null,
+  ])('ignores an unknown tools advisory: %j', async hermesTalkAdvisory => {
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          modelCompatibility: { hermesTalkAdvisory },
+          capabilities: { text_chat: true, tts: false, audio_message: false },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    }))
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    expect(screen.queryByTestId('talk-tools-notice')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'hello' } })
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+  })
+
+  test('keeps the blocking model notice unchanged when a block and the advisory arrive together', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          reason: TALK_NOT_SUPPORTED_COPY,
+          reasonCode: 'model_not_supported',
+          modelCompatibility: {
+            hermesTalk: { status: 'unsupported', reason: FLEET_NOTE },
+            hermesTalkAdvisory: { code: 'tools-unavailable' },
+          },
+          capabilities: { text_chat: false, tts: false, audio_message: false },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    }))
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByTestId('talk-model-notice')).toHaveTextContent(TALK_NOT_SUPPORTED_COPY)
+    expect(screen.getByText('Model not supported in Talk')).toBeInTheDocument()
+    expect(screen.queryByTestId('talk-tools-notice')).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Get help on Discord' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'hello' } })
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+  })
+
+  test('drops the tools advisory once a refreshed status no longer carries it', async () => {
+    let advisory = true
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          modelCompatibility: advisory ? { hermesTalkAdvisory: { code: 'tools-unavailable' } } : {},
+          capabilities: { text_chat: true, tts: false, audio_message: false },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByTestId('talk-tools-notice')).toHaveTextContent(TALK_TOOLS_ADVISORY_COPY)
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'hello' } })
+    const send = screen.getByRole('button', { name: 'Send message' })
+    expect(send).toBeEnabled()
+    advisory = false
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh ODS Talk status' }))
+    expect(send).toBeDisabled()
+    await waitFor(() => expect(send).toBeEnabled())
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(screen.queryByTestId('talk-tools-notice')).not.toBeInTheDocument()
+  })
+
+  test('switches to the model notice when a send is rejected for model compatibility', async () => {
+    let blocked = false
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/talk/status') {
+        return response(blocked
+          ? {
+              reason: TALK_NOT_SUPPORTED_COPY,
+              reasonCode: 'model_not_supported',
+              modelCompatibility: { hermesTalk: { status: 'unsupported_until_revalidated', reason: FLEET_NOTE } },
+              capabilities: { text_chat: false, tts: false, audio_message: false },
+            }
+          : { capabilities: { text_chat: true, tts: false, audio_message: false } })
+      }
+      if (url === '/api/talk/message/stream' && options.method === 'POST') {
+        blocked = true
+        return response({ detail: TALK_NOT_SUPPORTED_COPY }, 409)
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), {
+      target: { value: 'hello' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByTestId('talk-model-notice')).toHaveTextContent(TALK_NOT_SUPPORTED_COPY)
+    expect(screen.getByText('Model not supported in Talk')).toBeInTheDocument()
+    expect(screen.queryByText(/Fleet model-UI run/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
   })
 
   test('refreshes transient offline status until text chat becomes ready', async () => {
@@ -186,6 +375,7 @@ describe('ODSTalk', () => {
         return response({
           capabilities: { text_chat: false, tts: false, audio_message: false },
           reason: 'Model does not support tool calling.',
+          reasonCode: 'model_not_supported',
         })
       }
       throw new Error(`unexpected request: ${url}`)
@@ -265,6 +455,36 @@ describe('ODSTalk', () => {
     expect(screen.getByText('alpha').closest('li')).toBeTruthy()
     // And the raw `**` is gone from the DOM text.
     expect(container.textContent).not.toContain('**')
+  })
+
+  test.each([
+    ['what is 12 squared?', '144.', '144', ['']],
+    ['what is left?', 'Steps 1 and 2 are done.\n\n3. Run the tests\n4. Open the pull request', '3', ['Run the tests', 'Open the pull request']],
+  ])('keeps the ordered-list start number in the reply to %j', async (question, text, start, items) => {
+    // A reply of exactly "144." is an ordered list that starts at 144 with an
+    // empty item. Without its start number the bubble showed a bare "1.".
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/talk/status') return response({ capabilities: { text_chat: true } })
+      if (url === '/api/talk/message/stream' && options.method === 'POST') {
+        return sseResponse([
+          { type: 'session', session_id: 'sid' },
+          { type: 'complete', session_id: 'sid', text, status: 'ok' },
+          { type: 'done' },
+        ])
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { container } = render(<ODSTalk />)
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), {
+      target: { value: question },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => expect(container.querySelector('ol')).toHaveAttribute('start', start))
+    expect([...container.querySelectorAll('ol li')].map(item => item.textContent)).toEqual(items)
   })
 
   test('renders dynamic SSE status caption + detail while a tool is in flight', async () => {
@@ -560,5 +780,83 @@ describe('ODSTalk', () => {
       '/api/talk/speak',
       expect.objectContaining({ method: 'POST' }),
     ))
+  })
+
+  test('renders a tool approval and submits one choice-only response', async () => {
+    let resolveApproval
+    const approvalResponse = new Promise(resolve => {
+      resolveApproval = () => resolve(response({ accepted: true, choice: 'once' }))
+    })
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/talk/status') return response({ capabilities: { text_chat: true } })
+      if (url === '/api/talk/message/stream' && options.method === 'POST') {
+        return sseResponse([
+          { type: 'session', session_id: 'sid' },
+          { type: 'delta', text: 'Let me check.' },
+          {
+            type: 'approval',
+            command: 'python -c "print(4)"',
+            description: 'Run a short calculation',
+            choices: ['once', 'deny'],
+          },
+        ], { holdOpen: true })
+      }
+      if (url === '/api/talk/approval' && options.method === 'POST') return approvalResponse
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'calculate' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('Permission required')).toBeInTheDocument()
+    expect(screen.getByText('Let me check.')).toBeInTheDocument()
+    expect(screen.getByText('Run a short calculation')).toBeInTheDocument()
+    expect(screen.getByText('python -c "print(4)"')).toBeInTheDocument()
+    const allow = screen.getByRole('button', { name: 'Allow once' })
+    const deny = screen.getByRole('button', { name: 'Deny' })
+
+    fireEvent.click(allow)
+    fireEvent.click(allow)
+    await waitFor(() => {
+      const calls = fetchMock.mock.calls.filter(([url]) => url === '/api/talk/approval')
+      expect(calls).toHaveLength(1)
+      expect(JSON.parse(calls[0][1].body)).toEqual({ choice: 'once' })
+      expect(Object.keys(JSON.parse(calls[0][1].body))).toEqual(['choice'])
+    })
+    expect(allow).toBeDisabled()
+    expect(deny).toBeDisabled()
+
+    resolveApproval()
+    await waitFor(() => expect(screen.queryByText('Permission required')).not.toBeInTheDocument())
+    expect(screen.getByText('Let me check.')).toBeInTheDocument()
+  })
+
+  test('keeps approval actions retryable after a failed response', async () => {
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/talk/status') return response({ capabilities: { text_chat: true } })
+      if (url === '/api/talk/message/stream' && options.method === 'POST') {
+        return sseResponse([
+          { type: 'approval', command: 'echo retry', description: 'Run a command' },
+        ], { holdOpen: true })
+      }
+      if (url === '/api/talk/approval' && options.method === 'POST') {
+        return response({ detail: 'Approval response failed safely.' }, 502)
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), { target: { value: 'run it' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Deny' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Approval response failed safely.')
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeEnabled()
   })
 })
